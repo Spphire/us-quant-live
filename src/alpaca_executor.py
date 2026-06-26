@@ -351,7 +351,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_path = Path(args.ledger_path).resolve()
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
         lot_manager = LotManager.from_json(ledger_path)
-        resolved_session_idx = _resolve_session_idx(lot_manager, args.session_idx)
+        resolved_session_idx = _resolve_session_idx(
+            lot_manager,
+            args.session_idx,
+            session_date=decision_date.isoformat(),
+        )
 
         lot_check = _check_lot_alignment(
             lot_manager=lot_manager,
@@ -381,6 +385,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "executor_last_sync_at_utc": _utc_now(),
                 "executor_last_broker_equity": float(equity_before),
                 "executor_last_broker_equity_source": str(equity_before_source),
+            }
+        )
+        # Always record session_idx / session_date in meta, even if ledger_write
+        # is disabled — if this run computes targets with DecisionEngine, the resulting
+        # lot structure must be captured so that the subsequent execute phase can rebuild
+        # the lot-lock state. If we only write it when should_submit=True, then the
+        # plan_only (decision) run computes per-factor lots but discards them, and the
+        # execute run only sees broker_sync lots with min_hold=0, thus defeating the
+        # entire lot-locking mechanism. Note that we do NOT write the ledger file yet;
+        # that happens at the end after post-trade reconciliation.
+        lot_manager.meta.update(
+            {
+                "last_session_idx": int(resolved_session_idx),
+                "last_session_date": decision_date.isoformat(),
             }
         )
         if ledger_write_enabled:
@@ -536,6 +554,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if decision_result.skip_reason in (None, "", "null") else str(decision_result.skip_reason)
             )
             decision_diagnostics = dict(decision_result.diagnostics)
+
+            # CRITICAL FIX for live lot history: DecisionEngine.decide() has now split
+            # the target positions into per-factor lots with individual min_hold periods.
+            # In the scheduler's plan_only (decision) phase, should_submit=False, so
+            # ledger_write_enabled=False, which means the factor-lot structure would
+            # normally be discarded at the end (line ~784). But if we discard it now,
+            # the subsequent execute phase (22:00 CN) will only see broker_sync lots
+            # with min_hold=0, defeating the entire lot-locking mechanism. The fix: when
+            # DecisionEngine was invoked (i.e. we are NOT loading an existing plan or
+            # decision_targets CSV), persist the lot ledger immediately after decide(),
+            # even if should_submit=False. This ensures the 22:00 execute phase loads
+            # the factor-lot structure and can properly respect locked lots. The end-of-
+            # run ledger write (line ~784) will then be a post-trade reconciliation update.
+            lot_manager.to_json(ledger_path)
 
             decision_targets_path = output_root / "decision_targets.csv"
             target_signed_weights = _signed_weights_from_lot(lot_manager)
@@ -1040,11 +1072,25 @@ def _buying_power(account: Mapping[str, Any]) -> tuple[float, str]:
     return 0.0, "unavailable"
 
 
-def _resolve_session_idx(lot_manager: LotManager, provided: int | None) -> int:
+def _resolve_session_idx(
+    lot_manager: LotManager,
+    provided: int | None,
+    session_date: str | None = None,
+) -> int:
     if provided is not None:
         return int(provided)
-    if "last_session_idx" in lot_manager.meta:
-        return int(lot_manager.meta["last_session_idx"]) + 1
+    last_idx = lot_manager.meta.get("last_session_idx")
+    if last_idx is not None:
+        # session_idx must count trading days, not process invocations. The same
+        # trading day is touched multiple times (12:00 decision, 22:00 execute, plus
+        # any manual retry); all of them must share one index so that per-factor
+        # min-hold (measured in sessions) is not silently consumed faster than the
+        # market actually advances. Only roll the index forward when we observe a
+        # genuinely new session date.
+        last_date = lot_manager.meta.get("last_session_date")
+        if session_date is not None and last_date is not None and str(last_date) == str(session_date):
+            return int(last_idx)
+        return int(last_idx) + 1
     return int(lot_manager.max_birth_idx()) + 1
 
 

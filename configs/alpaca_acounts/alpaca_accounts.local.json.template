@@ -1,0 +1,8 @@
+{
+  "ALPACA_US_FULL": {
+    "api_key": "YOUR_ALPACA_API_KEY_HERE",
+    "api_secret": "YOUR_ALPACA_SECRET_KEY_HERE",
+    "base_url": "https://paper-api.alpaca.markets",
+    "comment": "Paper trading account for testing. For live: use https://api.alpaca.markets"
+  }
+}
