@@ -5,7 +5,7 @@
 对比对象：
 
 - 文章：《谈量化交易中被严重低估的执行模块》，原链接：<https://zhuanlan.zhihu.com/p/2003516497964855536>
-- 本地模块：`F:/量化/Final/src/alpha_core.py`、`decision_engine.py`、`lot_manager.py`、`alpaca_executor.py`、`ibkr_executor.py`
+- 本地模块：`src/alpha_core.py`、`src/decision_engine.py`、`src/lot_manager.py`、`src/alpaca_executor.py`、`src/ibkr_executor.py`
 - 相关报告：`phase7k_strategy_technical_report.md`、`alpaca_short_integer_position_management_report.md`、`us_alpha_lot_portfolio_engine_qa.md`
 
 ## 1. 文章主旨
@@ -18,7 +18,7 @@
 
 ## 2. 我们当前模块的定位
 
-当前 `F:/量化/Final` 不是单纯的下单脚本，而是一个日频美股多空组合的 alpha、仓位、执行闭环：
+当前本仓库不是单纯的下单脚本，而是一个日频美股多空组合的 alpha、仓位、执行闭环：
 
 1. `AlphaCore` 生成五类因子和综合分：短反转、动量、小市值、低 beta、现金质量，当前权重为静态配置。
 2. `DecisionEngine` 用线性规划求目标仓位，约束包括多空各满仓、beta 中性、行业暴露惩罚、单名上限、最低持仓数、换手预算和 locked-lot 下界。
@@ -199,9 +199,9 @@ continuous target weights
 推荐 10:00 执行命令形态：
 
 ```powershell
-python F:\量化\Final\src\alpaca_executor.py `
+python .\src\alpaca_executor.py `
   --date 2026-06-13 `
-  --decision-targets-input-path F:\量化\Final\artifacts\decision\decision_targets.csv `
+  --decision-targets-input-path .\artifacts\decision\decision_targets.csv `
   --execution-mode staged_regt `
   --trigger-mode wait_target_time `
   --target-ny-time 10:00 `

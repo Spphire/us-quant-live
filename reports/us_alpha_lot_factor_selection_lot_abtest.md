@@ -25,7 +25,9 @@
 
 4. 仓位管理层面：lot 级最小持有期和硬换手预算不是装饰模块。早期 Phase7K 报告中，未强制持有路径的日均换手约 `0.658`，引入 factor-reason lot 后 shared-core 日均换手降到 `0.153`，净 Sharpe 从约 `0.55` 提升到 `1.97`。
 
-但也必须诚实说明：当前还没有完成“最终生产 AlphaCore 五因子组合 vs 随机抽取五因子组合”的完整组合级 replay。原因是 `F:/量化/Final` 目前没有保存 2017-2026 每日完整 AlphaCore panel，只发现了单日 smoke panel。本文把已经能被现有文件证明的 A/B 证据整理出来，并给出生产级随机因子 A/B 的下一步实验规格。
+但也必须诚实说明：当前还没有完成“最终生产 AlphaCore 五因子组合 vs 随机抽取五因子组合”的完整组合级 replay。原因是本仓库目前没有保存 2017-2026 每日完整 AlphaCore panel，只发现了单日 smoke panel。本文把已经能被现有文件证明的 A/B 证据整理出来，并给出生产级随机因子 A/B 的下一步实验规格。
+
+说明：下文标记为“外部历史研究产物”的证据来自早期本地研究目录，未随本仓库提交；在其他机器或 GitHub 环境中可能暂时无法访问。
 
 ## 1. 当前生产因子定义
 
@@ -42,9 +44,9 @@
 对应代码位置：
 
 ```text
-F:/量化/Final/src/alpha_core.py
-F:/量化/Final/src/decision_engine.py
-F:/量化/Final/src/lot_manager.py
+src/alpha_core.py
+src/decision_engine.py
+src/lot_manager.py
 ```
 
 ## 2. 因子筛选规则固化
@@ -190,7 +192,7 @@ s_{i,t}=zscore_t(s^{raw}_{i,t})
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase3_baseline_signals_20260418/phase3_baseline_signal_leaderboard_validation.csv
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase3_baseline_signal_leaderboard_validation.csv
 ```
 
 检验目标：`forward_beta_residual_return_5d`。  
@@ -208,13 +210,13 @@ F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strat
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase3_baseline_signals_20260418/phase3_baseline_signal_daily_diagnostics_validation.csv
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase3_baseline_signal_daily_diagnostics_validation.csv
 ```
 
 输出文件：
 
 ```text
-F:/量化/Final/artifacts/abtest_factor_lot_summary/factor_signal_random_paired_ab.csv
+artifacts/abtest_factor_lot_summary/factor_signal_random_paired_ab.csv
 ```
 
 | 股票池变体 | 指标 | 配对交易日 | 真实均值 | 随机均值 | 差值 | t-stat | 真实优于随机比例 |
@@ -246,13 +248,13 @@ F:/量化/Final/artifacts/abtest_factor_lot_summary/factor_signal_random_paired_
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_tb0p15/phase7k_feature_target_panel_sample.csv
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_feature_target_panel_sample.csv
 ```
 
 输出文件：
 
 ```text
-F:/量化/Final/artifacts/abtest_factor_lot_summary/final_five_sample_random_ab_summary.csv
+artifacts/abtest_factor_lot_summary/final_five_sample_random_ab_summary.csv
 ```
 
 样本范围非常有限：`5000` 行、`81` 个交易日，日期为 `2016-01-04` 至 `2016-04-28`，平均每天约 `61.7` 只股票。因此这只能作为最终五因子的 sanity check，不能替代 2017-2026 的生产级 replay。
@@ -271,7 +273,7 @@ F:/量化/Final/artifacts/abtest_factor_lot_summary/final_five_sample_random_ab_
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_tb0p15/phase7k_strict_daily_metrics.csv
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_strict_daily_metrics.csv
 ```
 
 口径说明：validation-only，非最终生产实盘口径；用于判断因子组结构，不用于宣传最终收益。
@@ -341,7 +343,7 @@ a^{new}_{i,k,t}
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/docs/us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md
 ```
 
 | 方案 | 日均换手 | Net Sharpe | 说明 |
@@ -358,7 +360,7 @@ F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/docs/us-equitie
 数据来源：
 
 ```text
-F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_tb0p15/phase7k_lot_summary.csv
+外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_lot_summary.csv
 ```
 
 | 组合 | Mean Locked Weight | Median Locked Weight | Mean Locked Lots | Mean Active Lots | Carry Session Rate | Budget Used Fraction |
@@ -419,7 +421,7 @@ w_{i,t}^{side} \ge \sum_{\ell\in Locked(i,side,t)} a_{\ell,t}
 数据来源：
 
 ```text
-F:/量化/Final/artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json
+artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json
 ```
 
 区间：预热 252 个交易日后，报告期 `2017-01-03` 至 `2026-05-19`。  
@@ -491,17 +493,17 @@ Sector exposure drift
 
 ## 12. 证据文件
 
-| 内容 | 路径 |
+| 内容 | 路径/说明 |
 |---|---|
-| 当前 AlphaCore 因子定义 | `F:/量化/Final/src/alpha_core.py` |
-| 决策 LP 与换手预算 | `F:/量化/Final/src/decision_engine.py` |
-| Lot 账本与 factor-reason min-hold | `F:/量化/Final/src/lot_manager.py` |
-| 信号层随机控制 leaderboard | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase3_baseline_signals_20260418/phase3_baseline_signal_leaderboard_validation.csv` |
-| 信号层 paired A/B 输出 | `F:/量化/Final/artifacts/abtest_factor_lot_summary/factor_signal_random_paired_ab.csv` |
-| 最终五因子样本随机对照 | `F:/量化/Final/artifacts/abtest_factor_lot_summary/final_five_sample_random_ab_summary.csv` |
-| 信号相关性检查 | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase3_baseline_signals_20260418/phase3_signal_correlation_validation.csv` |
-| 因子消融 metrics | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_tb0p15/phase7k_strict_daily_metrics.csv` |
-| Lot summary | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_tb0p15/phase7k_lot_summary.csv` |
-| 早期有/无强制持有对照报告 | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/docs/us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md` |
-| 当前 open-to-open 主回测 | `F:/量化/Final/artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json` |
-| 本次 A/B 摘要目录 | `F:/量化/Final/artifacts/abtest_factor_lot_summary` |
+| 当前 AlphaCore 因子定义 | `src/alpha_core.py` |
+| 决策 LP 与换手预算 | `src/decision_engine.py` |
+| Lot 账本与 factor-reason min-hold | `src/lot_manager.py` |
+| 信号层随机控制 leaderboard | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase3_baseline_signal_leaderboard_validation.csv` |
+| 信号层 paired A/B 输出 | `artifacts/abtest_factor_lot_summary/factor_signal_random_paired_ab.csv` |
+| 最终五因子样本随机对照 | `artifacts/abtest_factor_lot_summary/final_five_sample_random_ab_summary.csv` |
+| 信号相关性检查 | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase3_signal_correlation_validation.csv` |
+| 因子消融 metrics | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_strict_daily_metrics.csv` |
+| Lot summary | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_lot_summary.csv` |
+| 早期有/无强制持有对照报告 | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md` |
+| 当前 open-to-open 主回测 | `artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json` |
+| 本次 A/B 摘要目录 | `artifacts/abtest_factor_lot_summary` |

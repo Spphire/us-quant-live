@@ -204,7 +204,7 @@ a^{new}_{i,k,t}
 
 ### 当前 open-to-open 长区间回测
 
-来源：`F:/量化/Final/artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json`。  
+来源：`artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json`。  
 区间：预热 252 个交易日后，从 `2017-01-03` 到 `2026-05-19`。  
 路径：`t-1 close` 后生成决策，`t open` 执行，收益按 open-to-open 记账。  
 成本模型：执行成本 `8 bps`，SEC fee `0.0000278`，TAF `0.000195/share`，TAF cap `9.79/trade`。
@@ -279,7 +279,7 @@ TAF_t = \sum_{sell\ trades} \min(0.000195 \times shares, 9.79).
 
 ## Q5. 因子筛选和 Lot 管理 A/B 测试放在哪里？
 
-已整理成独立中文报告：`F:/量化/Final/reports/us_alpha_lot_factor_selection_lot_abtest.md`。
+已整理成独立中文报告：`reports/us_alpha_lot_factor_selection_lot_abtest.md`。
 
 这份报告把三类证据分开：
 
@@ -288,14 +288,17 @@ TAF_t = \sum_{sell\ trades} \min(0.000195 \times shares, 9.79).
 3. 仓位层：lot 锁仓和硬换手预算 vs 无强制持有路径。
 
 报告也明确说明：当前还没有完成最终生产 AlphaCore 的“随机五因子组合级 replay”，因为全历史每日 AlphaCore panel 尚未完整保存；后续若要做严格随机组合 A/B，应先保存每日 panel，再用同一套 `DecisionEngine + LotManager + 成本模型` 重放。
+
+说明：表中标记为“外部历史研究产物”的证据来自早期本地研究目录，未随本仓库提交；在其他机器或 GitHub 环境中可能暂时无法访问。
+
 ## 证据文件
 
-| 内容 | 路径 |
+| 内容 | 路径/说明 |
 |---|---|
-| Alpha 因子定义 | `F:/量化/Final/src/alpha_core.py` |
-| 组合优化与换手预算 | `F:/量化/Final/src/decision_engine.py` |
-| 回测成本模型 | `F:/量化/Final/src/backtest/phase7k_backtest.py` |
-| 当前长区间回测 summary | `F:/量化/Final/artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json` |
-| 早期 Phase7K 中文报告 | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/docs/us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md` |
-| 因子暴露 summary | `F:/量化/StockMachine-20260321-codex-stable-ops-status-20260322/artifacts/strategy_projects/us_equities_pure_alpha_h5/research/phase7k_locked_turnover_shared_capital_2016_20260518_top1000full_tb0p15/phase7k_factor_exposure_summary.csv` |
+| Alpha 因子定义 | `src/alpha_core.py` |
+| 组合优化与换手预算 | `src/decision_engine.py` |
+| 回测成本模型 | `src/backtest/phase7k_backtest.py` |
+| 当前长区间回测 summary | `artifacts/phase7k_backtest/multi_cap_open_open_20160101_20260520_rerun/backtest_summary.json` |
+| 早期 Phase7K 中文报告 | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：us-equities-pure-alpha-phase7k-locked-turnover-shared-core-report-zh-20260518.md` |
+| 因子暴露 summary | `外部历史研究产物（未随本仓库提交；其他机器可能无法访问）：phase7k_factor_exposure_summary.csv` |
 
