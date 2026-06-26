@@ -1,0 +1,46 @@
+# Runtime artifacts and market data
+artifacts/
+data/
+*.log
+*.pid
+
+# Local secrets and account config
+.env
+.env.*
+*.local.json
+configs/alpaca_acounts/*.json
+!configs/alpaca_acounts/*.example.json
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Heavy third-party runtime bundles
+tools/clientportal.gw/
+tools/clientportal.gw.zip
+
+# Personal resume/export artifacts
+量化简历分块/
+沈一波-*.md
+沈一波-*.pdf
+沈一波-*.tex
+reports/shen_yibo*
+reports/*resume*
+reports/*.tex
+reports/*.aux
+reports/*.out
+reports/resume_style_quant.toml
+tools/export_quant_resume_pdf.py
+*.pdf
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
