@@ -25,6 +25,11 @@ env/
 tools/clientportal.gw/
 tools/clientportal.gw.zip
 
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+
 # Personal resume/export artifacts
 量化简历分块/
 沈一波-*.md

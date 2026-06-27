@@ -18,7 +18,34 @@ Alpaca 免费版限制 **200 requests/minute**：
 - **手动测试**：首次运行可能触发限速（HTTP 403/429），等待 2 分钟重试即可
 - **详细排查**：见 [ALPACA_RATE_LIMIT_GUIDE.md](ALPACA_RATE_LIMIT_GUIDE.md)
 
-## 守护进程
+## 🚀 一键启动（推荐）
+
+使用系统托盘启动器，最简单的启动方式：
+
+```bash
+cd W:\实验室项目\us-quant-live
+source venv/Scripts/activate
+python tools/tray_launcher.py
+```
+
+或构建 .exe 后双击：
+
+```bash
+python tools/build_exe.py
+# 之后双击 dist/USQuantLive.exe
+```
+
+启动器会：
+- ✅ 自动启动 scheduler 守护进程
+- ✅ 自动启动 dashboard（http://127.0.0.1:8766）
+- ✅ 在系统托盘显示 K 线图标，右键菜单可访问所有功能
+- ✅ 单例保护（不会重复启动）
+- ✅ 自动监督（scheduler 崩溃时自动重启）
+- ✅ 退出时干净清理所有子进程
+
+详细使用方法见 [TRAY_LAUNCHER_GUIDE.md](TRAY_LAUNCHER_GUIDE.md)。
+
+## 守护进程（手动模式）
 
 后台守护由两层组成：
 
