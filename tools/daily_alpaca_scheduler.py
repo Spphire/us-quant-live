@@ -95,6 +95,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-non-trading-day", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--heartbeat-minutes", type=float, default=30.0)
+    parser.add_argument("--enable-dashboard", action="store_true", default=True, help="Launch dashboard HTTP server (default: enabled)")
+    parser.add_argument("--no-dashboard", dest="enable_dashboard", action="store_false", help="Disable dashboard HTTP server")
+    parser.add_argument("--dashboard-host", default="127.0.0.1", help="Dashboard server bind host")
+    parser.add_argument("--dashboard-port", type=int, default=8766, help="Dashboard server port")
     parser.add_argument("--max-attempts-per-task", type=int, default=3)
     parser.add_argument("--max-execute-attempts", type=int, default=8)
     parser.add_argument("--retry-failed-after-minutes", type=float, default=30.0)
@@ -106,15 +110,58 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _start_dashboard_server(args: argparse.Namespace) -> subprocess.Popen | None:
+    """Launch dashboard HTTP server as a child process."""
+    if not bool(args.enable_dashboard):
+        return None
+    dashboard_script = Path(args.project_root) / "tools" / "dashboard_server.py"
+    if not dashboard_script.exists():
+        print(f"[Scheduler] warning: dashboard_server.py not found at {dashboard_script}", flush=True)
+        return None
+
+    cmd = [
+        str(args.python_executable),
+        str(dashboard_script),
+        "--artifacts-root",
+        str(args.output_root),
+        "--project-root",
+        str(args.project_root),
+        "--host",
+        str(args.dashboard_host),
+        "--port",
+        str(int(args.dashboard_port)),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(args.project_root),
+        )
+        print(
+            f"[Scheduler] dashboard server started at http://{args.dashboard_host}:{args.dashboard_port} (PID {proc.pid})",
+            flush=True,
+        )
+        return proc
+    except Exception as exc:
+        print(f"[Scheduler] warning: failed to start dashboard server: {exc}", flush=True)
+        return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _resolve_config_paths(args)
     state = _load_state(args.state_path)
     calendar_cache: dict[str, bool] = {}
 
+    # Start dashboard server as a child process (best-effort, non-blocking)
+    dashboard_proc = _start_dashboard_server(args)
+
     if args.run_once:
         now_cn = datetime.now(CN_TZ)
         ok = _run_once(args=args, state=state, calendar_cache=calendar_cache, now_cn=now_cn)
+        if dashboard_proc is not None:
+            dashboard_proc.terminate()
         return 0 if ok else 1
 
     print(
@@ -124,26 +171,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         flush=True,
     )
     last_heartbeat_at: datetime | None = None
-    while True:
-        now_cn = datetime.now(CN_TZ)
-        try:
-            _run_due_tasks(args=args, state=state, calendar_cache=calendar_cache, now_cn=now_cn)
-        except KeyboardInterrupt:
-            print("[Scheduler] stopped by keyboard interrupt.", flush=True)
-            return 130
-        except Exception as exc:  # Keep the daemon alive after transient API/process errors.
-            print(f"[Scheduler] warning: loop error: {exc}", flush=True)
+    try:
+        while True:
+            now_cn = datetime.now(CN_TZ)
+            try:
+                _run_due_tasks(args=args, state=state, calendar_cache=calendar_cache, now_cn=now_cn)
+            except KeyboardInterrupt:
+                print("[Scheduler] stopped by keyboard interrupt.", flush=True)
+                if dashboard_proc is not None:
+                    dashboard_proc.terminate()
+                return 130
+            except Exception as exc:  # Keep the daemon alive after transient API/process errors.
+                print(f"[Scheduler] warning: loop error: {exc}", flush=True)
 
-        heartbeat_due = (
-            last_heartbeat_at is None
-            or (now_cn - last_heartbeat_at).total_seconds() >= max(args.heartbeat_minutes, 0.1) * 60
-        )
-        if heartbeat_due:
-            today = now_cn.date().isoformat()
-            print(f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} session={today}", flush=True)
-            last_heartbeat_at = now_cn
+            # Restart dashboard if it died
+            if dashboard_proc is not None and dashboard_proc.poll() is not None:
+                print("[Scheduler] dashboard server exited, restarting...", flush=True)
+                dashboard_proc = _start_dashboard_server(args)
 
-        time.sleep(max(float(args.poll_seconds), 1.0))
+            heartbeat_due = (
+                last_heartbeat_at is None
+                or (now_cn - last_heartbeat_at).total_seconds() >= max(args.heartbeat_minutes, 0.1) * 60
+            )
+            if heartbeat_due:
+                today = now_cn.date().isoformat()
+                print(f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} session={today}", flush=True)
+                last_heartbeat_at = now_cn
+
+            time.sleep(max(float(args.poll_seconds), 1.0))
+    finally:
+        if dashboard_proc is not None:
+            try:
+                dashboard_proc.terminate()
+                dashboard_proc.wait(timeout=5)
+            except Exception:
+                pass
 
 
 def _resolve_config_paths(args: argparse.Namespace) -> None:

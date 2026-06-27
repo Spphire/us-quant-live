@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Trading Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0a0e27;
+            color: #e4e8f0;
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a1f3a 0%, #0f1729 100%);
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid #1e2a4a;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        .header h1 {
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .header h1::before {
+            content: '●';
+            color: #10b981;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            border-bottom: 2px solid #1e2a4a;
+        }
+
+        .tab {
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            border: none;
+            color: #8b92a8;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.2s;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }
+
+        .tab:hover {
+            color: #e4e8f0;
+            background: rgba(255,255,255,0.05);
+        }
+
+        .tab.active {
+            color: #60a5fa;
+            border-bottom-color: #60a5fa;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .metric-card {
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            padding: 1.5rem;
+            border-radius: 12px;
+            border: 1px solid #1e2a4a;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        .metric-label {
+            font-size: 0.85rem;
+            color: #8b92a8;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 0.25rem;
+        }
+
+        .metric-change {
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .metric-change.positive {
+            color: #10b981;
+        }
+
+        .metric-change.negative {
+            color: #ef4444;
+        }
+
+        .chart-container {
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            padding: 2rem;
+            border-radius: 12px;
+            border: 1px solid #1e2a4a;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        .chart-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            color: #ffffff;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        thead {
+            background: #0f1729;
+            border-bottom: 2px solid #1e2a4a;
+        }
+
+        th {
+            padding: 1rem;
+            text-align: left;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #8b92a8;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #1e2a4a;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr {
+            transition: background 0.2s;
+        }
+
+        tbody tr:hover {
+            background: rgba(96, 165, 250, 0.1);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .badge.long {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+        }
+
+        .badge.short {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+
+        .positive {
+            color: #10b981;
+        }
+
+        .negative {
+            color: #ef4444;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 3rem;
+            color: #8b92a8;
+            font-size: 1.1rem;
+        }
+
+        .loading::after {
+            content: '...';
+            animation: loading 1.5s infinite;
+        }
+
+        @keyframes loading {
+            0%, 20% { content: '.'; }
+            40% { content: '..'; }
+            60%, 100% { content: '...'; }
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .status-pill.completed {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+        }
+
+        .status-pill.running {
+            background: rgba(96, 165, 250, 0.2);
+            color: #60a5fa;
+        }
+
+        .status-pill.pending {
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+        }
+
+        .timeline {
+            margin: 2rem 0;
+            padding: 1.5rem;
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            border-radius: 12px;
+            border: 1px solid #1e2a4a;
+        }
+
+        .timeline-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+
+        .timeline-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #60a5fa;
+        }
+
+        .timeline-dot.completed {
+            background: #10b981;
+        }
+
+        .timeline-dot.pending {
+            background: #8b92a8;
+        }
+
+        .filter-bar {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            border-radius: 12px;
+            border: 1px solid #1e2a4a;
+        }
+
+        .filter-bar input,
+        .filter-bar select {
+            padding: 0.5rem 1rem;
+            background: #0f1729;
+            border: 1px solid #1e2a4a;
+            border-radius: 6px;
+            color: #e4e8f0;
+            font-size: 0.9rem;
+        }
+
+        .filter-bar input:focus,
+        .filter-bar select:focus {
+            outline: none;
+            border-color: #60a5fa;
+        }
+
+        canvas {
+            max-height: 300px;
+        }
+
+        .lot-composition {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .pie-container {
+            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
+            padding: 2rem;
+            border-radius: 12px;
+            border: 1px solid #1e2a4a;
+        }
+
+        .legend {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }
+
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            margin-right: 0.75rem;
+        }
+
+        .legend-label {
+            flex: 1;
+            font-size: 0.9rem;
+        }
+
+        .legend-value {
+            font-weight: 600;
+            color: #ffffff;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Live Trading Dashboard</h1>
+    </div>
+
+    <div class="container">
+        <div class="tabs">
+            <button class="tab active" data-tab="overview">Overview</button>
+            <button class="tab" data-tab="positions">Positions</button>
+            <button class="tab" data-tab="lots">Factor Lots</button>
+        </div>
+
+        <!-- Overview Tab -->
+        <div id="overview" class="tab-content active">
+            <div class="metrics-grid" id="metrics">
+                <div class="loading">Loading metrics</div>
+            </div>
+
+            <div class="timeline" id="timeline">
+                <div class="loading">Loading timeline</div>
+            </div>
+
+            <div class="chart-container">
+                <div class="chart-title">Portfolio Equity (Last 30 Days)</div>
+                <canvas id="equityChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Positions Tab -->
+        <div id="positions" class="tab-content">
+            <div class="filter-bar">
+                <input type="text" id="positionSearch" placeholder="Search symbol...">
+                <select id="sideFilter">
+                    <option value="all">All Sides</option>
+                    <option value="long">Long Only</option>
+                    <option value="short">Short Only</option>
+                </select>
+                <select id="plFilter">
+                    <option value="all">All P&L</option>
+                    <option value="profitable">Profitable</option>
+                    <option value="losing">Losing</option>
+                </select>
+            </div>
+
+            <table id="positionsTable">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Qty</th>
+                        <th>Market Value</th>
+                        <th>Entry Price</th>
+                        <th>Current Price</th>
+                        <th>Unrealized P&L</th>
+                        <th>% Change</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="8" class="loading">Loading positions</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Factor Lots Tab -->
+        <div id="lots" class="tab-content">
+            <div class="lot-composition">
+                <div class="pie-container">
+                    <div class="chart-title">Lot Composition by Factor</div>
+                    <canvas id="lotPieChart"></canvas>
+                </div>
+                <div class="pie-container">
+                    <div class="chart-title">Factor Distribution</div>
+                    <div class="legend" id="factorLegend">
+                        <div class="loading">Loading factors</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="metrics-grid" id="lotMetrics">
+                <div class="loading">Loading lot metrics</div>
+            </div>
+
+            <table id="lotsTable">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Factor</th>
+                        <th>Weight</th>
+                        <th>Min Hold</th>
+                        <th>Birth Index</th>
+                        <th>Entry Date</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="7" class="loading">Loading lots</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let currentTab = 'overview';
+        let equityChart = null;
+        let lotPieChart = null;
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const tabName = tab.dataset.tab;
+                switchTab(tabName);
+            });
+        });
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+            document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+
+            currentTab = tabName;
+
+            // Load data for tab
+            if (tabName === 'overview') loadOverview();
+            else if (tabName === 'positions') loadPositions();
+            else if (tabName === 'lots') loadLots();
+        }
+
+        // Fetch helpers
+        async function fetchJSON(endpoint) {
+            const response = await fetch(`/api/${endpoint}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+        }
+
+        // Overview Tab
+        async function loadOverview() {
+            try {
+                const data = await fetchJSON('overview');
+                renderMetrics(data);
+                renderTimeline(data);
+                await loadEquityChart();
+            } catch (err) {
+                console.error('Failed to load overview:', err);
+            }
+        }
+
+        function renderMetrics(data) {
+            const equity = data.equity || 0;
+            const posCount = data.positions_count || {};
+            const sessionIdx = data.session_idx || 0;
+
+            const html = `
+                <div class="metric-card">
+                    <div class="metric-label">Portfolio Equity</div>
+                    <div class="metric-value">$${equity.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
+                    <div class="metric-change positive">+0.0%</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Positions</div>
+                    <div class="metric-value">${posCount.total || 0}</div>
+                    <div class="metric-change">${posCount.long || 0} Long · ${posCount.short || 0} Short</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Session Index</div>
+                    <div class="metric-value">${sessionIdx}</div>
+                    <div class="metric-change">Trading Days</div>
+                </div>
+            `;
+            document.getElementById('metrics').innerHTML = html;
+        }
+
+        function renderTimeline(data) {
+            const lastDecision = data.last_decision || {};
+            const lastExecute = data.last_execute || {};
+
+            const html = `
+                <div class="timeline-item">
+                    <div class="timeline-dot ${lastDecision.status === 'completed' ? 'completed' : 'pending'}"></div>
+                    <span style="flex: 1;">12:00 CN Decision</span>
+                    <span class="status-pill ${lastDecision.status || 'pending'}">${lastDecision.status || 'Pending'}</span>
+                </div>
+                <div class="timeline-item">
+                    <div class="timeline-dot ${lastExecute.status === 'completed' ? 'completed' : 'pending'}"></div>
+                    <span style="flex: 1;">22:00 CN Execute</span>
+                    <span class="status-pill ${lastExecute.status || 'pending'}">${lastExecute.status || 'Pending'}</span>
+                </div>
+            `;
+            document.getElementById('timeline').innerHTML = html;
+        }
+
+        async function loadEquityChart() {
+            try {
+                const history = await fetchJSON('history?limit=30');
+                const labels = history.map(h => h.decision_date || '').reverse();
+                const values = history.map(h => h.account_equity_post_trade || 0).reverse();
+
+                const ctx = document.getElementById('equityChart').getContext('2d');
+
+                if (equityChart) equityChart.destroy();
+
+                equityChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Equity',
+                            data: values,
+                            borderColor: '#60a5fa',
+                            backgroundColor: 'rgba(96, 165, 250, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                backgroundColor: '#0f1729',
+                                titleColor: '#e4e8f0',
+                                bodyColor: '#e4e8f0',
+                                borderColor: '#1e2a4a',
+                                borderWidth: 1
+                            }
+                        },
+                        scales: {
+                            y: {
+                                ticks: { color: '#8b92a8' },
+                                grid: { color: '#1e2a4a' }
+                            },
+                            x: {
+                                ticks: { color: '#8b92a8' },
+                                grid: { color: '#1e2a4a' }
+                            }
+                        }
+                    }
+                });
+            } catch (err) {
+                console.error('Failed to load equity chart:', err);
+            }
+        }
+
+        // Positions Tab
+        async function loadPositions() {
+            try {
+                const positions = await fetchJSON('positions');
+                renderPositions(positions);
+            } catch (err) {
+                console.error('Failed to load positions:', err);
+            }
+        }
+
+        function renderPositions(positions) {
+            if (!positions || positions.length === 0) {
+                document.querySelector('#positionsTable tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b92a8;">No positions</td></tr>';
+                return;
+            }
+
+            const rows = positions.map(p => {
+                const unrealizedPL = (p.current_price - p.avg_entry_price) * p.qty;
+                const plPercent = ((p.current_price - p.avg_entry_price) / p.avg_entry_price) * 100;
+                const plClass = unrealizedPL >= 0 ? 'positive' : 'negative';
+
+                return `
+                    <tr>
+                        <td><strong>${p.symbol}</strong></td>
+                        <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
+                        <td>${Math.abs(p.qty).toFixed(2)}</td>
+                        <td>$${Math.abs(p.market_value).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                        <td>$${p.avg_entry_price.toFixed(2)}</td>
+                        <td>$${p.current_price.toFixed(2)}</td>
+                        <td class="${plClass}">$${unrealizedPL.toFixed(2)}</td>
+                        <td class="${plClass}">${plPercent >= 0 ? '+' : ''}${plPercent.toFixed(2)}%</td>
+                    </tr>
+                `;
+            }).join('');
+
+            document.querySelector('#positionsTable tbody').innerHTML = rows;
+        }
+
+        // Factor Lots Tab
+        async function loadLots() {
+            try {
+                const data = await fetchJSON('lots');
+                renderLotMetrics(data);
+                renderLotPieChart(data);
+                renderLotTable(data);
+            } catch (err) {
+                console.error('Failed to load lots:', err);
+            }
+        }
+
+        function renderLotMetrics(data) {
+            const html = `
+                <div class="metric-card">
+                    <div class="metric-label">Total Lots</div>
+                    <div class="metric-value">${data.total_count || 0}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Locked Lots</div>
+                    <div class="metric-value">${data.locked_count || 0}</div>
+                    <div class="metric-change">Within min_hold period</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Unlocked Lots</div>
+                    <div class="metric-value">${data.unlocked_count || 0}</div>
+                    <div class="metric-change">Can be rebalanced</div>
+                </div>
+            `;
+            document.getElementById('lotMetrics').innerHTML = html;
+        }
+
+        function renderLotPieChart(data) {
+            const composition = data.composition || {};
+            const counts = composition.counts || {};
+
+            const labels = Object.keys(counts);
+            const values = Object.values(counts);
+            const colors = ['#60a5fa', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+
+            const ctx = document.getElementById('lotPieChart').getContext('2d');
+
+            if (lotPieChart) lotPieChart.destroy();
+
+            lotPieChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: values,
+                        backgroundColor: colors,
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: '#0f1729',
+                            titleColor: '#e4e8f0',
+                            bodyColor: '#e4e8f0',
+                            borderColor: '#1e2a4a',
+                            borderWidth: 1
+                        }
+                    }
+                }
+            });
+
+            // Render legend
+            const legendHTML = labels.map((label, i) => `
+                <div class="legend-item">
+                    <div style="display:flex;align-items:center;">
+                        <div class="legend-color" style="background:${colors[i]}"></div>
+                        <span class="legend-label">${label}</span>
+                    </div>
+                    <span class="legend-value">${values[i]}</span>
+                </div>
+            `).join('');
+            document.getElementById('factorLegend').innerHTML = legendHTML;
+        }
+
+        function renderLotTable(data) {
+            const lots = data.lots || [];
+
+            if (lots.length === 0) {
+                document.querySelector('#lotsTable tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8b92a8;">No lots</td></tr>';
+                return;
+            }
+
+            const rows = lots.slice(0, 100).map(lot => {
+                const isLocked = data.locked_count > 0; // Simplified
+                return `
+                    <tr>
+                        <td><strong>${lot.symbol}</strong></td>
+                        <td>${lot.factor}</td>
+                        <td>${(lot.weight * 100).toFixed(3)}%</td>
+                        <td>${lot.min_hold}</td>
+                        <td>${lot.birth_idx}</td>
+                        <td>${lot.entry_session_date || 'N/A'}</td>
+                        <td><span class="badge ${isLocked ? 'short' : 'long'}">${isLocked ? 'Locked' : 'Unlocked'}</span></td>
+                    </tr>
+                `;
+            }).join('');
+
+            document.querySelector('#lotsTable tbody').innerHTML = rows;
+        }
+
+        // Auto-refresh
+        function startAutoRefresh() {
+            setInterval(() => {
+                if (currentTab === 'overview') loadOverview();
+                else if (currentTab === 'positions') loadPositions();
+                else if (currentTab === 'lots') loadLots();
+            }, 30000); // Refresh every 30 seconds
+        }
+
+        // Initialize
+        loadOverview();
+        startAutoRefresh();
+    </script>
+</body>
+</html>
