@@ -57,6 +57,22 @@
             content: ''; width: 6px; height: 6px; border-radius: 50%;
             background: currentColor;
         }
+        .lang-toggle {
+            padding: 0.35rem 0.8rem;
+            background: rgba(96, 165, 250, 0.1);
+            border: 1px solid rgba(96, 165, 250, 0.25);
+            color: #60a5fa;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+        .lang-toggle:hover {
+            background: rgba(96, 165, 250, 0.18);
+            border-color: rgba(96, 165, 250, 0.4);
+        }
         .container { max-width: 1500px; margin: 0 auto; padding: 1.5rem 2rem; }
         .tabs {
             display: flex; gap: 0.25rem;
@@ -371,9 +387,12 @@
 </head>
 <body>
     <div class="header">
-        <h1>Live Trading Dashboard</h1>
+        <h1 id="appTitle">Live Trading Dashboard</h1>
         <div class="header-status">
             <span id="lastUpdate">Updated: --</span>
+            <button class="lang-toggle" id="langToggle" onclick="toggleLanguage()">
+                <span id="langLabel">中文</span>
+            </button>
             <span class="conn-indicator" id="connStatus">Live</span>
         </div>
     </div>
@@ -403,6 +422,295 @@
         </div>
     </div>
     <script>
+        // === I18N (Internationalization) ===
+        const i18n = {
+            en: {
+                appTitle: 'Live Trading Dashboard',
+                lastUpdate: 'Updated',
+                connLive: 'Live',
+                connDisconnected: 'Disconnected',
+
+                // Tabs
+                tabOverview: 'Overview',
+                tabPositions: 'Positions',
+                tabLots: 'Factor Lots',
+                tabHistory: 'History',
+                tabLogs: 'Logs',
+                tabSettings: 'Settings',
+
+                // Overview
+                metricEquity: 'Portfolio Equity',
+                metricPositions: 'Total Positions',
+                metricSession: 'Session Index',
+                metricLong: 'Long',
+                metricShort: 'Short',
+                tradingDays: 'Trading Days',
+                timelineTitle: 'Task Timeline',
+                timelineDecision: 'Decision',
+                timelineExecute: 'Execute',
+                statusPending: 'Pending',
+                statusCompleted: 'Completed',
+                statusFailed: 'Failed',
+                statusRunning: 'Running',
+                chartEquityTitle: 'Portfolio Equity (Last 30 Days)',
+
+                // Positions
+                searchSymbol: 'Search symbol...',
+                filterAllSides: 'All Sides',
+                filterLongOnly: 'Long Only',
+                filterShortOnly: 'Short Only',
+                filterAllPL: 'All P&L',
+                filterProfitable: 'Profitable',
+                filterLosing: 'Losing',
+                thSymbol: 'Symbol',
+                thSide: 'Side',
+                thQty: 'Qty',
+                thMarketValue: 'Market Value',
+                thEntryPrice: 'Entry Price',
+                thCurrentPrice: 'Current Price',
+                thPL: 'P&L',
+                thChange: '% Change',
+                noPositions: 'No positions',
+                noMatch: 'No positions match filters',
+
+                // Lots
+                metricTotalLots: 'Total Lots',
+                metricLockedLots: 'Locked Lots',
+                metricUnlockedLots: 'Unlocked Lots',
+                withinMinHold: 'Within min_hold',
+                canRebalance: 'Can rebalance',
+                chartLotComposition: 'Lot Composition by Factor',
+                chartFactorDist: 'Factor Distribution',
+                allLotsTitle: 'All Lots',
+                showing: 'showing',
+                thFactor: 'Factor',
+                thWeight: 'Weight',
+                thMinHold: 'Min Hold',
+                thBirthIndex: 'Birth Index',
+                thEntryDate: 'Entry Date',
+                noLots: 'No lots',
+
+                // History
+                historyTitle: 'Execution History (Last 50 Runs)',
+                thDate: 'Date',
+                thSession: 'Session',
+                thStatus: 'Status',
+                thSymbols: 'Symbols',
+                thOrders: 'Orders',
+                thSubmitted: 'Submitted',
+                thEquityAfter: 'Equity After',
+                thActions: 'Actions',
+                btnDetails: 'Details',
+                noHistory: 'No execution history yet',
+                modalTitleExecution: 'Execution Details',
+
+                // Logs
+                filterLevel: 'Level:',
+                levelAll: 'All',
+                levelError: 'ERROR',
+                levelWarning: 'WARNING',
+                levelInfo: 'INFO',
+                searchLogs: 'Search logs...',
+                btnRefresh: 'Refresh',
+                logsTitle: 'Recent Logs',
+                logsLines: 'lines from',
+                logsFiles: 'files',
+                noLogs: 'No logs available yet',
+                noLogsHint: 'Logs appear after scheduler runs',
+                noLogsMatch: 'No logs match filters',
+
+                // Settings
+                settingsTradingTitle: 'Trading Configuration',
+                settingsSystemTitle: 'System Information',
+                settingsLedgerTitle: 'Lot Ledger State',
+                settingsSchedulerTitle: 'Scheduler Command',
+                cfgAccount: 'Account',
+                cfgFeed: 'Feed',
+                cfgExecutionMode: 'Execution Mode',
+                cfgTargetNYTime: 'Target NY Time',
+                cfgDecisionTime: 'Decision Time (CN)',
+                cfgExecuteTime: 'Execute Time (CN)',
+                cfgPythonVersion: 'Python Version',
+                cfgPlatform: 'Platform',
+                cfgDashboardPID: 'Dashboard PID',
+                cfgSchedulerPID: 'Scheduler PID',
+                cfgWatchdogPID: 'Watchdog PID',
+                cfgProjectRoot: 'Project Root',
+                cfgLastSessionIdx: 'Last Session Index',
+                cfgLastSessionDate: 'Last Session Date',
+                cfgLastSyncTime: 'Last Sync Time (UTC)',
+                cfgLastBrokerEquity: 'Last Broker Equity',
+                cfgLastSyncApplied: 'Last Sync Applied',
+                notRunning: 'Not running',
+                yes: 'Yes',
+                no: 'No',
+
+                // Common
+                loading: 'Loading',
+                emptyState: 'No data available',
+            },
+            zh: {
+                appTitle: '实时交易监控面板',
+                lastUpdate: '更新于',
+                connLive: '在线',
+                connDisconnected: '离线',
+
+                // Tabs
+                tabOverview: '总览',
+                tabPositions: '持仓',
+                tabLots: '因子组合',
+                tabHistory: '历史记录',
+                tabLogs: '日志',
+                tabSettings: '设置',
+
+                // Overview
+                metricEquity: '账户权益',
+                metricPositions: '总持仓数',
+                metricSession: '交易日索引',
+                metricLong: '多头',
+                metricShort: '空头',
+                tradingDays: '交易天数',
+                timelineTitle: '任务时间线',
+                timelineDecision: '决策',
+                timelineExecute: '执行',
+                statusPending: '待运行',
+                statusCompleted: '已完成',
+                statusFailed: '失败',
+                statusRunning: '运行中',
+                chartEquityTitle: '账户权益曲线（最近30天）',
+
+                // Positions
+                searchSymbol: '搜索股票代码...',
+                filterAllSides: '全部方向',
+                filterLongOnly: '仅多头',
+                filterShortOnly: '仅空头',
+                filterAllPL: '全部盈亏',
+                filterProfitable: '盈利',
+                filterLosing: '亏损',
+                thSymbol: '代码',
+                thSide: '方向',
+                thQty: '数量',
+                thMarketValue: '市值',
+                thEntryPrice: '入场价',
+                thCurrentPrice: '当前价',
+                thPL: '盈亏',
+                thChange: '涨跌幅',
+                noPositions: '无持仓',
+                noMatch: '无匹配的持仓',
+
+                // Lots
+                metricTotalLots: '总批次数',
+                metricLockedLots: '锁定批次',
+                metricUnlockedLots: '可调批次',
+                withinMinHold: '最短持仓期内',
+                canRebalance: '可以调仓',
+                chartLotComposition: '因子组合占比',
+                chartFactorDist: '因子分布',
+                allLotsTitle: '所有批次',
+                showing: '显示',
+                thFactor: '因子',
+                thWeight: '权重',
+                thMinHold: '最短持仓',
+                thBirthIndex: '创建索引',
+                thEntryDate: '入场日期',
+                noLots: '无批次',
+
+                // History
+                historyTitle: '执行历史（最近50次）',
+                thDate: '日期',
+                thSession: '会话',
+                thStatus: '状态',
+                thSymbols: '股票数',
+                thOrders: '订单数',
+                thSubmitted: '已提交',
+                thEquityAfter: '执行后权益',
+                thActions: '操作',
+                btnDetails: '详情',
+                noHistory: '暂无执行历史',
+                modalTitleExecution: '执行详情',
+
+                // Logs
+                filterLevel: '级别：',
+                levelAll: '全部',
+                levelError: '错误',
+                levelWarning: '警告',
+                levelInfo: '信息',
+                searchLogs: '搜索日志...',
+                btnRefresh: '刷新',
+                logsTitle: '最近日志',
+                logsLines: '行，来自',
+                logsFiles: '个文件',
+                noLogs: '暂无日志',
+                noLogsHint: '调度器运行后会显示日志',
+                noLogsMatch: '无匹配的日志',
+
+                // Settings
+                settingsTradingTitle: '交易配置',
+                settingsSystemTitle: '系统信息',
+                settingsLedgerTitle: '批次账本状态',
+                settingsSchedulerTitle: '调度器命令',
+                cfgAccount: '账户',
+                cfgFeed: '数据源',
+                cfgExecutionMode: '执行模式',
+                cfgTargetNYTime: '目标纽约时间',
+                cfgDecisionTime: '决策时间（北京）',
+                cfgExecuteTime: '执行时间（北京）',
+                cfgPythonVersion: 'Python 版本',
+                cfgPlatform: '平台',
+                cfgDashboardPID: '面板进程号',
+                cfgSchedulerPID: '调度器进程号',
+                cfgWatchdogPID: '守护进程号',
+                cfgProjectRoot: '项目根目录',
+                cfgLastSessionIdx: '最后会话索引',
+                cfgLastSessionDate: '最后会话日期',
+                cfgLastSyncTime: '最后同步时间（UTC）',
+                cfgLastBrokerEquity: '最后券商权益',
+                cfgLastSyncApplied: '最后同步已应用',
+                notRunning: '未运行',
+                yes: '是',
+                no: '否',
+
+                // Common
+                loading: '加载中',
+                emptyState: '无数据',
+            }
+        };
+
+        let currentLang = localStorage.getItem('dashboardLang') || 'en';
+
+        function t(key) {
+            return i18n[currentLang][key] || key;
+        }
+
+        function toggleLanguage() {
+            currentLang = currentLang === 'en' ? 'zh' : 'en';
+            localStorage.setItem('dashboardLang', currentLang);
+            updateLanguage();
+        }
+
+        function updateLanguage() {
+            // Update header
+            document.getElementById('appTitle').textContent = t('appTitle');
+            document.getElementById('langLabel').textContent = currentLang === 'en' ? '中文' : 'English';
+
+            // Update tabs
+            document.querySelectorAll('.tab').forEach((tab, i) => {
+                const keys = ['tabOverview', 'tabPositions', 'tabLots', 'tabHistory', 'tabLogs', 'tabSettings'];
+                tab.textContent = t(keys[i]);
+            });
+
+            // Update connection status
+            const connStatus = document.getElementById('connStatus');
+            if (connStatus.classList.contains('disconnected')) {
+                connStatus.textContent = t('connDisconnected');
+            } else {
+                connStatus.textContent = t('connLive');
+            }
+
+            // Reload current tab to apply translations
+            loadTabData(currentTab);
+        }
+
         // === CORE STATE & UTILS ===
         let currentTab = 'overview';
         let charts = { equity: null, lotPie: null };
@@ -418,7 +726,7 @@
         function updateLastUpdate() {
             lastUpdateTime = Date.now();
             document.getElementById('lastUpdate').textContent =
-                'Updated: ' + new Date().toLocaleTimeString();
+                t('lastUpdate') + ': ' + new Date().toLocaleTimeString();
         }
 
         function formatCurrency(val) {
@@ -492,19 +800,19 @@
             const html = `
                 <div class="metrics-grid">
                     <div class="metric-card">
-                        <div class="metric-label">Portfolio Equity</div>
+                        <div class="metric-label">${t('metricEquity')}</div>
                         <div class="metric-value">${formatCurrency(equity)}</div>
-                        <div class="metric-change neutral">Session ${sessionIdx}</div>
+                        <div class="metric-change neutral">${t('metricSession')} ${sessionIdx}</div>
                     </div>
                     <div class="metric-card">
-                        <div class="metric-label">Total Positions</div>
+                        <div class="metric-label">${t('metricPositions')}</div>
                         <div class="metric-value">${pos.total || 0}</div>
-                        <div class="metric-change">${pos.long || 0} Long · ${pos.short || 0} Short</div>
+                        <div class="metric-change">${pos.long || 0} ${t('metricLong')} · ${pos.short || 0} ${t('metricShort')}</div>
                     </div>
                     <div class="metric-card">
-                        <div class="metric-label">Session Index</div>
+                        <div class="metric-label">${t('metricSession')}</div>
                         <div class="metric-value">${sessionIdx}</div>
-                        <div class="metric-change neutral">Trading Days</div>
+                        <div class="metric-change neutral">${t('tradingDays')}</div>
                     </div>
                 </div>
             `;
@@ -517,24 +825,27 @@
             const lastDec = data.last_decision || {};
             const lastExe = data.last_execute || {};
 
+            const decStatus = lastDec.status || 'pending';
+            const exeStatus = lastExe.status || 'pending';
+
             const html = `
                 <div class="panel">
-                    <div class="panel-title">Task Timeline</div>
+                    <div class="panel-title">${t('timelineTitle')}</div>
                     <div class="timeline-row">
-                        <div class="timeline-dot ${lastDec.status === 'completed' ? 'completed' : lastDec.status === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-dot ${decStatus === 'completed' ? 'completed' : decStatus === 'running' ? 'running' : ''}"></div>
                         <div class="timeline-label">
-                            <div>12:00 CN Decision</div>
-                            <div class="timeline-sub">${lastDec.status || 'Pending'}</div>
+                            <div>12:00 CN ${t('timelineDecision')}</div>
+                            <div class="timeline-sub">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</div>
                         </div>
-                        <span class="badge ${lastDec.status || 'pending'}">${lastDec.status || 'Pending'}</span>
+                        <span class="badge ${decStatus}">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</span>
                     </div>
                     <div class="timeline-row">
-                        <div class="timeline-dot ${lastExe.status === 'completed' ? 'completed' : lastExe.status === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-dot ${exeStatus === 'completed' ? 'completed' : exeStatus === 'running' ? 'running' : ''}"></div>
                         <div class="timeline-label">
-                            <div>22:00 CN Execute</div>
-                            <div class="timeline-sub">${lastExe.status || 'Pending'}</div>
+                            <div>22:00 CN ${t('timelineExecute')}</div>
+                            <div class="timeline-sub">${t('status' + exeStatus.charAt(0).toUpperCase() + exeStatus.slice(1))}</div>
                         </div>
-                        <span class="badge ${lastExe.status || 'pending'}">${lastExe.status || 'Pending'}</span>
+                        <span class="badge ${exeStatus}">${t('status' + exeStatus.charAt(0).toUpperCase() + exeStatus.slice(1))}</span>
                     </div>
                 </div>
             `;
@@ -551,7 +862,7 @@
 
                 const chartHTML = `
                     <div class="panel">
-                        <div class="panel-title">Portfolio Equity (Last 30 Days)</div>
+                        <div class="panel-title">${t('chartEquityTitle')}</div>
                         <canvas id="equityChart"></canvas>
                     </div>
                 `;
@@ -571,7 +882,7 @@
                     data: {
                         labels: labels,
                         datasets: [{
-                            label: 'Equity',
+                            label: t('metricEquity'),
                             data: values,
                             borderColor: '#60a5fa',
                             backgroundColor: 'rgba(96, 165, 250, 0.08)',
@@ -626,36 +937,36 @@
 
         function renderPositionsTable(positions) {
             if (!positions || positions.length === 0) {
-                document.getElementById('positions').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📊</div><div>No positions</div></div>';
+                document.getElementById('positions').innerHTML = `<div class="empty-state"><div class="empty-state-icon">📊</div><div>${t('noPositions')}</div></div>`;
                 return;
             }
 
             let html = `
                 <div class="filter-bar">
-                    <input type="text" id="posSearch" placeholder="Search symbol..." oninput="filterPositions()">
+                    <input type="text" id="posSearch" placeholder="${t('searchSymbol')}" oninput="filterPositions()">
                     <select id="posSideFilter" onchange="filterPositions()">
-                        <option value="all">All Sides</option>
-                        <option value="long">Long Only</option>
-                        <option value="short">Short Only</option>
+                        <option value="all">${t('filterAllSides')}</option>
+                        <option value="long">${t('filterLongOnly')}</option>
+                        <option value="short">${t('filterShortOnly')}</option>
                     </select>
                     <select id="posPlFilter" onchange="filterPositions()">
-                        <option value="all">All P&L</option>
-                        <option value="profitable">Profitable</option>
-                        <option value="losing">Losing</option>
+                        <option value="all">${t('filterAllPL')}</option>
+                        <option value="profitable">${t('filterProfitable')}</option>
+                        <option value="losing">${t('filterLosing')}</option>
                     </select>
                 </div>
                 <div class="panel">
                     <table>
                         <thead>
                             <tr>
-                                <th onclick="sortPositions('symbol')">Symbol</th>
-                                <th onclick="sortPositions('side')">Side</th>
-                                <th onclick="sortPositions('qty')">Qty</th>
-                                <th onclick="sortPositions('market_value')">Market Value</th>
-                                <th onclick="sortPositions('avg_entry_price')">Entry Price</th>
-                                <th onclick="sortPositions('current_price')">Current Price</th>
-                                <th onclick="sortPositions('pl')">P&L</th>
-                                <th onclick="sortPositions('plPct')">% Change</th>
+                                <th onclick="sortPositions('symbol')">${t('thSymbol')}</th>
+                                <th onclick="sortPositions('side')">${t('thSide')}</th>
+                                <th onclick="sortPositions('qty')">${t('thQty')}</th>
+                                <th onclick="sortPositions('market_value')">${t('thMarketValue')}</th>
+                                <th onclick="sortPositions('avg_entry_price')">${t('thEntryPrice')}</th>
+                                <th onclick="sortPositions('current_price')">${t('thCurrentPrice')}</th>
+                                <th onclick="sortPositions('pl')">${t('thPL')}</th>
+                                <th onclick="sortPositions('plPct')">${t('thChange')}</th>
                             </tr>
                         </thead>
                         <tbody id="positionsTableBody"></tbody>
@@ -685,9 +996,10 @@
 
             const rows = filtered.map(p => {
                 const plClass = p.pl >= 0 ? 'positive' : 'negative';
+                const sideUpper = p.side.toUpperCase();
                 return `<tr>
                     <td><strong>${p.symbol}</strong></td>
-                    <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
+                    <td><span class="badge ${p.side}">${sideUpper}</span></td>
                     <td>${Math.abs(p.qty).toFixed(2)}</td>
                     <td>${formatCurrency(Math.abs(p.market_value))}</td>
                     <td>$${p.avg_entry_price.toFixed(2)}</td>
@@ -696,7 +1008,10 @@
                     <td class="${plClass}">${formatPercent(p.plPct)}</td>
                 </tr>`;
             }).join('');
-            document.getElementById('positionsTableBody').innerHTML = rows || '<tr><td colspan="8" class="neutral" style="text-align:center;">No positions match filters</td></tr>';
+            const tbody = document.getElementById('positionsTableBody');
+            if (tbody) {
+                tbody.innerHTML = rows || `<tr><td colspan="8" class="neutral" style="text-align:center;">${t('noMatch')}</td></tr>`;
+            }
         }
 
         function sortPositions(key) {
@@ -720,18 +1035,18 @@
             const html = `
                 <div class="metrics-grid">
                     <div class="metric-card">
-                        <div class="metric-label">Total Lots</div>
+                        <div class="metric-label">${t('metricTotalLots')}</div>
                         <div class="metric-value">${data.total_count || 0}</div>
                     </div>
                     <div class="metric-card">
-                        <div class="metric-label">Locked Lots</div>
+                        <div class="metric-label">${t('metricLockedLots')}</div>
                         <div class="metric-value">${data.locked_count || 0}</div>
-                        <div class="metric-change neutral">Within min_hold</div>
+                        <div class="metric-change neutral">${t('withinMinHold')}</div>
                     </div>
                     <div class="metric-card">
-                        <div class="metric-label">Unlocked Lots</div>
+                        <div class="metric-label">${t('metricUnlockedLots')}</div>
                         <div class="metric-value">${data.unlocked_count || 0}</div>
-                        <div class="metric-change neutral">Can rebalance</div>
+                        <div class="metric-change neutral">${t('canRebalance')}</div>
                     </div>
                 </div>
             `;
@@ -750,11 +1065,11 @@
             const chartHTML = `
                 <div class="charts-row">
                     <div class="panel">
-                        <div class="panel-title">Lot Composition by Factor</div>
+                        <div class="panel-title">${t('chartLotComposition')}</div>
                         <canvas id="lotPieChart"></canvas>
                     </div>
                     <div class="panel">
-                        <div class="panel-title">Factor Distribution</div>
+                        <div class="panel-title">${t('chartFactorDist')}</div>
                         <div class="legend-list" id="factorLegend"></div>
                     </div>
                 </div>
@@ -808,16 +1123,16 @@
             const lots = data.lots || [];
             const html = `
                 <div class="panel">
-                    <div class="panel-title">All Lots <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(showing ${Math.min(lots.length, 200)})</span></div>
+                    <div class="panel-title">${t('allLotsTitle')} <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(${t('showing')} ${Math.min(lots.length, 200)})</span></div>
                     <table>
                         <thead>
                             <tr>
-                                <th>Symbol</th>
-                                <th>Factor</th>
-                                <th>Weight</th>
-                                <th>Min Hold</th>
-                                <th>Birth Index</th>
-                                <th>Entry Date</th>
+                                <th>${t('thSymbol')}</th>
+                                <th>${t('thFactor')}</th>
+                                <th>${t('thWeight')}</th>
+                                <th>${t('thMinHold')}</th>
+                                <th>${t('thBirthIndex')}</th>
+                                <th>${t('thEntryDate')}</th>
                             </tr>
                         </thead>
                         <tbody id="lotsTableBody"></tbody>
@@ -839,7 +1154,7 @@
                     <td>${lot.entry_session_date || 'N/A'}</td>
                 </tr>
             `).join('');
-            document.getElementById('lotsTableBody').innerHTML = rows || '<tr><td colspan="6" style="text-align:center;color:#8b92a8;">No lots</td></tr>';
+            document.getElementById('lotsTableBody').innerHTML = rows || `<tr><td colspan="6" style="text-align:center;color:#8b92a8;">${t('noLots')}</td></tr>`;
         }
 
                 // === HISTORY TAB ===
@@ -855,37 +1170,38 @@
 
         function renderHistoryTable(history) {
             if (!history || history.length === 0) {
-                document.getElementById('history').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📅</div><div>No execution history yet</div></div>';
+                document.getElementById('history').innerHTML = `<div class="empty-state"><div class="empty-state-icon">📅</div><div>${t('noHistory')}</div></div>`;
                 return;
             }
 
             const html = `
                 <div class="panel">
-                    <div class="panel-title">Execution History (Last 50 Runs)</div>
+                    <div class="panel-title">${t('historyTitle')}</div>
                     <table>
                         <thead>
                             <tr>
-                                <th>Date</th>
-                                <th>Session</th>
-                                <th>Status</th>
-                                <th>Symbols</th>
-                                <th>Orders</th>
-                                <th>Submitted</th>
-                                <th>Equity After</th>
-                                <th>Actions</th>
+                                <th>${t('thDate')}</th>
+                                <th>${t('thSession')}</th>
+                                <th>${t('thStatus')}</th>
+                                <th>${t('thSymbols')}</th>
+                                <th>${t('thOrders')}</th>
+                                <th>${t('thSubmitted')}</th>
+                                <th>${t('thEquityAfter')}</th>
+                                <th>${t('thActions')}</th>
                             </tr>
                         </thead>
                         <tbody>${history.map(h => {
                             const statusBadge = h.ok ? 'success' : 'error';
+                            const submitted = h.submitted ? t('yes') : t('no');
                             return `<tr>
                                 <td>${h.decision_date || 'N/A'}</td>
                                 <td>${h.session_idx ?? '-'}</td>
                                 <td><span class="badge ${statusBadge}">${h.decision_status || 'unknown'}</span></td>
                                 <td>${h.dynamic_symbols || 0}</td>
                                 <td>${h.order_plan_count || 0}</td>
-                                <td>${h.submitted ? 'Yes' : 'No'}</td>
+                                <td>${submitted}</td>
                                 <td>${formatCurrency(h.account_equity_post_trade || 0)}</td>
-                                <td><button class="btn secondary" onclick="showHistoryDetail('${h.run_dir}')">Details</button></td>
+                                <td><button class="btn secondary" onclick="showHistoryDetail('${h.run_dir}')">${t('btnDetails')}</button></td>
                             </tr>`;
                         }).join('')}</tbody>
                     </table>
@@ -899,7 +1215,7 @@
             const item = window.historyData.find(h => h.run_dir === runDir);
             if (!item) return;
             const json = JSON.stringify(item, null, 2);
-            showModal(`Execution Details: ${runDir}`, `<pre>${json}</pre>`);
+            showModal(`${t('modalTitleExecution')}: ${runDir}`, `<pre>${json}</pre>`);
         }
 
                 // === LOGS TAB ===
@@ -916,24 +1232,24 @@
         function renderLogs(data) {
             const logs = data.logs || [];
             if (logs.length === 0) {
-                document.getElementById('logs').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📝</div><div>No logs available yet</div><div style="margin-top:0.5rem;font-size:0.85rem;">Logs appear after scheduler runs</div></div>';
+                document.getElementById('logs').innerHTML = `<div class="empty-state"><div class="empty-state-icon">📝</div><div>${t('noLogs')}</div><div style="margin-top:0.5rem;font-size:0.85rem;">${t('noLogsHint')}</div></div>`;
                 return;
             }
 
             const html = `
                 <div class="filter-bar">
-                    <span class="filter-label">Level:</span>
+                    <span class="filter-label">${t('filterLevel')}</span>
                     <select id="logLevelFilter" onchange="filterLogs()">
-                        <option value="all">All</option>
-                        <option value="error">ERROR</option>
-                        <option value="warning">WARNING</option>
-                        <option value="info">INFO</option>
+                        <option value="all">${t('levelAll')}</option>
+                        <option value="error">${t('levelError')}</option>
+                        <option value="warning">${t('levelWarning')}</option>
+                        <option value="info">${t('levelInfo')}</option>
                     </select>
-                    <input type="text" id="logSearch" placeholder="Search logs..." oninput="filterLogs()">
-                    <button class="btn" onclick="loadLogs()">Refresh</button>
+                    <input type="text" id="logSearch" placeholder="${t('searchLogs')}" oninput="filterLogs()">
+                    <button class="btn" onclick="loadLogs()">${t('btnRefresh')}</button>
                 </div>
                 <div class="panel">
-                    <div class="panel-title">Recent Logs <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(${logs.length} lines from ${data.total_files || 0} files)</span></div>
+                    <div class="panel-title">${t('logsTitle')} <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(${logs.length} ${t('logsLines')} ${data.total_files || 0} ${t('logsFiles')})</span></div>
                     <div class="log-viewer scroll-style" id="logViewer"></div>
                 </div>
             `;
@@ -960,7 +1276,7 @@
             `).join('');
             const viewer = document.getElementById('logViewer');
             if (viewer) {
-                viewer.innerHTML = logHTML || '<div style="padding:2rem;text-align:center;color:#64748b;">No logs match filters</div>';
+                viewer.innerHTML = logHTML || `<div style="padding:2rem;text-align:center;color:#64748b;">${t('noLogsMatch')}</div>`;
                 viewer.scrollTop = viewer.scrollHeight; // Auto-scroll to bottom
             }
         }
@@ -983,39 +1299,39 @@
 
             const html = `
                 <div class="panel">
-                    <div class="panel-title">Trading Configuration</div>
+                    <div class="panel-title">${t('settingsTradingTitle')}</div>
                     <div class="config-grid">
-                        <div class="config-item"><span class="config-key">Account</span><span class="config-value">${trading.account || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Feed</span><span class="config-value">${trading.feed || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Execution Mode</span><span class="config-value">${trading.execution_mode || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Target NY Time</span><span class="config-value">${trading.target_ny_time || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Decision Time (CN)</span><span class="config-value">${trading.decision_time_cn || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Execute Time (CN)</span><span class="config-value">${trading.execute_time_cn || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgAccount')}</span><span class="config-value">${trading.account || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgFeed')}</span><span class="config-value">${trading.feed || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgExecutionMode')}</span><span class="config-value">${trading.execution_mode || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgTargetNYTime')}</span><span class="config-value">${trading.target_ny_time || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgDecisionTime')}</span><span class="config-value">${trading.decision_time_cn || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgExecuteTime')}</span><span class="config-value">${trading.execute_time_cn || 'N/A'}</span></div>
                     </div>
                 </div>
                 <div class="panel">
-                    <div class="panel-title">System Information</div>
+                    <div class="panel-title">${t('settingsSystemTitle')}</div>
                     <div class="config-grid">
-                        <div class="config-item"><span class="config-key">Python Version</span><span class="config-value">${system.python_version || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Platform</span><span class="config-value">${system.platform || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Dashboard PID</span><span class="config-value">${system.pid_self || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Scheduler PID</span><span class="config-value">${system.pid_scheduler || 'Not running'}</span></div>
-                        <div class="config-item"><span class="config-key">Watchdog PID</span><span class="config-value">${system.pid_watchdog || 'Not running'}</span></div>
-                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Project Root</span><span class="config-value" style="font-size:0.75rem;">${system.project_root || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgPythonVersion')}</span><span class="config-value">${system.python_version || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgPlatform')}</span><span class="config-value">${system.platform || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgDashboardPID')}</span><span class="config-value">${system.pid_self || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgSchedulerPID')}</span><span class="config-value">${system.pid_scheduler || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgWatchdogPID')}</span><span class="config-value">${system.pid_watchdog || t('notRunning')}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">${t('cfgProjectRoot')}</span><span class="config-value" style="font-size:0.75rem;">${system.project_root || 'N/A'}</span></div>
                     </div>
                 </div>
                 <div class="panel">
-                    <div class="panel-title">Lot Ledger State</div>
+                    <div class="panel-title">${t('settingsLedgerTitle')}</div>
                     <div class="config-grid">
-                        <div class="config-item"><span class="config-key">Last Session Index</span><span class="config-value">${ledger.last_session_idx ?? 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Last Session Date</span><span class="config-value">${ledger.last_session_date || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Last Sync Time (UTC)</span><span class="config-value" style="font-size:0.75rem;">${ledger.last_sync_at_utc || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Last Broker Equity</span><span class="config-value">${ledger.last_broker_equity ? formatCurrency(ledger.last_broker_equity) : 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">Last Sync Applied</span><span class="config-value">${ledger.last_sync_applied ? 'Yes' : 'No'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSessionIdx')}</span><span class="config-value">${ledger.last_session_idx ?? 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSessionDate')}</span><span class="config-value">${ledger.last_session_date || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSyncTime')}</span><span class="config-value" style="font-size:0.75rem;">${ledger.last_sync_at_utc || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastBrokerEquity')}</span><span class="config-value">${ledger.last_broker_equity ? formatCurrency(ledger.last_broker_equity) : 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSyncApplied')}</span><span class="config-value">${ledger.last_sync_applied ? t('yes') : t('no')}</span></div>
                     </div>
                 </div>
                 ${config.scheduler_command ? `<div class="panel">
-                    <div class="panel-title">Scheduler Command</div>
+                    <div class="panel-title">${t('settingsSchedulerTitle')}</div>
                     <pre style="background:#050917;padding:1rem;border-radius:6px;overflow-x:auto;font-size:0.75rem;color:#cbd5e1;">${config.scheduler_command}</pre>
                 </div>` : ''}
             `;
@@ -1032,12 +1348,12 @@
             const connStatus = document.getElementById('connStatus');
 
             sseConnection.onopen = () => {
-                connStatus.textContent = 'Live';
+                connStatus.textContent = t('connLive');
                 connStatus.classList.remove('disconnected');
             };
 
             sseConnection.onerror = () => {
-                connStatus.textContent = 'Disconnected';
+                connStatus.textContent = t('connDisconnected');
                 connStatus.classList.add('disconnected');
                 // Auto-reconnect after 5s
                 setTimeout(() => {
@@ -1067,6 +1383,7 @@
 
         // === INITIALIZATION ===
         function init() {
+            updateLanguage(); // Apply language on load
             loadOverview();
             connectSSE();
 
