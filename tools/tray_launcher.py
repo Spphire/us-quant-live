@@ -111,9 +111,48 @@ def show_notification(title: str, message: str) -> None:
         print(f"[Launcher] notification failed: {exc}", flush=True)
 
 
+def show_notification_async(title: str, message: str) -> None:
+    """Show a notification in a daemon thread so the caller never blocks.
+
+    Use this from background threads (monitor_loop, etc.) where blocking on
+    a MessageBox would prevent restart logic from running.
+    """
+    threading.Thread(
+        target=show_notification, args=(title, message), daemon=True
+    ).start()
+
+
+def _is_port_in_use(host: str, port: int) -> bool:
+    """Return True if a TCP listener already owns (host, port)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.bind((host, port))
+    except OSError:
+        return True
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    return False
+
+
 # === Scheduler subprocess management ===
 class SchedulerSupervisor:
-    """Manages the scheduler subprocess and its lifecycle."""
+    """Manages the scheduler subprocess and its lifecycle.
+
+    Threading model:
+    - All state mutations (process, log_fp, should_run, restart_in_progress)
+      occur under self.lock.
+    - Long-running operations (terminate, taskkill, wait) execute OUTSIDE the
+      lock to avoid blocking other threads for many seconds.
+    - The monitor_thread is permanent: it never exits on its own. It pauses
+      (via should_run=False) when explicitly told to.
+    - start() refuses to spawn a process when should_run is False — this
+      prevents orphaned subprocesses if stop() races with monitor restart.
+    """
 
     def __init__(self):
         self.process: subprocess.Popen | None = None
@@ -140,9 +179,25 @@ class SchedulerSupervisor:
             return None
         return sys.executable
 
-    def start(self) -> bool:
-        """Start the scheduler subprocess. Returns True on success."""
+    def snapshot(self) -> tuple[bool, int | None]:
+        """Thread-safe snapshot of running state and PID. Returns (running, pid_or_None)."""
         with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return True, self.process.pid
+            return False, None
+
+    def start(self) -> bool:
+        """Start the scheduler subprocess. Returns True on success.
+
+        Refuses to start if should_run is False (i.e. stop() was called).
+        This prevents the monitor thread from spawning an orphan subprocess
+        after a manual cleanup has been initiated.
+        """
+        with self.lock:
+            if not self.should_run:
+                print("[Launcher] start() refused: should_run is False", flush=True)
+                return False
+
             if self.process is not None and self.process.poll() is None:
                 print("[Launcher] scheduler already running", flush=True)
                 return True
@@ -162,6 +217,16 @@ class SchedulerSupervisor:
                     "US Quant Live - Error",
                     f"Scheduler script not found:\n{SCHEDULER_SCRIPT}\n\n"
                     f"The .exe must be placed next to the 'tools/' directory.",
+                )
+                return False
+
+            # Check if dashboard port is already in use (often = stale scheduler from prior run)
+            if _is_port_in_use("127.0.0.1", DASHBOARD_PORT):
+                show_notification(
+                    "US Quant Live - Port In Use",
+                    f"Port {DASHBOARD_PORT} is already in use.\n\n"
+                    f"Another instance of the scheduler/dashboard may still be running.\n"
+                    f"Check Task Manager for leftover python.exe processes, or wait 30s.",
                 )
                 return False
 
@@ -241,39 +306,67 @@ class SchedulerSupervisor:
 
     def stop(self, timeout: float = 10.0) -> None:
         """Stop the scheduler subprocess gracefully, killing the whole tree.
-        Also disables auto-restart by the monitor (call set_should_run(True) to re-enable).
+        Disables auto-restart by the monitor (set should_run=True to re-enable).
+
+        Implementation notes:
+        - Acquires lock only briefly to snapshot+clear state, then performs
+          terminate/taskkill/wait OUTSIDE the lock. This prevents other
+          threads (is_running, restart, monitor) from blocking on us for
+          up to `timeout` seconds.
         """
+        # Snapshot under lock; clear state immediately so other callers
+        # (monitor, restart) see process=None and don't operate on it.
         with self.lock:
             self.should_run = False
-            if self.process is None:
-                self._close_log_fp()
-                return
-            if self.process.poll() is not None:
-                self.process = None
-                self._close_log_fp()
-                return
+            proc = self.process
+            log_fp = self.log_fp
+            self.process = None
+            self.log_fp = None
 
-            pid = self.process.pid
-            print(f"[Launcher] stopping scheduler tree (PID {pid})...", flush=True)
-            # Graceful first
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=timeout / 2)
-                print("[Launcher] scheduler stopped gracefully", flush=True)
-            except subprocess.TimeoutExpired:
-                pass
-            except Exception as exc:
-                print(f"[Launcher] terminate error: {exc}", flush=True)
+        if proc is None:
+            # Nothing to terminate, but still close any orphan log handle
+            if log_fp is not None:
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
+            return
 
-            # Always kill the process tree to clean up grandchildren (executor subprocess etc.)
-            self._kill_process_tree(pid, timeout=timeout / 2)
+        if proc.poll() is not None:
+            # Already exited; just clean up handles
+            if log_fp is not None:
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
+            return
+
+        pid = proc.pid
+        print(f"[Launcher] stopping scheduler tree (PID {pid})...", flush=True)
+        # Graceful first
+        try:
+            proc.terminate()
+            proc.wait(timeout=timeout / 2)
+            print("[Launcher] scheduler stopped gracefully", flush=True)
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:
+            print(f"[Launcher] terminate error: {exc}", flush=True)
+
+        # Always kill the process tree to clean up grandchildren
+        # (executor subprocess, dashboard server etc.)
+        self._kill_process_tree(pid, timeout=timeout / 2)
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+        # Close log handle last
+        if log_fp is not None:
             try:
-                self.process.wait(timeout=3)
+                log_fp.close()
             except Exception:
                 pass
-
-            self.process = None
-            self._close_log_fp()
 
     def restart(self) -> bool:
         """Restart the scheduler safely (won't race with monitor)."""
@@ -299,51 +392,100 @@ class SchedulerSupervisor:
             return self.process is not None and self.process.poll() is None
 
     def monitor_loop(self) -> None:
-        """Background thread: restart scheduler if it dies unexpectedly."""
+        """Background thread: restart scheduler if it dies unexpectedly.
+
+        Lifecycle: this thread runs FOREVER until the process is killed.
+        It pauses (no-ops) when should_run is False, and resumes auto-restart
+        when should_run is True (set by start() / restart()).
+
+        We catch all exceptions to avoid the thread dying silently — once it
+        dies, no future crash detection works.
+        """
+        suppressed_until_manual_restart = False  # set after early-death
+
         while True:
-            time.sleep(5)
-            with self.lock:
-                if not self.should_run or self.restart_in_progress:
-                    if not self.should_run:
-                        return
-                    continue
-                if self.process is None:
-                    continue
-                exit_code = self.process.poll()
-                if exit_code is None:
-                    continue  # Still running
+            try:
+                time.sleep(5)
 
-                # Process died
-                uptime = time.time() - self.start_time
-                print(
-                    f"[Launcher] scheduler died (code={exit_code}, uptime={uptime:.1f}s)",
-                    flush=True,
-                )
-                self._close_log_fp()
-                self.process = None
+                # Snapshot state under the lock; do any restart spawn OUTSIDE the lock
+                with self.lock:
+                    if not self.should_run or self.restart_in_progress:
+                        continue
+                    if suppressed_until_manual_restart:
+                        # Wait for manual restart to clear the suppression flag
+                        # (restart() sets should_run back to True; that's our signal)
+                        continue
+                    if self.process is None:
+                        continue
+                    exit_code = self.process.poll()
+                    if exit_code is None:
+                        continue  # Still running
 
-                # Don't auto-restart if it died very quickly (likely config error)
-                if uptime < EARLY_DEATH_THRESHOLD_SECONDS:
+                    # Process died — capture diagnostics under lock
+                    uptime = time.time() - self.start_time
                     print(
-                        f"[Launcher] scheduler exited too quickly ({uptime:.1f}s < {EARLY_DEATH_THRESHOLD_SECONDS}s), "
-                        f"not auto-restarting",
+                        f"[Launcher] scheduler died (code={exit_code}, uptime={uptime:.1f}s)",
                         flush=True,
                     )
-                    self.should_run = False
-                    show_notification(
+
+                    # Close log handle and clear process slot
+                    log_fp_to_close = self.log_fp
+                    self.log_fp = None
+                    self.process = None
+
+                    # Decide whether to auto-restart
+                    if uptime < EARLY_DEATH_THRESHOLD_SECONDS:
+                        print(
+                            f"[Launcher] scheduler exited too quickly ({uptime:.1f}s < "
+                            f"{EARLY_DEATH_THRESHOLD_SECONDS}s), suspending auto-restart",
+                            flush=True,
+                        )
+                        suppressed_until_manual_restart = True
+                        # Atomic flip: don't auto-restart, but stay alive to react
+                        # to a future manual restart (which sets should_run=True
+                        # and we'll clear the suppression flag below).
+
+                # Operations OUTSIDE the lock
+                if log_fp_to_close is not None:
+                    try:
+                        log_fp_to_close.close()
+                    except Exception:
+                        pass
+
+                if suppressed_until_manual_restart:
+                    # Notify user, do not block the monitor (use async dialog)
+                    show_notification_async(
                         "US Quant Live - Scheduler Crashed",
                         f"Scheduler exited unexpectedly within {uptime:.1f}s.\n\n"
                         f"This usually means a config error. Check the log:\n{DASHBOARD_LOG}\n\n"
                         f"Use the tray menu 'Restart Scheduler' to retry after fixing.",
                     )
-                    return
+                    # Wait for restart() to flip should_run back to True (manual signal).
+                    # Poll the flag and clear suppression when user retries.
+                    while True:
+                        time.sleep(2)
+                        with self.lock:
+                            if self.should_run and self.process is not None:
+                                # restart() succeeded; reset suppression
+                                suppressed_until_manual_restart = False
+                                break
+                    continue  # Resume normal monitoring
 
-            # Restart outside the lock (avoid deadlock with start()'s lock)
-            print("[Launcher] auto-restarting scheduler...", flush=True)
-            self.start()
+                # Normal auto-restart path
+                print("[Launcher] auto-restarting scheduler...", flush=True)
+                self.start()
+            except Exception as exc:
+                # Never let the monitor die — log and continue. Otherwise future
+                # crashes go undetected.
+                import traceback
+                print(f"[Launcher] monitor_loop exception: {exc}", flush=True)
+                traceback.print_exc()
+                time.sleep(5)
 
     def start_monitor(self) -> None:
-        """Start the monitor thread."""
+        """Start the monitor thread (only if not already running)."""
+        if self.monitor_thread is not None and self.monitor_thread.is_alive():
+            return
         self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
         self.monitor_thread.start()
 
@@ -367,15 +509,23 @@ def make_menu(supervisor: SchedulerSupervisor, on_exit_callback) -> pystray.Menu
             show_notification("US Quant Live", "Log file not yet created. Wait a few seconds.")
 
     def restart_scheduler(icon, item):
-        threading.Thread(target=lambda: (
-            supervisor.restart(),
-            show_notification("US Quant Live", "Scheduler restarted"),
-        ), daemon=True).start()
+        def _do_restart():
+            ok = supervisor.restart()
+            show_notification(
+                "US Quant Live",
+                "Scheduler restarted successfully" if ok else
+                "Restart failed — check the log file via 'Open Latest Log'",
+            )
+        threading.Thread(target=_do_restart, daemon=True).start()
 
     def show_status(icon, item):
-        running = supervisor.is_running()
-        pid = supervisor.process.pid if running else "N/A"
-        msg = f"Scheduler: {'Running' if running else 'Stopped'}\nPID: {pid}\nDashboard: {DASHBOARD_URL}"
+        # Atomic snapshot to avoid TOCTOU race with monitor_loop
+        running, pid = supervisor.snapshot()
+        msg = (
+            f"Scheduler: {'Running' if running else 'Stopped'}\n"
+            f"PID: {pid if pid is not None else 'N/A'}\n"
+            f"Dashboard: {DASHBOARD_URL}"
+        )
         show_notification("US Quant Live - Status", msg)
 
     def quit_app(icon, item):
@@ -425,7 +575,17 @@ def main():
         actual_icon = next((p for p in icon_search if p.exists()), None)
 
         if actual_icon is None:
-            print(f"[Launcher] WARNING: icon not found, generating...", flush=True)
+            # In frozen mode the generator script isn't bundled — show clear error.
+            if getattr(sys, 'frozen', False):
+                show_notification(
+                    "US Quant Live - Error",
+                    f"Tray icon not found in bundled .exe.\n\n"
+                    f"This is a build issue. Rebuild with:\n"
+                    f"python tools/build_exe.py",
+                )
+                return 1
+            # Dev mode: try regenerating
+            print(f"[Launcher] icon not found, attempting to generate...", flush=True)
             try:
                 from generate_tray_icon import main as gen_icon
                 gen_icon()
@@ -434,7 +594,11 @@ def main():
                 show_notification("US Quant Live - Error", f"Failed to generate icon: {exc}")
                 return 1
 
-        icon_image = Image.open(actual_icon)
+        # Load icon into memory and close the file handle immediately so that:
+        # (1) the .ico file isn't locked while the tray runs, and
+        # (2) Windows can replace the file (e.g., for icon updates).
+        with Image.open(actual_icon) as src:
+            icon_image = src.copy()
 
         # Start scheduler
         supervisor = SchedulerSupervisor()

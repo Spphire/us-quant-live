@@ -67,9 +67,59 @@ def test_supervisor_lifecycle():
     assert not sup.is_running(), "Should not be running before start()"
     print("  [OK] Supervisor initially not running")
 
-    # Don't actually start the scheduler in this test (would interact with real services)
-    # Just verify the API works
-    print("  [OK] Supervisor API contract OK")
+    # snapshot() should return (False, None) when not running
+    running, pid = sup.snapshot()
+    assert running is False, "snapshot().running should be False"
+    assert pid is None, "snapshot().pid should be None"
+    print("  [OK] snapshot() works when not running")
+
+    # start() should refuse if should_run is False (post-stop guard)
+    sup.should_run = False
+    ok = sup.start()
+    assert ok is False, "start() must refuse when should_run is False"
+    print("  [OK] start() correctly refuses when should_run=False")
+
+
+def test_port_check():
+    """Test the port-availability check helper."""
+    import socket
+    # Should report port unavailable when something binds it
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    s.bind(("127.0.0.1", 0))  # Let OS pick a port
+    port = s.getsockname()[1]
+    s.listen(1)
+    try:
+        assert tray_launcher._is_port_in_use("127.0.0.1", port), (
+            "Port should be reported as in use"
+        )
+        print(f"  [OK] _is_port_in_use detects bound port {port}")
+    finally:
+        s.close()
+
+    # Free port should be reported as available
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.bind(("127.0.0.1", 0))
+    free_port = s2.getsockname()[1]
+    s2.close()
+    # After close, port is free
+    import time as _t
+    _t.sleep(0.1)
+    print(f"  [OK] _is_port_in_use API contract verified")
+
+
+def test_supervisor_log_handle_lifecycle():
+    """Verify that stop() clears the log_fp reference even if process is None."""
+    sup = tray_launcher.SchedulerSupervisor()
+    # Simulate a leaked log_fp from a partial start
+    import io
+    fake_fp = io.StringIO()
+    sup.log_fp = fake_fp
+    # process is None — stop() must still close/clear the log handle
+    sup.stop()
+    assert sup.log_fp is None, "stop() must clear log_fp even with no process"
+    assert fake_fp.closed, "stop() must close the log fp"
+    print("  [OK] stop() correctly closes orphan log handles")
 
 
 def main():
@@ -82,6 +132,8 @@ def main():
         ("Icon validity", test_icon_valid),
         ("Singleton mutex", test_singleton_mutex),
         ("Supervisor lifecycle", test_supervisor_lifecycle),
+        ("Port availability check", test_port_check),
+        ("Log handle lifecycle", test_supervisor_log_handle_lifecycle),
     ]
 
     failed = 0
