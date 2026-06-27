@@ -1,5 +1,11 @@
 # Quick Start Scripts for us-quant-live
 
+## Important Notes
+
+**Data Feed**: System defaults to SIP (full market coverage). **DO NOT** use `--feed iex` - IEX covers only ~2-3% of market and will cause missing data for most stocks.
+
+**Rate Limiting**: First run may hit Alpaca's 200 req/min limit (HTTP 403/429). Wait 2 minutes and retry. Daemon mode (every 12h) never hits limit. See [ALPACA_RATE_LIMIT_GUIDE.md](ALPACA_RATE_LIMIT_GUIDE.md) for details.
+
 ## Activate Virtual Environment
 
 **Bash/Git Bash:**

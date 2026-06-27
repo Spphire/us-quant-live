@@ -2,6 +2,22 @@
 
 美股多因子横截面多空策略实盘系统。项目覆盖动态股票池、Alpha/Decision Engine、lot 最短持仓锁定、Reg T 两阶段调仓执行、Alpaca/IBKR 执行接口与后台守护调度。
 
+## 重要提示
+
+### 数据源要求
+
+**必须使用 SIP (Securities Information Processor) 数据源**：
+- IEX 仅覆盖 ~2-3% 美股成交量，会导致大量股票数据缺失
+- SIP 覆盖全市场（NYSE/NASDAQ/AMEX），确保 1000-symbol 策略完整运行
+- 代码默认使用 SIP，**不要修改 `--feed` 参数**
+
+### API 限速说明
+
+Alpaca 免费版限制 **200 requests/minute**：
+- **守护进程模式**（推荐）：每天仅运行 2 次，间隔 10 小时，永不触发限速
+- **手动测试**：首次运行可能触发限速（HTTP 403/429），等待 2 分钟重试即可
+- **详细排查**：见 [ALPACA_RATE_LIMIT_GUIDE.md](ALPACA_RATE_LIMIT_GUIDE.md)
+
 ## 守护进程
 
 后台守护由两层组成：

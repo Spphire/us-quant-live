@@ -98,10 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--dynamic-feed",
         default="sip",
-        help="Feed for dynamic symbol pool refresh.",
+        help="Feed for dynamic symbol pool refresh. MUST be 'sip' for 1000-symbol universe (IEX covers only ~2-3%% market).",
     )
 
-    parser.add_argument("--feed", default="sip", help="Feed used by AlphaCore bars fetch.")
+    parser.add_argument("--feed", default="sip", help="Feed used by AlphaCore bars fetch. MUST be 'sip' for full market coverage.")
     parser.add_argument("--price-adjustment", default="all")
     parser.add_argument("--bars-window-calendar-days", type=int, default=420)
     parser.add_argument("--bars-chunk-size", type=int, default=120)
@@ -166,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="marketable_limit",
         help="Order style for live submission.",
     )
-    parser.add_argument("--execution-price-feed", default="sip")
+    parser.add_argument("--execution-price-feed", default="sip", help="Feed for execution price reference. MUST be 'sip' for accurate market-wide pricing.")
     parser.add_argument(
         "--adverse-price-offset-bps",
         type=float,
@@ -311,6 +311,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser.add_argument("--output-root", default=None)
     args = parser.parse_args(argv)
+
+    # Validate feed choices - SIP is required for 1000-symbol universe
+    if str(args.feed).lower() != "sip":
+        print(
+            f"[WARNING] --feed={args.feed} detected. For 1000-symbol universe, SIP is required.\n"
+            f"          IEX covers only ~2-3% of market volume and will miss many stocks.\n"
+            f"          Recommend: --feed sip (default)",
+            flush=True,
+        )
+    if str(args.dynamic_feed).lower() != "sip":
+        print(
+            f"[WARNING] --dynamic-feed={args.dynamic_feed} detected. For 1000-symbol universe, SIP is required.\n"
+            f"          IEX will cause symbol pool filtering to fail on missing data.\n"
+            f"          Recommend: --dynamic-feed sip (default)",
+            flush=True,
+        )
 
     try:
         decision_date = _normalize_date(args.date)
