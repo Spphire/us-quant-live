@@ -120,39 +120,168 @@ class DataAggregator:
             return summaries
 
     def get_logs(self, lines: int = 100, level: str = "all", source: str = "all") -> dict[str, Any]:
-        """Get recent logs."""
+        """Get recent logs with parsed timestamp/level/source."""
+        import re
         with self.cache_lock:
             log_dir = self.artifacts_root / "logs"
-            if not log_dir.exists():
-                return {"logs": []}
+            daemon_dir = self.artifacts_root / "daemon"
+            watchdog_dir = self.artifacts_root / "watchdog"
 
-            # Find most recent log files
-            log_files = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-            all_logs = []
+            log_files: list[Path] = []
+            for d in (log_dir, daemon_dir, watchdog_dir):
+                if d.exists():
+                    log_files.extend(d.glob("*.log"))
+            log_files = sorted(log_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
-            for log_file in log_files[:5]:  # Last 5 log files
+            # Pattern: [YYYY-MM-DD HH:MM:SS] [Component] message
+            #   or:   [Component] message
+            ts_pattern = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\]]*)\]\s*(.*)$")
+            tag_pattern = re.compile(r"^\[([A-Za-z]+)\]\s*(.*)$")
+            level_keywords = {
+                "ERROR": ["error", "exception", "traceback", "failed", "fatal"],
+                "WARNING": ["warning", "warn"],
+            }
+
+            def detect_level(text: str) -> str:
+                lower = text.lower()
+                for lvl, kws in level_keywords.items():
+                    if any(kw in lower for kw in kws):
+                        return lvl
+                return "INFO"
+
+            all_logs: list[dict[str, Any]] = []
+            for log_file in log_files[:8]:
                 try:
-                    content = log_file.read_text(encoding="utf-8", errors="ignore")
+                    # Read last ~10KB only (avoid huge file scans)
+                    file_size = log_file.stat().st_size
+                    read_bytes = min(file_size, 200_000)
+                    with open(log_file, "rb") as f:
+                        f.seek(file_size - read_bytes)
+                        content = f.read().decode("utf-8", errors="ignore")
                     log_lines = content.strip().split("\n")
-                    for line in log_lines[-lines:]:
-                        if line.strip():
-                            all_logs.append({"timestamp": "", "level": "INFO", "source": log_file.stem, "message": line})
+                    file_source = log_file.parent.name + "/" + log_file.stem
+                    for line in log_lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ts = ""
+                        msg = line
+                        component = file_source
+                        m = ts_pattern.match(line)
+                        if m:
+                            ts = m.group(1)
+                            msg = m.group(2)
+                        tm = tag_pattern.match(msg)
+                        if tm:
+                            component = tm.group(1)
+                            msg = tm.group(2)
+                        lvl = detect_level(msg)
+                        # Apply filters
+                        if level != "all" and lvl.lower() != level.lower():
+                            continue
+                        if source != "all" and source.lower() not in component.lower() and source.lower() not in file_source.lower():
+                            continue
+                        all_logs.append(
+                            {
+                                "timestamp": ts,
+                                "level": lvl,
+                                "source": component,
+                                "file": file_source,
+                                "message": msg,
+                            }
+                        )
                 except Exception:
                     continue
 
-            return {"logs": all_logs[-lines:]}
+            return {"logs": all_logs[-lines:], "total_files": len(log_files)}
 
     def get_config(self) -> dict[str, Any]:
-        """Get system configuration."""
+        """Get system configuration and live status."""
+        import os
+        import sys
+        import platform
+        lot_ledger = self._read_lot_ledger()
+        meta = lot_ledger.get("meta", {})
+
+        # Try to read scheduler command for actual config
+        scheduler_cmd_file = self.artifacts_root / "daemon" / "scheduler.command.txt"
+        scheduler_cmd = ""
+        if scheduler_cmd_file.exists():
+            try:
+                scheduler_cmd = scheduler_cmd_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        # Detect PIDs
+        scheduler_pid_file = self.artifacts_root / "daemon" / "scheduler.pid"
+        watchdog_pid_file = self.artifacts_root / "watchdog" / "watchdog.pid"
+
+        def read_pid(path: Path) -> int | None:
+            if not path.exists():
+                return None
+            try:
+                return int(path.read_text().strip())
+            except Exception:
+                return None
+
+        scheduler_pid = read_pid(scheduler_pid_file)
+        watchdog_pid = read_pid(watchdog_pid_file)
+
         return {
-            "account": "ALPACA_US_FULL",
-            "feed": "sip",
-            "execution_mode": "staged_regt",
-            "target_ny_time": "10:00",
-            "decision_time_cn": "12:00",
-            "execute_time_cn": "22:00",
-            "project_root": str(self.project_root),
+            "trading": {
+                "account": "ALPACA_US_FULL",
+                "feed": "sip",
+                "execution_mode": "staged_regt",
+                "target_ny_time": "10:00",
+                "decision_time_cn": "12:00",
+                "execute_time_cn": "22:00",
+            },
+            "system": {
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "platform": platform.system() + " " + platform.release(),
+                "project_root": str(self.project_root),
+                "pid_self": os.getpid(),
+                "pid_scheduler": scheduler_pid,
+                "pid_watchdog": watchdog_pid,
+            },
+            "ledger": {
+                "last_session_idx": meta.get("last_session_idx"),
+                "last_session_date": meta.get("last_session_date"),
+                "last_sync_at_utc": meta.get("executor_last_sync_at_utc"),
+                "last_broker_equity": meta.get("executor_last_broker_equity"),
+                "last_sync_applied": meta.get("executor_last_sync_applied"),
+            },
+            "scheduler_command": scheduler_cmd,
         }
+
+    def get_artifact_mtimes(self) -> dict[str, float]:
+        """Return mtimes of key artifact files for change detection (SSE)."""
+        files = {
+            "lot_ledger": self.project_root / "artifacts" / "alpaca_executor" / "lot_ledger.json",
+            "state": self.artifacts_root / "state.json",
+        }
+        # Also include latest execution_summary
+        output_root = self.artifacts_root / "output"
+        if output_root.exists():
+            try:
+                latest = max(
+                    (d for d in output_root.iterdir() if d.is_dir() and (d / "execution_summary.json").exists()),
+                    key=lambda d: d.stat().st_mtime,
+                    default=None,
+                )
+                if latest is not None:
+                    files["latest_summary"] = latest / "execution_summary.json"
+            except Exception:
+                pass
+
+        mtimes: dict[str, float] = {}
+        for key, path in files.items():
+            try:
+                if path.exists():
+                    mtimes[key] = path.stat().st_mtime
+            except Exception:
+                pass
+        return mtimes
 
     def _read_scheduler_state(self) -> dict[str, Any]:
         """Read scheduler state.json."""
@@ -301,22 +430,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_sse(self) -> None:
-        """Send Server-Sent Events stream."""
+        """Send Server-Sent Events stream with file change detection."""
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        # Send heartbeat every 30 seconds
+        last_mtimes = self.aggregator.get_artifact_mtimes()
+        last_heartbeat = time.time()
+        heartbeat_interval = 15.0  # send heartbeat every 15s to keep connection alive
+        poll_interval = 1.5  # check for file changes every 1.5s
+
+        # Send initial snapshot event so client knows connection is live
+        try:
+            initial = json.dumps({"event": "connected", "mtimes": last_mtimes, "timestamp": datetime.utcnow().isoformat()})
+            self.wfile.write(f"data: {initial}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
         try:
             while True:
-                event = f"data: {json.dumps({'event': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
-                self.wfile.write(event.encode("utf-8"))
-                self.wfile.flush()
-                time.sleep(30)
+                time.sleep(poll_interval)
+                now = time.time()
+                current = self.aggregator.get_artifact_mtimes()
+                changed_keys = [k for k, v in current.items() if last_mtimes.get(k) != v]
+
+                if changed_keys:
+                    payload = json.dumps({"event": "artifacts_changed", "changed": changed_keys, "timestamp": datetime.utcnow().isoformat()})
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_mtimes = current
+                    last_heartbeat = now
+                elif now - last_heartbeat >= heartbeat_interval:
+                    hb = json.dumps({"event": "heartbeat", "timestamp": datetime.utcnow().isoformat()})
+                    self.wfile.write(f"data: {hb}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_heartbeat = now
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            return
 
     def _send_error(self, status: HTTPStatus, message: str) -> None:
         """Send error response."""

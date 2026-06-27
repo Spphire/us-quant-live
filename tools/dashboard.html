@@ -6,478 +6,443 @@
     <title>Live Trading Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #0a0e27;
-            color: #e4e8f0;
-            line-height: 1.6;
+            background: #0a0e27; color: #e4e8f0; line-height: 1.6;
+            min-height: 100vh;
         }
-
         .header {
             background: linear-gradient(135deg, #1a1f3a 0%, #0f1729 100%);
-            padding: 1.5rem 2rem;
+            padding: 1.25rem 2rem;
             border-bottom: 1px solid #1e2a4a;
             box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        }
-
-        .header h1 {
-            font-size: 1.75rem;
-            font-weight: 600;
-            color: #ffffff;
             display: flex;
             align-items: center;
-            gap: 0.75rem;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
-
+        .header h1 {
+            font-size: 1.5rem; font-weight: 600; color: #ffffff;
+            display: flex; align-items: center; gap: 0.75rem;
+        }
         .header h1::before {
-            content: '●';
-            color: #10b981;
+            content: '●'; color: #10b981;
             animation: pulse 2s ease-in-out infinite;
+            font-size: 0.7em;
         }
-
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.85); }
         }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 2rem;
+        .header-status {
+            display: flex; align-items: center; gap: 1rem;
+            font-size: 0.85rem; color: #8b92a8;
         }
-
-        .tabs {
-            display: flex;
-            gap: 0.5rem;
-            margin-bottom: 2rem;
-            border-bottom: 2px solid #1e2a4a;
-        }
-
-        .tab {
-            padding: 0.75rem 1.5rem;
-            background: transparent;
-            border: none;
-            color: #8b92a8;
-            cursor: pointer;
-            font-size: 0.95rem;
+        .conn-indicator {
+            display: inline-flex; align-items: center; gap: 0.4rem;
+            padding: 0.3rem 0.7rem;
+            background: rgba(16, 185, 129, 0.15);
+            color: #10b981;
+            border-radius: 12px;
             font-weight: 500;
+            font-size: 0.8rem;
+        }
+        .conn-indicator.disconnected {
+            background: rgba(239, 68, 68, 0.15); color: #ef4444;
+        }
+        .conn-indicator::before {
+            content: ''; width: 6px; height: 6px; border-radius: 50%;
+            background: currentColor;
+        }
+        .container { max-width: 1500px; margin: 0 auto; padding: 1.5rem 2rem; }
+        .tabs {
+            display: flex; gap: 0.25rem;
+            margin-bottom: 1.5rem;
+            border-bottom: 2px solid #1e2a4a;
+            overflow-x: auto;
+        }
+        .tab {
+            padding: 0.7rem 1.4rem;
+            background: transparent; border: none;
+            color: #8b92a8; cursor: pointer;
+            font-size: 0.9rem; font-weight: 500;
             transition: all 0.2s;
             border-bottom: 2px solid transparent;
             margin-bottom: -2px;
+            white-space: nowrap;
+            font-family: inherit;
         }
-
-        .tab:hover {
-            color: #e4e8f0;
-            background: rgba(255,255,255,0.05);
-        }
-
-        .tab.active {
-            color: #60a5fa;
-            border-bottom-color: #60a5fa;
-        }
-
-        .tab-content {
-            display: none;
-        }
-
+        .tab:hover { color: #e4e8f0; background: rgba(255,255,255,0.04); }
+        .tab.active { color: #60a5fa; border-bottom-color: #60a5fa; }
+        .tab-content { display: none; }
         .tab-content.active {
             display: block;
-            animation: fadeIn 0.3s;
+            animation: fadeIn 0.25s ease;
         }
-
         @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
+            from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
         }
-
         .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
         }
-
         .metric-card {
             background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            padding: 1.5rem;
-            border-radius: 12px;
+            padding: 1.25rem 1.5rem;
+            border-radius: 10px;
             border: 1px solid #1e2a4a;
             box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            transition: transform 0.15s, border-color 0.15s;
         }
-
+        .metric-card:hover { transform: translateY(-2px); border-color: #2a3658; }
         .metric-label {
-            font-size: 0.85rem;
-            color: #8b92a8;
+            font-size: 0.75rem; color: #8b92a8;
             margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            text-transform: uppercase; letter-spacing: 0.6px;
         }
-
         .metric-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: #ffffff;
+            font-size: 1.75rem; font-weight: 700; color: #ffffff;
             margin-bottom: 0.25rem;
+            line-height: 1.2;
         }
-
-        .metric-change {
-            font-size: 0.9rem;
-            font-weight: 500;
-        }
-
-        .metric-change.positive {
-            color: #10b981;
-        }
-
-        .metric-change.negative {
-            color: #ef4444;
-        }
-
-        .chart-container {
+        .metric-value.small { font-size: 1.1rem; font-weight: 600; }
+        .metric-change { font-size: 0.85rem; font-weight: 500; color: #8b92a8; }
+        .metric-change.positive { color: #10b981; }
+        .metric-change.negative { color: #ef4444; }
+        .panel {
             background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            padding: 2rem;
-            border-radius: 12px;
+            padding: 1.5rem;
+            border-radius: 10px;
             border: 1px solid #1e2a4a;
-            margin-bottom: 2rem;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        }
-
-        .chart-title {
-            font-size: 1.25rem;
-            font-weight: 600;
             margin-bottom: 1.5rem;
-            color: #ffffff;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            border-radius: 12px;
-            overflow: hidden;
             box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         }
-
-        thead {
-            background: #0f1729;
-            border-bottom: 2px solid #1e2a4a;
+        .panel-title {
+            font-size: 1.05rem; font-weight: 600;
+            margin-bottom: 1rem; color: #ffffff;
+            display: flex; align-items: center; justify-content: space-between;
         }
-
+        .panel-title .actions {
+            display: flex; gap: 0.5rem;
+            font-size: 0.8rem; font-weight: 400;
+        }
+        table {
+            width: 100%; border-collapse: collapse;
+            background: transparent;
+        }
+        thead { border-bottom: 2px solid #1e2a4a; }
         th {
-            padding: 1rem;
+            padding: 0.75rem 1rem;
             text-align: left;
-            font-size: 0.85rem;
-            font-weight: 600;
+            font-size: 0.78rem; font-weight: 600;
             color: #8b92a8;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            cursor: pointer;
+            user-select: none;
+        }
+        th:hover { color: #e4e8f0; }
+        th.sort-asc::after { content: ' ▲'; color: #60a5fa; }
+        th.sort-desc::after { content: ' ▼'; color: #60a5fa; }
+        td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid #1e2a4a;
+            font-size: 0.9rem;
+        }
+        tr:last-child td { border-bottom: none; }
+        tbody tr { transition: background 0.15s; }
+        tbody tr:hover { background: rgba(96, 165, 250, 0.06); }
+        .badge {
+            display: inline-block; padding: 0.2rem 0.65rem;
+            border-radius: 10px;
+            font-size: 0.75rem; font-weight: 600;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
-
-        td {
-            padding: 1rem;
-            border-bottom: 1px solid #1e2a4a;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        tbody tr {
-            transition: background 0.2s;
-        }
-
-        tbody tr:hover {
-            background: rgba(96, 165, 250, 0.1);
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-
-        .badge.long {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
-        }
-
-        .badge.short {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
-        }
-
-        .positive {
-            color: #10b981;
-        }
-
-        .negative {
-            color: #ef4444;
-        }
-
+        .badge.long, .badge.completed, .badge.success { background: rgba(16, 185, 129, 0.18); color: #10b981; }
+        .badge.short, .badge.failed, .badge.error { background: rgba(239, 68, 68, 0.18); color: #ef4444; }
+        .badge.pending, .badge.warning { background: rgba(251, 191, 36, 0.18); color: #fbbf24; }
+        .badge.info, .badge.running { background: rgba(96, 165, 250, 0.18); color: #60a5fa; }
+        .badge.locked { background: rgba(251, 146, 60, 0.18); color: #fb923c; }
+        .badge.unlocked { background: rgba(148, 163, 184, 0.18); color: #94a3b8; }
+        .positive { color: #10b981; }
+        .negative { color: #ef4444; }
+        .neutral { color: #8b92a8; }
         .loading {
-            text-align: center;
-            padding: 3rem;
-            color: #8b92a8;
-            font-size: 1.1rem;
+            text-align: center; padding: 2.5rem;
+            color: #8b92a8; font-size: 1rem;
         }
-
-        .loading::after {
-            content: '...';
-            animation: loading 1.5s infinite;
-        }
-
-        @keyframes loading {
+        .loading::after { content: '...'; animation: ldots 1.5s infinite; }
+        @keyframes ldots {
             0%, 20% { content: '.'; }
             40% { content: '..'; }
             60%, 100% { content: '...'; }
         }
-
-        .status-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-            font-weight: 500;
+        .empty-state {
+            text-align: center; padding: 3rem 1rem;
+            color: #64748b;
         }
-
-        .status-pill.completed {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
-        }
-
-        .status-pill.running {
-            background: rgba(96, 165, 250, 0.2);
-            color: #60a5fa;
-        }
-
-        .status-pill.pending {
-            background: rgba(251, 191, 36, 0.2);
-            color: #fbbf24;
-        }
-
-        .timeline {
-            margin: 2rem 0;
-            padding: 1.5rem;
-            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            border-radius: 12px;
-            border: 1px solid #1e2a4a;
-        }
-
-        .timeline-item {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin: 1rem 0;
-        }
-
-        .timeline-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: #60a5fa;
-        }
-
-        .timeline-dot.completed {
-            background: #10b981;
-        }
-
-        .timeline-dot.pending {
-            background: #8b92a8;
-        }
-
+        .empty-state-icon { font-size: 3rem; margin-bottom: 0.5rem; opacity: 0.4; }
         .filter-bar {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
+            display: flex; flex-wrap: wrap; gap: 0.75rem;
+            margin-bottom: 1rem;
             padding: 1rem;
             background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            border-radius: 12px;
+            border-radius: 10px;
             border: 1px solid #1e2a4a;
         }
-
-        .filter-bar input,
-        .filter-bar select {
-            padding: 0.5rem 1rem;
+        .filter-bar input, .filter-bar select {
+            padding: 0.5rem 0.85rem;
             background: #0f1729;
             border: 1px solid #1e2a4a;
             border-radius: 6px;
-            color: #e4e8f0;
-            font-size: 0.9rem;
+            color: #e4e8f0; font-size: 0.85rem;
+            font-family: inherit;
         }
-
-        .filter-bar input:focus,
-        .filter-bar select:focus {
-            outline: none;
-            border-color: #60a5fa;
+        .filter-bar input { min-width: 200px; }
+        .filter-bar input:focus, .filter-bar select:focus {
+            outline: none; border-color: #60a5fa;
         }
-
-        canvas {
-            max-height: 300px;
+        .filter-bar .filter-label {
+            display: flex; align-items: center;
+            font-size: 0.8rem; color: #8b92a8;
+            margin-right: -0.5rem;
         }
-
-        .lot-composition {
+        canvas { max-height: 320px; }
+        .charts-row {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
-            margin-bottom: 2rem;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
         }
-
-        .pie-container {
-            background: linear-gradient(135deg, #1a1f3a 0%, #141829 100%);
-            padding: 2rem;
-            border-radius: 12px;
-            border: 1px solid #1e2a4a;
+        @media (max-width: 900px) { .charts-row { grid-template-columns: 1fr; } }
+        .timeline-row {
+            display: flex; align-items: center; gap: 1rem;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #1e2a4a;
         }
-
-        .legend {
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
+        .timeline-row:last-child { border-bottom: none; }
+        .timeline-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: #94a3b8;
+            box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.15);
+            flex-shrink: 0;
         }
-
+        .timeline-dot.completed { background: #10b981; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18); }
+        .timeline-dot.failed { background: #ef4444; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18); }
+        .timeline-dot.running {
+            background: #60a5fa; box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
+            animation: blink 1s ease-in-out infinite;
+        }
+        @keyframes blink { 50% { opacity: 0.4; } }
+        .timeline-label { flex: 1; font-size: 0.9rem; }
+        .timeline-sub { font-size: 0.8rem; color: #8b92a8; }
+        .legend-list { display: flex; flex-direction: column; gap: 0.5rem; }
         .legend-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0.75rem;
-            background: rgba(255,255,255,0.05);
-            border-radius: 8px;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0.6rem 0.85rem;
+            background: rgba(255,255,255,0.03);
+            border-radius: 6px;
+            font-size: 0.85rem;
         }
-
         .legend-color {
-            width: 16px;
-            height: 16px;
-            border-radius: 4px;
-            margin-right: 0.75rem;
+            width: 12px; height: 12px; border-radius: 3px;
+            margin-right: 0.65rem;
         }
-
-        .legend-label {
-            flex: 1;
-            font-size: 0.9rem;
+        .legend-label { flex: 1; }
+        .legend-value { font-weight: 600; color: #ffffff; }
+        .log-viewer {
+            background: #050917;
+            border: 1px solid #1e2a4a;
+            border-radius: 8px;
+            padding: 0.5rem;
+            max-height: 520px;
+            overflow-y: auto;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', monospace;
+            font-size: 0.78rem;
+            line-height: 1.55;
         }
-
-        .legend-value {
-            font-weight: 600;
-            color: #ffffff;
+        .log-line {
+            padding: 0.15rem 0.5rem;
+            display: flex; gap: 0.6rem;
+            border-radius: 3px;
         }
+        .log-line:hover { background: rgba(255,255,255,0.03); }
+        .log-ts { color: #64748b; flex-shrink: 0; min-width: 130px; }
+        .log-level { flex-shrink: 0; min-width: 60px; font-weight: 600; }
+        .log-level.INFO { color: #60a5fa; }
+        .log-level.WARNING { color: #fbbf24; }
+        .log-level.ERROR { color: #ef4444; }
+        .log-src { color: #94a3b8; flex-shrink: 0; min-width: 90px; }
+        .log-msg { color: #cbd5e1; word-break: break-word; }
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+        }
+        .config-item {
+            display: flex; justify-content: space-between;
+            padding: 0.6rem 0.85rem;
+            background: rgba(255,255,255,0.03);
+            border-radius: 6px;
+            font-size: 0.88rem;
+        }
+        .config-key { color: #8b92a8; }
+        .config-value {
+            color: #e4e8f0; font-weight: 500;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.82rem;
+        }
+        .modal-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.65);
+            z-index: 200;
+            justify-content: center; align-items: center;
+            padding: 2rem;
+        }
+        .modal-overlay.show { display: flex; }
+        .modal {
+            background: #0f1729;
+            border: 1px solid #1e2a4a;
+            border-radius: 12px;
+            max-width: 900px; width: 100%; max-height: 85vh;
+            overflow: hidden;
+            display: flex; flex-direction: column;
+            box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+        }
+        .modal-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #1e2a4a;
+        }
+        .modal-title { font-size: 1.1rem; font-weight: 600; }
+        .modal-close {
+            background: transparent; border: none;
+            color: #8b92a8; cursor: pointer; font-size: 1.5rem;
+            padding: 0.2rem 0.7rem;
+            border-radius: 6px;
+        }
+        .modal-close:hover { background: rgba(255,255,255,0.05); color: #ffffff; }
+        .modal-body {
+            padding: 1.25rem 1.5rem;
+            overflow-y: auto;
+            font-size: 0.85rem;
+        }
+        .modal-body pre {
+            background: #050917;
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.78rem;
+            color: #cbd5e1;
+        }
+        button.btn {
+            padding: 0.45rem 0.9rem;
+            background: rgba(96, 165, 250, 0.12);
+            border: 1px solid rgba(96, 165, 250, 0.3);
+            color: #60a5fa;
+            border-radius: 6px; cursor: pointer;
+            font-size: 0.82rem; font-weight: 500;
+            transition: all 0.15s;
+            font-family: inherit;
+        }
+        button.btn:hover {
+            background: rgba(96, 165, 250, 0.2);
+            border-color: rgba(96, 165, 250, 0.5);
+        }
+        button.btn.secondary {
+            color: #94a3b8;
+            background: rgba(148, 163, 184, 0.08);
+            border-color: rgba(148, 163, 184, 0.25);
+        }
+        button.btn.secondary:hover { background: rgba(148, 163, 184, 0.16); }
+        .scroll-style::-webkit-scrollbar { width: 8px; height: 8px; }
+        .scroll-style::-webkit-scrollbar-track { background: #0a0e27; }
+        .scroll-style::-webkit-scrollbar-thumb { background: #1e2a4a; border-radius: 4px; }
+        .scroll-style::-webkit-scrollbar-thumb:hover { background: #2a3658; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Live Trading Dashboard</h1>
+        <div class="header-status">
+            <span id="lastUpdate">Updated: --</span>
+            <span class="conn-indicator" id="connStatus">Live</span>
+        </div>
     </div>
-
     <div class="container">
         <div class="tabs">
             <button class="tab active" data-tab="overview">Overview</button>
             <button class="tab" data-tab="positions">Positions</button>
             <button class="tab" data-tab="lots">Factor Lots</button>
+            <button class="tab" data-tab="history">History</button>
+            <button class="tab" data-tab="logs">Logs</button>
+            <button class="tab" data-tab="settings">Settings</button>
         </div>
-
-        <!-- Overview Tab -->
-        <div id="overview" class="tab-content active">
-            <div class="metrics-grid" id="metrics">
-                <div class="loading">Loading metrics</div>
+        <div id="overview" class="tab-content active"></div>
+        <div id="positions" class="tab-content"></div>
+        <div id="lots" class="tab-content"></div>
+        <div id="history" class="tab-content"></div>
+        <div id="logs" class="tab-content"></div>
+        <div id="settings" class="tab-content"></div>
+    </div>
+    <div class="modal-overlay" id="modal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title" id="modalTitle">Details</div>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
-
-            <div class="timeline" id="timeline">
-                <div class="loading">Loading timeline</div>
-            </div>
-
-            <div class="chart-container">
-                <div class="chart-title">Portfolio Equity (Last 30 Days)</div>
-                <canvas id="equityChart"></canvas>
-            </div>
-        </div>
-
-        <!-- Positions Tab -->
-        <div id="positions" class="tab-content">
-            <div class="filter-bar">
-                <input type="text" id="positionSearch" placeholder="Search symbol...">
-                <select id="sideFilter">
-                    <option value="all">All Sides</option>
-                    <option value="long">Long Only</option>
-                    <option value="short">Short Only</option>
-                </select>
-                <select id="plFilter">
-                    <option value="all">All P&L</option>
-                    <option value="profitable">Profitable</option>
-                    <option value="losing">Losing</option>
-                </select>
-            </div>
-
-            <table id="positionsTable">
-                <thead>
-                    <tr>
-                        <th>Symbol</th>
-                        <th>Side</th>
-                        <th>Qty</th>
-                        <th>Market Value</th>
-                        <th>Entry Price</th>
-                        <th>Current Price</th>
-                        <th>Unrealized P&L</th>
-                        <th>% Change</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan="8" class="loading">Loading positions</td></tr>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Factor Lots Tab -->
-        <div id="lots" class="tab-content">
-            <div class="lot-composition">
-                <div class="pie-container">
-                    <div class="chart-title">Lot Composition by Factor</div>
-                    <canvas id="lotPieChart"></canvas>
-                </div>
-                <div class="pie-container">
-                    <div class="chart-title">Factor Distribution</div>
-                    <div class="legend" id="factorLegend">
-                        <div class="loading">Loading factors</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="metrics-grid" id="lotMetrics">
-                <div class="loading">Loading lot metrics</div>
-            </div>
-
-            <table id="lotsTable">
-                <thead>
-                    <tr>
-                        <th>Symbol</th>
-                        <th>Factor</th>
-                        <th>Weight</th>
-                        <th>Min Hold</th>
-                        <th>Birth Index</th>
-                        <th>Entry Date</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan="7" class="loading">Loading lots</td></tr>
-                </tbody>
-            </table>
+            <div class="modal-body scroll-style" id="modalBody"></div>
         </div>
     </div>
-
     <script>
-        // State
+        // === CORE STATE & UTILS ===
         let currentTab = 'overview';
-        let equityChart = null;
-        let lotPieChart = null;
+        let charts = { equity: null, lotPie: null };
+        let sseConnection = null;
+        let lastUpdateTime = Date.now();
+
+        async function fetchJSON(endpoint) {
+            const resp = await fetch(`/api/${endpoint}`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return resp.json();
+        }
+
+        function updateLastUpdate() {
+            lastUpdateTime = Date.now();
+            document.getElementById('lastUpdate').textContent =
+                'Updated: ' + new Date().toLocaleTimeString();
+        }
+
+        function formatCurrency(val) {
+            return '$' + Math.abs(val).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        }
+
+        function formatPercent(val) {
+            const sign = val >= 0 ? '+' : '';
+            return sign + val.toFixed(2) + '%';
+        }
+
+        function showModal(title, bodyHTML) {
+            document.getElementById('modalTitle').textContent = title;
+            document.getElementById('modalBody').innerHTML = bodyHTML;
+            document.getElementById('modal').classList.add('show');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('show');
+        }
+
+        document.getElementById('modal').addEventListener('click', (e) => {
+            if (e.target.id === 'modal') closeModal();
+        });
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -490,79 +455,92 @@
         function switchTab(tabName) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-
             document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
             document.getElementById(tabName).classList.add('active');
-
             currentTab = tabName;
-
-            // Load data for tab
-            if (tabName === 'overview') loadOverview();
-            else if (tabName === 'positions') loadPositions();
-            else if (tabName === 'lots') loadLots();
+            loadTabData(tabName);
         }
 
-        // Fetch helpers
-        async function fetchJSON(endpoint) {
-            const response = await fetch(`/api/${endpoint}`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response.json();
+        function loadTabData(tab) {
+            if (tab === 'overview') loadOverview();
+            else if (tab === 'positions') loadPositions();
+            else if (tab === 'lots') loadLots();
+            else if (tab === 'history') loadHistory();
+            else if (tab === 'logs') loadLogs();
+            else if (tab === 'settings') loadSettings();
         }
 
-        // Overview Tab
+                // === OVERVIEW TAB ===
         async function loadOverview() {
             try {
                 const data = await fetchJSON('overview');
-                renderMetrics(data);
-                renderTimeline(data);
+                renderOverviewMetrics(data);
+                renderOverviewTimeline(data);
                 await loadEquityChart();
+                updateLastUpdate();
             } catch (err) {
                 console.error('Failed to load overview:', err);
+                document.getElementById('overview').innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div><div>Failed to load overview</div></div>';
             }
         }
 
-        function renderMetrics(data) {
+        function renderOverviewMetrics(data) {
             const equity = data.equity || 0;
-            const posCount = data.positions_count || {};
+            const pos = data.positions_count || {};
             const sessionIdx = data.session_idx || 0;
 
             const html = `
-                <div class="metric-card">
-                    <div class="metric-label">Portfolio Equity</div>
-                    <div class="metric-value">$${equity.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
-                    <div class="metric-change positive">+0.0%</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Positions</div>
-                    <div class="metric-value">${posCount.total || 0}</div>
-                    <div class="metric-change">${posCount.long || 0} Long · ${posCount.short || 0} Short</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Session Index</div>
-                    <div class="metric-value">${sessionIdx}</div>
-                    <div class="metric-change">Trading Days</div>
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Portfolio Equity</div>
+                        <div class="metric-value">${formatCurrency(equity)}</div>
+                        <div class="metric-change neutral">Session ${sessionIdx}</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Total Positions</div>
+                        <div class="metric-value">${pos.total || 0}</div>
+                        <div class="metric-change">${pos.long || 0} Long · ${pos.short || 0} Short</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Session Index</div>
+                        <div class="metric-value">${sessionIdx}</div>
+                        <div class="metric-change neutral">Trading Days</div>
+                    </div>
                 </div>
             `;
-            document.getElementById('metrics').innerHTML = html;
+            const metricsEl = document.querySelector('#overview .metrics-grid');
+            if (metricsEl) metricsEl.outerHTML = html;
+            else document.getElementById('overview').insertAdjacentHTML('afterbegin', html);
         }
 
-        function renderTimeline(data) {
-            const lastDecision = data.last_decision || {};
-            const lastExecute = data.last_execute || {};
+        function renderOverviewTimeline(data) {
+            const lastDec = data.last_decision || {};
+            const lastExe = data.last_execute || {};
 
             const html = `
-                <div class="timeline-item">
-                    <div class="timeline-dot ${lastDecision.status === 'completed' ? 'completed' : 'pending'}"></div>
-                    <span style="flex: 1;">12:00 CN Decision</span>
-                    <span class="status-pill ${lastDecision.status || 'pending'}">${lastDecision.status || 'Pending'}</span>
-                </div>
-                <div class="timeline-item">
-                    <div class="timeline-dot ${lastExecute.status === 'completed' ? 'completed' : 'pending'}"></div>
-                    <span style="flex: 1;">22:00 CN Execute</span>
-                    <span class="status-pill ${lastExecute.status || 'pending'}">${lastExecute.status || 'Pending'}</span>
+                <div class="panel">
+                    <div class="panel-title">Task Timeline</div>
+                    <div class="timeline-row">
+                        <div class="timeline-dot ${lastDec.status === 'completed' ? 'completed' : lastDec.status === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-label">
+                            <div>12:00 CN Decision</div>
+                            <div class="timeline-sub">${lastDec.status || 'Pending'}</div>
+                        </div>
+                        <span class="badge ${lastDec.status || 'pending'}">${lastDec.status || 'Pending'}</span>
+                    </div>
+                    <div class="timeline-row">
+                        <div class="timeline-dot ${lastExe.status === 'completed' ? 'completed' : lastExe.status === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-label">
+                            <div>22:00 CN Execute</div>
+                            <div class="timeline-sub">${lastExe.status || 'Pending'}</div>
+                        </div>
+                        <span class="badge ${lastExe.status || 'pending'}">${lastExe.status || 'Pending'}</span>
+                    </div>
                 </div>
             `;
-            document.getElementById('timeline').innerHTML = html;
+            const tlEl = document.querySelector('#overview .panel');
+            if (tlEl) tlEl.outerHTML = html;
+            else document.getElementById('overview').insertAdjacentHTML('beforeend', html);
         }
 
         async function loadEquityChart() {
@@ -571,11 +549,24 @@
                 const labels = history.map(h => h.decision_date || '').reverse();
                 const values = history.map(h => h.account_equity_post_trade || 0).reverse();
 
-                const ctx = document.getElementById('equityChart').getContext('2d');
+                const chartHTML = `
+                    <div class="panel">
+                        <div class="panel-title">Portfolio Equity (Last 30 Days)</div>
+                        <canvas id="equityChart"></canvas>
+                    </div>
+                `;
+                const chartEl = document.querySelector('#overview .panel:last-child');
+                if (chartEl && chartEl.querySelector('canvas')) {
+                    // Update existing chart
+                } else {
+                    document.getElementById('overview').insertAdjacentHTML('beforeend', chartHTML);
+                }
 
-                if (equityChart) equityChart.destroy();
+                const ctx = document.getElementById('equityChart');
+                if (!ctx) return;
 
-                equityChart = new Chart(ctx, {
+                if (charts.equity) charts.equity.destroy();
+                charts.equity = new Chart(ctx.getContext('2d'), {
                     type: 'line',
                     data: {
                         labels: labels,
@@ -583,10 +574,12 @@
                             label: 'Equity',
                             data: values,
                             borderColor: '#60a5fa',
-                            backgroundColor: 'rgba(96, 165, 250, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.4,
-                            fill: true
+                            backgroundColor: 'rgba(96, 165, 250, 0.08)',
+                            borderWidth: 2.5,
+                            tension: 0.35,
+                            fill: true,
+                            pointRadius: 2,
+                            pointHoverRadius: 5
                         }]
                     },
                     options: {
@@ -599,17 +592,18 @@
                                 titleColor: '#e4e8f0',
                                 bodyColor: '#e4e8f0',
                                 borderColor: '#1e2a4a',
-                                borderWidth: 1
+                                borderWidth: 1,
+                                padding: 10
                             }
                         },
                         scales: {
                             y: {
-                                ticks: { color: '#8b92a8' },
-                                grid: { color: '#1e2a4a' }
+                                ticks: { color: '#8b92a8', font: {size: 11} },
+                                grid: { color: '#1e2a4a', lineWidth: 0.5 }
                             },
                             x: {
-                                ticks: { color: '#8b92a8' },
-                                grid: { color: '#1e2a4a' }
+                                ticks: { color: '#8b92a8', font: {size: 10}, maxRotation: 45 },
+                                grid: { color: '#1e2a4a', lineWidth: 0.5 }
                             }
                         }
                     }
@@ -619,51 +613,104 @@
             }
         }
 
-        // Positions Tab
+                // === POSITIONS TAB ===
         async function loadPositions() {
             try {
                 const positions = await fetchJSON('positions');
-                renderPositions(positions);
+                renderPositionsTable(positions);
+                updateLastUpdate();
             } catch (err) {
                 console.error('Failed to load positions:', err);
             }
         }
 
-        function renderPositions(positions) {
+        function renderPositionsTable(positions) {
             if (!positions || positions.length === 0) {
-                document.querySelector('#positionsTable tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b92a8;">No positions</td></tr>';
+                document.getElementById('positions').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📊</div><div>No positions</div></div>';
                 return;
             }
 
-            const rows = positions.map(p => {
-                const unrealizedPL = (p.current_price - p.avg_entry_price) * p.qty;
-                const plPercent = ((p.current_price - p.avg_entry_price) / p.avg_entry_price) * 100;
-                const plClass = unrealizedPL >= 0 ? 'positive' : 'negative';
+            let html = `
+                <div class="filter-bar">
+                    <input type="text" id="posSearch" placeholder="Search symbol..." oninput="filterPositions()">
+                    <select id="posSideFilter" onchange="filterPositions()">
+                        <option value="all">All Sides</option>
+                        <option value="long">Long Only</option>
+                        <option value="short">Short Only</option>
+                    </select>
+                    <select id="posPlFilter" onchange="filterPositions()">
+                        <option value="all">All P&L</option>
+                        <option value="profitable">Profitable</option>
+                        <option value="losing">Losing</option>
+                    </select>
+                </div>
+                <div class="panel">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th onclick="sortPositions('symbol')">Symbol</th>
+                                <th onclick="sortPositions('side')">Side</th>
+                                <th onclick="sortPositions('qty')">Qty</th>
+                                <th onclick="sortPositions('market_value')">Market Value</th>
+                                <th onclick="sortPositions('avg_entry_price')">Entry Price</th>
+                                <th onclick="sortPositions('current_price')">Current Price</th>
+                                <th onclick="sortPositions('pl')">P&L</th>
+                                <th onclick="sortPositions('plPct')">% Change</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positionsTableBody"></tbody>
+                    </table>
+                </div>
+            `;
+            document.getElementById('positions').innerHTML = html;
 
-                return `
-                    <tr>
-                        <td><strong>${p.symbol}</strong></td>
-                        <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
-                        <td>${Math.abs(p.qty).toFixed(2)}</td>
-                        <td>$${Math.abs(p.market_value).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
-                        <td>$${p.avg_entry_price.toFixed(2)}</td>
-                        <td>$${p.current_price.toFixed(2)}</td>
-                        <td class="${plClass}">$${unrealizedPL.toFixed(2)}</td>
-                        <td class="${plClass}">${plPercent >= 0 ? '+' : ''}${plPercent.toFixed(2)}%</td>
-                    </tr>
-                `;
-            }).join('');
-
-            document.querySelector('#positionsTable tbody').innerHTML = rows;
+            window.positionsData = positions.map(p => ({
+                ...p,
+                pl: (p.current_price - p.avg_entry_price) * p.qty,
+                plPct: ((p.current_price - p.avg_entry_price) / p.avg_entry_price) * 100
+            }));
+            filterPositions();
         }
 
-        // Factor Lots Tab
+        function filterPositions() {
+            const search = document.getElementById('posSearch')?.value.toLowerCase() || '';
+            const sideFilter = document.getElementById('posSideFilter')?.value || 'all';
+            const plFilter = document.getElementById('posPlFilter')?.value || 'all';
+
+            let filtered = window.positionsData || [];
+            if (search) filtered = filtered.filter(p => p.symbol.toLowerCase().includes(search));
+            if (sideFilter !== 'all') filtered = filtered.filter(p => p.side === sideFilter);
+            if (plFilter === 'profitable') filtered = filtered.filter(p => p.pl >= 0);
+            if (plFilter === 'losing') filtered = filtered.filter(p => p.pl < 0);
+
+            const rows = filtered.map(p => {
+                const plClass = p.pl >= 0 ? 'positive' : 'negative';
+                return `<tr>
+                    <td><strong>${p.symbol}</strong></td>
+                    <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
+                    <td>${Math.abs(p.qty).toFixed(2)}</td>
+                    <td>${formatCurrency(Math.abs(p.market_value))}</td>
+                    <td>$${p.avg_entry_price.toFixed(2)}</td>
+                    <td>$${p.current_price.toFixed(2)}</td>
+                    <td class="${plClass}">${formatCurrency(p.pl)}</td>
+                    <td class="${plClass}">${formatPercent(p.plPct)}</td>
+                </tr>`;
+            }).join('');
+            document.getElementById('positionsTableBody').innerHTML = rows || '<tr><td colspan="8" class="neutral" style="text-align:center;">No positions match filters</td></tr>';
+        }
+
+        function sortPositions(key) {
+            // TODO: implement sorting
+        }
+
+                // === LOTS TAB ===
         async function loadLots() {
             try {
                 const data = await fetchJSON('lots');
                 renderLotMetrics(data);
                 renderLotPieChart(data);
-                renderLotTable(data);
+                renderLotsTable(data);
+                updateLastUpdate();
             } catch (err) {
                 console.error('Failed to load lots:', err);
             }
@@ -671,37 +718,55 @@
 
         function renderLotMetrics(data) {
             const html = `
-                <div class="metric-card">
-                    <div class="metric-label">Total Lots</div>
-                    <div class="metric-value">${data.total_count || 0}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Locked Lots</div>
-                    <div class="metric-value">${data.locked_count || 0}</div>
-                    <div class="metric-change">Within min_hold period</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Unlocked Lots</div>
-                    <div class="metric-value">${data.unlocked_count || 0}</div>
-                    <div class="metric-change">Can be rebalanced</div>
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Total Lots</div>
+                        <div class="metric-value">${data.total_count || 0}</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Locked Lots</div>
+                        <div class="metric-value">${data.locked_count || 0}</div>
+                        <div class="metric-change neutral">Within min_hold</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Unlocked Lots</div>
+                        <div class="metric-value">${data.unlocked_count || 0}</div>
+                        <div class="metric-change neutral">Can rebalance</div>
+                    </div>
                 </div>
             `;
-            document.getElementById('lotMetrics').innerHTML = html;
+            const metricsEl = document.querySelector('#lots .metrics-grid');
+            if (metricsEl) metricsEl.outerHTML = html;
+            else document.getElementById('lots').insertAdjacentHTML('afterbegin', html);
         }
 
         function renderLotPieChart(data) {
             const composition = data.composition || {};
             const counts = composition.counts || {};
-
             const labels = Object.keys(counts);
             const values = Object.values(counts);
-            const colors = ['#60a5fa', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+            const colors = ['#60a5fa', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
 
-            const ctx = document.getElementById('lotPieChart').getContext('2d');
+            const chartHTML = `
+                <div class="charts-row">
+                    <div class="panel">
+                        <div class="panel-title">Lot Composition by Factor</div>
+                        <canvas id="lotPieChart"></canvas>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-title">Factor Distribution</div>
+                        <div class="legend-list" id="factorLegend"></div>
+                    </div>
+                </div>
+            `;
+            const chartEl = document.querySelector('#lots .charts-row');
+            if (!chartEl) document.getElementById('lots').insertAdjacentHTML('beforeend', chartHTML);
 
-            if (lotPieChart) lotPieChart.destroy();
+            const ctx = document.getElementById('lotPieChart');
+            if (!ctx) return;
 
-            lotPieChart = new Chart(ctx, {
+            if (charts.lotPie) charts.lotPie.destroy();
+            charts.lotPie = new Chart(ctx.getContext('2d'), {
                 type: 'doughnut',
                 data: {
                     labels: labels,
@@ -727,7 +792,6 @@
                 }
             });
 
-            // Render legend
             const legendHTML = labels.map((label, i) => `
                 <div class="legend-item">
                     <div style="display:flex;align-items:center;">
@@ -740,44 +804,288 @@
             document.getElementById('factorLegend').innerHTML = legendHTML;
         }
 
-        function renderLotTable(data) {
+        function renderLotsTable(data) {
             const lots = data.lots || [];
+            const html = `
+                <div class="panel">
+                    <div class="panel-title">All Lots <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(showing ${Math.min(lots.length, 200)})</span></div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Factor</th>
+                                <th>Weight</th>
+                                <th>Min Hold</th>
+                                <th>Birth Index</th>
+                                <th>Entry Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="lotsTableBody"></tbody>
+                    </table>
+                </div>
+            `;
+            const tableEl = document.querySelector('#lots .panel:last-child');
+            if (!tableEl || !tableEl.querySelector('table')) {
+                document.getElementById('lots').insertAdjacentHTML('beforeend', html);
+            }
 
-            if (lots.length === 0) {
-                document.querySelector('#lotsTable tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8b92a8;">No lots</td></tr>';
+            const rows = lots.slice(0, 200).map(lot => `
+                <tr>
+                    <td><strong>${lot.symbol}</strong></td>
+                    <td>${lot.factor}</td>
+                    <td>${(lot.weight * 100).toFixed(4)}%</td>
+                    <td>${lot.min_hold}</td>
+                    <td>${lot.birth_idx}</td>
+                    <td>${lot.entry_session_date || 'N/A'}</td>
+                </tr>
+            `).join('');
+            document.getElementById('lotsTableBody').innerHTML = rows || '<tr><td colspan="6" style="text-align:center;color:#8b92a8;">No lots</td></tr>';
+        }
+
+                // === HISTORY TAB ===
+        async function loadHistory() {
+            try {
+                const history = await fetchJSON('history?limit=50');
+                renderHistoryTable(history);
+                updateLastUpdate();
+            } catch (err) {
+                console.error('Failed to load history:', err);
+            }
+        }
+
+        function renderHistoryTable(history) {
+            if (!history || history.length === 0) {
+                document.getElementById('history').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📅</div><div>No execution history yet</div></div>';
                 return;
             }
 
-            const rows = lots.slice(0, 100).map(lot => {
-                const isLocked = data.locked_count > 0; // Simplified
-                return `
-                    <tr>
-                        <td><strong>${lot.symbol}</strong></td>
-                        <td>${lot.factor}</td>
-                        <td>${(lot.weight * 100).toFixed(3)}%</td>
-                        <td>${lot.min_hold}</td>
-                        <td>${lot.birth_idx}</td>
-                        <td>${lot.entry_session_date || 'N/A'}</td>
-                        <td><span class="badge ${isLocked ? 'short' : 'long'}">${isLocked ? 'Locked' : 'Unlocked'}</span></td>
-                    </tr>
-                `;
-            }).join('');
-
-            document.querySelector('#lotsTable tbody').innerHTML = rows;
+            const html = `
+                <div class="panel">
+                    <div class="panel-title">Execution History (Last 50 Runs)</div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Session</th>
+                                <th>Status</th>
+                                <th>Symbols</th>
+                                <th>Orders</th>
+                                <th>Submitted</th>
+                                <th>Equity After</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>${history.map(h => {
+                            const statusBadge = h.ok ? 'success' : 'error';
+                            return `<tr>
+                                <td>${h.decision_date || 'N/A'}</td>
+                                <td>${h.session_idx ?? '-'}</td>
+                                <td><span class="badge ${statusBadge}">${h.decision_status || 'unknown'}</span></td>
+                                <td>${h.dynamic_symbols || 0}</td>
+                                <td>${h.order_plan_count || 0}</td>
+                                <td>${h.submitted ? 'Yes' : 'No'}</td>
+                                <td>${formatCurrency(h.account_equity_post_trade || 0)}</td>
+                                <td><button class="btn secondary" onclick="showHistoryDetail('${h.run_dir}')">Details</button></td>
+                            </tr>`;
+                        }).join('')}</tbody>
+                    </table>
+                </div>
+            `;
+            document.getElementById('history').innerHTML = html;
+            window.historyData = history;
         }
 
-        // Auto-refresh
-        function startAutoRefresh() {
+        function showHistoryDetail(runDir) {
+            const item = window.historyData.find(h => h.run_dir === runDir);
+            if (!item) return;
+            const json = JSON.stringify(item, null, 2);
+            showModal(`Execution Details: ${runDir}`, `<pre>${json}</pre>`);
+        }
+
+                // === LOGS TAB ===
+        async function loadLogs() {
+            try {
+                const data = await fetchJSON('logs?lines=150');
+                renderLogs(data);
+                updateLastUpdate();
+            } catch (err) {
+                console.error('Failed to load logs:', err);
+            }
+        }
+
+        function renderLogs(data) {
+            const logs = data.logs || [];
+            if (logs.length === 0) {
+                document.getElementById('logs').innerHTML = '<div class="empty-state"><div class="empty-state-icon">📝</div><div>No logs available yet</div><div style="margin-top:0.5rem;font-size:0.85rem;">Logs appear after scheduler runs</div></div>';
+                return;
+            }
+
+            const html = `
+                <div class="filter-bar">
+                    <span class="filter-label">Level:</span>
+                    <select id="logLevelFilter" onchange="filterLogs()">
+                        <option value="all">All</option>
+                        <option value="error">ERROR</option>
+                        <option value="warning">WARNING</option>
+                        <option value="info">INFO</option>
+                    </select>
+                    <input type="text" id="logSearch" placeholder="Search logs..." oninput="filterLogs()">
+                    <button class="btn" onclick="loadLogs()">Refresh</button>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Recent Logs <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(${logs.length} lines from ${data.total_files || 0} files)</span></div>
+                    <div class="log-viewer scroll-style" id="logViewer"></div>
+                </div>
+            `;
+            document.getElementById('logs').innerHTML = html;
+            window.logsData = logs;
+            filterLogs();
+        }
+
+        function filterLogs() {
+            const levelFilter = document.getElementById('logLevelFilter')?.value || 'all';
+            const search = document.getElementById('logSearch')?.value.toLowerCase() || '';
+
+            let filtered = window.logsData || [];
+            if (levelFilter !== 'all') filtered = filtered.filter(l => l.level.toLowerCase() === levelFilter);
+            if (search) filtered = filtered.filter(l => l.message.toLowerCase().includes(search) || l.source.toLowerCase().includes(search));
+
+            const logHTML = filtered.map(l => `
+                <div class="log-line">
+                    <span class="log-ts">${l.timestamp || ''}</span>
+                    <span class="log-level ${l.level}">${l.level}</span>
+                    <span class="log-src">${l.source}</span>
+                    <span class="log-msg">${l.message}</span>
+                </div>
+            `).join('');
+            const viewer = document.getElementById('logViewer');
+            if (viewer) {
+                viewer.innerHTML = logHTML || '<div style="padding:2rem;text-align:center;color:#64748b;">No logs match filters</div>';
+                viewer.scrollTop = viewer.scrollHeight; // Auto-scroll to bottom
+            }
+        }
+
+                // === SETTINGS TAB ===
+        async function loadSettings() {
+            try {
+                const config = await fetchJSON('config');
+                renderSettings(config);
+                updateLastUpdate();
+            } catch (err) {
+                console.error('Failed to load settings:', err);
+            }
+        }
+
+        function renderSettings(config) {
+            const trading = config.trading || {};
+            const system = config.system || {};
+            const ledger = config.ledger || {};
+
+            const html = `
+                <div class="panel">
+                    <div class="panel-title">Trading Configuration</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Account</span><span class="config-value">${trading.account || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Feed</span><span class="config-value">${trading.feed || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Execution Mode</span><span class="config-value">${trading.execution_mode || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Target NY Time</span><span class="config-value">${trading.target_ny_time || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Decision Time (CN)</span><span class="config-value">${trading.decision_time_cn || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Execute Time (CN)</span><span class="config-value">${trading.execute_time_cn || 'N/A'}</span></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">System Information</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Python Version</span><span class="config-value">${system.python_version || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Platform</span><span class="config-value">${system.platform || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Dashboard PID</span><span class="config-value">${system.pid_self || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Scheduler PID</span><span class="config-value">${system.pid_scheduler || 'Not running'}</span></div>
+                        <div class="config-item"><span class="config-key">Watchdog PID</span><span class="config-value">${system.pid_watchdog || 'Not running'}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Project Root</span><span class="config-value" style="font-size:0.75rem;">${system.project_root || 'N/A'}</span></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Lot Ledger State</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Last Session Index</span><span class="config-value">${ledger.last_session_idx ?? 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Last Session Date</span><span class="config-value">${ledger.last_session_date || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Last Sync Time (UTC)</span><span class="config-value" style="font-size:0.75rem;">${ledger.last_sync_at_utc || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Last Broker Equity</span><span class="config-value">${ledger.last_broker_equity ? formatCurrency(ledger.last_broker_equity) : 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Last Sync Applied</span><span class="config-value">${ledger.last_sync_applied ? 'Yes' : 'No'}</span></div>
+                    </div>
+                </div>
+                ${config.scheduler_command ? `<div class="panel">
+                    <div class="panel-title">Scheduler Command</div>
+                    <pre style="background:#050917;padding:1rem;border-radius:6px;overflow-x:auto;font-size:0.75rem;color:#cbd5e1;">${config.scheduler_command}</pre>
+                </div>` : ''}
+            `;
+            document.getElementById('settings').innerHTML = html;
+        }
+
+                // === SSE (Server-Sent Events) ===
+        function connectSSE() {
+            if (sseConnection) {
+                try { sseConnection.close(); } catch (e) {}
+            }
+
+            sseConnection = new EventSource('/api/stream');
+            const connStatus = document.getElementById('connStatus');
+
+            sseConnection.onopen = () => {
+                connStatus.textContent = 'Live';
+                connStatus.classList.remove('disconnected');
+            };
+
+            sseConnection.onerror = () => {
+                connStatus.textContent = 'Disconnected';
+                connStatus.classList.add('disconnected');
+                // Auto-reconnect after 5s
+                setTimeout(() => {
+                    if (sseConnection.readyState === EventSource.CLOSED) {
+                        connectSSE();
+                    }
+                }, 5000);
+            };
+
+            sseConnection.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.event === 'artifacts_changed') {
+                        console.log('[SSE] Artifacts changed:', data.changed);
+                        // Reload current tab data
+                        loadTabData(currentTab);
+                    } else if (data.event === 'heartbeat') {
+                        // Keep-alive, no action needed
+                    } else if (data.event === 'connected') {
+                        console.log('[SSE] Connected');
+                    }
+                } catch (err) {
+                    console.error('[SSE] Parse error:', err);
+                }
+            };
+        }
+
+        // === INITIALIZATION ===
+        function init() {
+            loadOverview();
+            connectSSE();
+
+            // Auto-refresh fallback (SSE primary, polling backup)
             setInterval(() => {
-                if (currentTab === 'overview') loadOverview();
-                else if (currentTab === 'positions') loadPositions();
-                else if (currentTab === 'lots') loadLots();
-            }, 30000); // Refresh every 30 seconds
+                const now = Date.now();
+                if (now - lastUpdateTime > 45000) { // No update for 45s
+                    loadTabData(currentTab);
+                }
+            }, 30000);
         }
 
-        // Initialize
-        loadOverview();
-        startAutoRefresh();
+        // Start
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+
     </script>
 </body>
 </html>
