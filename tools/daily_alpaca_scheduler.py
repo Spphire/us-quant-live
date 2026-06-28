@@ -14,6 +14,44 @@ from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CN_TZ = ZoneInfo("Asia/Shanghai")
+US_TZ = ZoneInfo("America/New_York")
+
+
+def resolve_session_date(now_cn: datetime) -> date:
+    """Resolve the US trading session that a Beijing wall-clock moment operates on.
+
+    Design contract
+    ---------------
+    The session_date MUST be identical for the 12:00 decision and the 22:00 execute
+    of the same operating day, because execute reads the decision-targets file that
+    decision wrote, and both are keyed by session_date. If they diverged, execute
+    would look for a file decision never created.
+
+    The Beijing CALENDAR DATE satisfies this: at both 12:00 and 22:00 Beijing time,
+    the US session being served falls on the same calendar number as the Beijing
+    date (verified for both summer DST and winter standard time). So we anchor
+    session_date to the Beijing date during the normal operating window.
+
+    Early-morning correction
+    ------------------------
+    The one window where Beijing date does NOT equal the US session is Beijing
+    00:00-11:59 (e.g. a manual --run-once at 03:00). There, the Beijing date is one
+    day AHEAD of the most recent US session. To make manual early-morning runs
+    correct, we detect that window and roll back to the US-Eastern date, which is
+    the session that just closed.
+
+    Summary:
+    - Beijing 12:00-23:59  -> session_date = Beijing date (matches the served session)
+    - Beijing 00:00-11:59  -> session_date = US-Eastern date (the prior/most-recent session)
+    """
+    if now_cn.hour >= 12:
+        # Normal operating window: Beijing date == served US session date.
+        return now_cn.date()
+    # Pre-noon Beijing: roll back to the US-Eastern session date to avoid being a
+    # day ahead of the actual US trading session.
+    return now_cn.astimezone(US_TZ).date()
+
+
 
 
 @dataclass(frozen=True)
@@ -90,7 +128,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--trading-day-source",
         choices=("alpaca_calendar", "weekday", "always"),
         default="alpaca_calendar",
-        help="How to decide whether the Beijing calendar date is a US equity trading session.",
+        help=(
+            "How to decide whether the resolved US session_date is a tradable US equity "
+            "session. session_date is derived from the Beijing wall-clock via "
+            "resolve_session_date() so it always refers to the correct US-Eastern session."
+        ),
     )
     parser.add_argument("--allow-non-trading-day", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
@@ -194,8 +236,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or (now_cn - last_heartbeat_at).total_seconds() >= max(args.heartbeat_minutes, 0.1) * 60
             )
             if heartbeat_due:
-                today = now_cn.date().isoformat()
-                print(f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} session={today}", flush=True)
+                session_date = resolve_session_date(now_cn)
+                now_us = now_cn.astimezone(US_TZ)
+                print(
+                    f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} "
+                    f"(US {now_us.strftime('%Y-%m-%d %H:%M %Z')}) session={session_date.isoformat()}",
+                    flush=True,
+                )
                 last_heartbeat_at = now_cn
 
             time.sleep(max(float(args.poll_seconds), 1.0))
@@ -231,7 +278,7 @@ def _run_once(
     calendar_cache: dict[str, bool],
     now_cn: datetime,
 ) -> bool:
-    session_date = date.fromisoformat(args.date) if args.date else now_cn.date()
+    session_date = date.fromisoformat(args.date) if args.date else resolve_session_date(now_cn)
     if not _session_is_tradable(args, session_date, calendar_cache):
         print(f"[Scheduler] skip {session_date}: not a US trading day.", flush=True)
         return True
@@ -256,7 +303,7 @@ def _run_due_tasks(
     now_cn: datetime,
     session_date: date | None = None,
 ) -> bool:
-    session_date = session_date or now_cn.date()
+    session_date = session_date or resolve_session_date(now_cn)
     if not _session_is_tradable(args, session_date, calendar_cache):
         return True
 
