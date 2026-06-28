@@ -10,7 +10,7 @@ These lock in the timezone contract:
    not be a day ahead.
 """
 import sys
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,12 +23,33 @@ def _bj(s: str) -> datetime:
 
 
 def test_decision_execute_consistency():
-    """Decision (12:00) and execute (22:00) must give identical session_date."""
+    """Decision and execute must give identical session_date (default 12:00/22:00)."""
+    cutoff = dt_time(12, 0)
     for day, season in [("2026-06-27", "summer/DST"), ("2026-12-15", "winter/standard")]:
-        dec = resolve_session_date(_bj(f"{day} 12:00"))
-        exe = resolve_session_date(_bj(f"{day} 22:00"))
+        dec = resolve_session_date(_bj(f"{day} 12:00"), cutoff)
+        exe = resolve_session_date(_bj(f"{day} 22:00"), cutoff)
         assert dec == exe, f"{season}: decision={dec} != execute={exe} (file name mismatch!)"
         print(f"  [OK] {season}: decision==execute=={dec}")
+
+
+def test_configurable_decision_time_consistency():
+    """Invariant must hold for a configured SUB-NOON decision time (regression).
+
+    If the operating-window boundary were hardcoded to noon, a 09:00 decision would
+    roll back to the US date while the 22:00 execute used the Beijing date, breaking
+    the decision==execute contract. Passing the configured decision time as the
+    window start keeps them aligned.
+    """
+    for day, season in [("2026-06-27", "summer"), ("2026-12-15", "winter")]:
+        for dec_str, exe_str in [("09:00", "22:00"), ("10:30", "21:00"), ("08:00", "20:00")]:
+            cutoff = dt_time(*map(int, dec_str.split(":")))
+            dec = resolve_session_date(_bj(f"{day} {dec_str}"), cutoff)
+            exe = resolve_session_date(_bj(f"{day} {exe_str}"), cutoff)
+            assert dec == exe, (
+                f"{season} decision@{dec_str}/execute@{exe_str}: "
+                f"decision={dec} != execute={exe}"
+            )
+            print(f"  [OK] {season} decision@{dec_str} execute@{exe_str} -> both {dec}")
 
 
 def test_operating_window_uses_beijing_date():
@@ -76,6 +97,7 @@ def main():
 
     tests = [
         ("Decision/Execute consistency", test_decision_execute_consistency),
+        ("Configurable decision-time consistency", test_configurable_decision_time_consistency),
         ("Operating window uses Beijing date", test_operating_window_uses_beijing_date),
         ("Early-morning rolls back to US date", test_early_morning_rolls_back_to_us_date),
         ("Noon boundary", test_noon_boundary),

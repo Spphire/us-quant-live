@@ -17,38 +17,46 @@ CN_TZ = ZoneInfo("Asia/Shanghai")
 US_TZ = ZoneInfo("America/New_York")
 
 
-def resolve_session_date(now_cn: datetime) -> date:
+def resolve_session_date(now_cn: datetime, operating_window_start: dt_time | None = None) -> date:
     """Resolve the US trading session that a Beijing wall-clock moment operates on.
 
     Design contract
     ---------------
-    The session_date MUST be identical for the 12:00 decision and the 22:00 execute
-    of the same operating day, because execute reads the decision-targets file that
+    The session_date MUST be identical for the decision run and the execute run of
+    the same operating day, because execute reads the decision-targets file that
     decision wrote, and both are keyed by session_date. If they diverged, execute
     would look for a file decision never created.
 
-    The Beijing CALENDAR DATE satisfies this: at both 12:00 and 22:00 Beijing time,
-    the US session being served falls on the same calendar number as the Beijing
-    date (verified for both summer DST and winter standard time). So we anchor
-    session_date to the Beijing date during the normal operating window.
+    Operating window
+    ----------------
+    `operating_window_start` is the Beijing time at/after which a run is considered
+    part of "today's" operating cycle (decision then execute). It MUST be <= the
+    decision trigger time so that BOTH decision and execute fall on or after it and
+    therefore resolve to the same Beijing date. The scheduler passes the configured
+    decision time here, so the boundary tracks the actual trigger instead of a
+    hardcoded noon. When omitted, defaults to 12:00 (the default decision time).
+
+    Within the operating window the served US session falls on the same calendar
+    number as the Beijing date (verified for both summer DST and winter standard
+    time), so we anchor session_date to the Beijing date there.
 
     Early-morning correction
     ------------------------
-    The one window where Beijing date does NOT equal the US session is Beijing
-    00:00-11:59 (e.g. a manual --run-once at 03:00). There, the Beijing date is one
-    day AHEAD of the most recent US session. To make manual early-morning runs
-    correct, we detect that window and roll back to the US-Eastern date, which is
-    the session that just closed.
+    Before `operating_window_start` (e.g. a manual --run-once at 03:00 Beijing), the
+    Beijing date is one day AHEAD of the most recent US session. We roll back to the
+    US-Eastern date, which is the session that just closed — the correct target for
+    reconciliation.
 
-    Summary:
-    - Beijing 12:00-23:59  -> session_date = Beijing date (matches the served session)
-    - Beijing 00:00-11:59  -> session_date = US-Eastern date (the prior/most-recent session)
+    Summary (with default 12:00 window start):
+    - Beijing >= 12:00  -> session_date = Beijing date (matches the served session)
+    - Beijing <  12:00  -> session_date = US-Eastern date (prior/most-recent session)
     """
-    if now_cn.hour >= 12:
-        # Normal operating window: Beijing date == served US session date.
+    cutoff = operating_window_start if operating_window_start is not None else dt_time(12, 0)
+    if now_cn.timetz().replace(tzinfo=None) >= cutoff:
+        # Operating window: Beijing date == served US session date.
         return now_cn.date()
-    # Pre-noon Beijing: roll back to the US-Eastern session date to avoid being a
-    # day ahead of the actual US trading session.
+    # Before the operating window: roll back to the US-Eastern session date to avoid
+    # being a day ahead of the actual US trading session.
     return now_cn.astimezone(US_TZ).date()
 
 
@@ -236,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or (now_cn - last_heartbeat_at).total_seconds() >= max(args.heartbeat_minutes, 0.1) * 60
             )
             if heartbeat_due:
-                session_date = resolve_session_date(now_cn)
+                session_date = resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
                 now_us = now_cn.astimezone(US_TZ)
                 print(
                     f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} "
@@ -278,7 +286,7 @@ def _run_once(
     calendar_cache: dict[str, bool],
     now_cn: datetime,
 ) -> bool:
-    session_date = date.fromisoformat(args.date) if args.date else resolve_session_date(now_cn)
+    session_date = date.fromisoformat(args.date) if args.date else resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
     if not _session_is_tradable(args, session_date, calendar_cache):
         print(f"[Scheduler] skip {session_date}: not a US trading day.", flush=True)
         return True
@@ -303,7 +311,7 @@ def _run_due_tasks(
     now_cn: datetime,
     session_date: date | None = None,
 ) -> bool:
-    session_date = session_date or resolve_session_date(now_cn)
+    session_date = session_date or resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
     if not _session_is_tradable(args, session_date, calendar_cache):
         return True
 
