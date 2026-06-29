@@ -1051,17 +1051,38 @@ class DecisionEngine:
         return long_weights, short_weights
 
     def _sanitize_locked_lower(self, values: np.ndarray, *, max_weight: float) -> np.ndarray:
-        # Clean tiny/negative noise and, if the locked weights collectively round
-        # just above the side budget (sum > 1.0) due to floating point, scale them
-        # back under 1.0. We do NOT clip individual over-cap locked weights here —
-        # the optimizer accommodates them via a per-name upper bound (see
-        # _optimize_joint_weights_locked), so a genuinely over-cap locked lot is
-        # held in place rather than discarded.
+        # Clean tiny/negative noise and normalize collectively-over-budget locked
+        # weights down to fit under the side-budget constraint (Σw_side = 1.0).
+        #
+        # Two kinds of overflow are handled here:
+        #
+        #  (a) Tiny floating-point noise (sum in (1.0, 1.0+1e-7]): scale to just
+        #      under 1.0 so the equality constraint stays feasible.
+        #
+        #  (b) Genuine over-budget locked total (e.g. broker positions drifted up
+        #      on price, side-weight sum reached 100.3% as seen in the 2026-06-29
+        #      paper account): proportionally scale ALL locked weights down so
+        #      their sum reaches `over_budget_target` (default 0.99). This
+        #      preserves the RELATIVE position structure while making the LP
+        #      feasible — without this rescue, every decision would dead-end at
+        #      'locked_weight_exceeds_side_budget' and fall back to carry/repair,
+        #      never running the real optimization.
+        #
+        # We do NOT clip individual over-cap locked weights here — the optimizer
+        # accommodates them via a per-name upper bound (see
+        # _optimize_joint_weights_locked).
         lower = np.asarray(values, dtype=float).copy()
         lower[np.abs(lower) <= self.eps] = 0.0
         total = float(lower.sum())
-        if total > 1.0 and total <= 1.0 + 1e-7:
-            lower *= (1.0 - 1e-9) / total
+        if total > 1.0:
+            if total <= 1.0 + 1e-7:
+                # Float-noise: nudge under 1.0
+                lower *= (1.0 - 1e-9) / total
+            else:
+                # Genuine over-budget: scale to 99% of the side budget so the LP
+                # has a tiny slack for the equality constraint.
+                over_budget_target = 0.99
+                lower *= over_budget_target / total
         return lower
 
     def _group_exposure_matrix(self, longs: pd.DataFrame, shorts: pd.DataFrame, group_column: str) -> np.ndarray:

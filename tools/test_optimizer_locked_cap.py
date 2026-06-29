@@ -33,6 +33,38 @@ def _make_side_frame(symbols, betas, scores, sectors):
     )
 
 
+def test_locked_sum_exceeds_side_budget():
+    """Optimizer must remain feasible when ALL locked weights collectively exceed 100%
+    (e.g. broker positions drifted up on price)."""
+    engine = DecisionEngine(DecisionConfig())
+    cap = 1.0 / 30.0
+    n = 40
+    longs = _make_side_frame(
+        [f"L{i}" for i in range(n)], [1.0] * n, [float(n - i) for i in range(n)],
+        [f"SIC{i % 5}" for i in range(n)],
+    )
+    shorts = _make_side_frame(
+        [f"S{i}" for i in range(n)], [1.0] * n, [float(i) for i in range(n)],
+        [f"SIC{i % 5}" for i in range(n)],
+    )
+    # Simulate the 2026-06-29 paper account: many locked names with weights summing >1.0
+    # 30 locked longs * 0.0345 = 1.035 (3.5% over budget; many also exceed 3.33% cap)
+    locked_long = {f"L{i}": 0.0345 for i in range(30)}
+    locked_short = {f"S{i}": 0.0335 for i in range(30)}
+    assert sum(locked_long.values()) > 1.0, "test setup must produce over-budget locks"
+
+    long_w, short_w = engine._optimize_joint_weights_locked(
+        longs=longs, shorts=shorts, max_weight=cap,
+        score_weight=0.01, sector_penalty=25.0, turnover_penalty=0.005,
+        previous_long_weights={}, previous_short_weights={},
+        locked_long_weights=locked_long, locked_short_weights=locked_short,
+        turnover_budget=10.0, deploy_gap=0.0,
+    )
+    assert abs(float(long_w.sum()) - 1.0) < 1e-6, f"long sum={long_w.sum()}"
+    assert abs(float(short_w.sum()) - 1.0) < 1e-6, f"short sum={short_w.sum()}"
+    print(f"  [OK] over-budget locked rescaled, LP still feasible: long sum={long_w.sum():.6f}")
+
+
 def test_over_cap_locked_weight_is_feasible():
     """Optimizer must succeed (not raise) when a locked weight exceeds the cap."""
     engine = DecisionEngine(DecisionConfig())
@@ -119,6 +151,7 @@ def main():
     print("=" * 60)
     tests = [
         ("Over-cap locked weight is feasible", test_over_cap_locked_weight_is_feasible),
+        ("Over-budget locked sum is feasible", test_locked_sum_exceeds_side_budget),
         ("Normal within-cap locked still works", test_normal_locked_within_cap_still_works),
     ]
     failed = 0
