@@ -139,7 +139,16 @@ class DecisionEngine:
                 deploy_gap=float(deploy_gap),
             )
         except ValueError as exc:
-            relaxed = self._try_relaxed_beta_fallback(
+            # First fallback: progressively relax the turnover budget. The strict
+            # budget (default 0.15/day) is designed for steady-state low-turnover
+            # operation. In cold-start scenarios (broker has pre-existing positions
+            # the strategy didn't pick, or after a long pause with significant
+            # drift) the L1 distance from prev to the optimal portfolio genuinely
+            # exceeds the daily budget, so the LP is infeasible NOT because the
+            # alpha or risk constraints conflict — only because we asked it to
+            # transition too fast. Try progressively looser budgets before giving
+            # up on the strict optimizer.
+            relaxed_turnover = self._try_relaxed_turnover_fallback(
                 longs=longs,
                 shorts=shorts,
                 max_weight=float(self.config.max_single_name_side_weight),
@@ -150,49 +159,74 @@ class DecisionEngine:
                 previous_short_weights=previous_weights["short"],
                 locked_long_weights=locked_weights["long"],
                 locked_short_weights=locked_weights["short"],
-                turnover_budget=float(effective_budget),
+                base_turnover_budget=float(effective_budget),
                 deploy_gap=float(deploy_gap),
-                beta_band_grid=self.config.beta_band_grid,
             )
-            if relaxed is not None:
-                long_weights, short_weights, used_beta_band = relaxed
+            if relaxed_turnover is not None:
+                long_weights, short_weights, used_budget = relaxed_turnover
                 carry_reason = (
-                    f"fallback_relaxed_beta_band_{used_beta_band:.3f}"
+                    f"fallback_relaxed_turnover_budget_{used_budget:.3f}"
                     f"_after_optimizer_failed:{str(exc).replace(' ', '_')}"
                 )
+                # Override effective_budget for downstream diagnostics so the
+                # actual budget used is recorded.
+                effective_budget = used_budget
+                turnover_cap_total = float(effective_budget + deploy_gap)
             else:
-                repaired = self._repair_after_optimizer_failure(
-                    lot_manager=lot_manager,
-                    base=base,
+                relaxed = self._try_relaxed_beta_fallback(
                     longs=longs,
                     shorts=shorts,
-                    previous_weights=previous_weights,
-                    locked_weights=locked_weights,
-                    session_date=str(session_date),
-                    session_idx=int(session_idx),
-                    reason=f"optimizer_failed:{exc}",
-                    dropped_summary=dropped_summary,
+                    max_weight=float(self.config.max_single_name_side_weight),
+                    score_weight=float(self.config.score_weight),
+                    sector_penalty=float(self.config.sector_penalty),
+                    turnover_penalty=float(self.config.turnover_penalty),
+                    previous_long_weights=previous_weights["long"],
+                    previous_short_weights=previous_weights["short"],
+                    locked_long_weights=locked_weights["long"],
+                    locked_short_weights=locked_weights["short"],
+                    turnover_budget=float(effective_budget),
+                    deploy_gap=float(deploy_gap),
+                    beta_band_grid=self.config.beta_band_grid,
                 )
-                if repaired is not None:
-                    return repaired
-                diagnostics = {
-                    "status": "skip",
-                    "skip_reason": f"optimizer_failed_unrepairable:{exc}",
-                    "session_date": str(session_date),
-                    "session_idx": int(session_idx),
-                    "base_names": int(len(base)),
-                    "long_candidates": int(len(longs)),
-                    "short_candidates": int(len(shorts)),
-                    "dropped_lot_summary": dropped_summary,
-                }
-                return DecisionResult(
-                    status="skip",
-                    session_idx=int(session_idx),
-                    session_date=str(session_date),
-                    targets=pd.DataFrame(),
-                    diagnostics=diagnostics,
-                    skip_reason="optimizer_failed_unrepairable",
-                )
+                if relaxed is not None:
+                    long_weights, short_weights, used_beta_band = relaxed
+                    carry_reason = (
+                        f"fallback_relaxed_beta_band_{used_beta_band:.3f}"
+                        f"_after_optimizer_failed:{str(exc).replace(' ', '_')}"
+                    )
+                else:
+                    repaired = self._repair_after_optimizer_failure(
+                        lot_manager=lot_manager,
+                        base=base,
+                        longs=longs,
+                        shorts=shorts,
+                        previous_weights=previous_weights,
+                        locked_weights=locked_weights,
+                        session_date=str(session_date),
+                        session_idx=int(session_idx),
+                        reason=f"optimizer_failed:{exc}",
+                        dropped_summary=dropped_summary,
+                    )
+                    if repaired is not None:
+                        return repaired
+                    diagnostics = {
+                        "status": "skip",
+                        "skip_reason": f"optimizer_failed_unrepairable:{exc}",
+                        "session_date": str(session_date),
+                        "session_idx": int(session_idx),
+                        "base_names": int(len(base)),
+                        "long_candidates": int(len(longs)),
+                        "short_candidates": int(len(shorts)),
+                        "dropped_lot_summary": dropped_summary,
+                    }
+                    return DecisionResult(
+                        status="skip",
+                        session_idx=int(session_idx),
+                        session_date=str(session_date),
+                        targets=pd.DataFrame(),
+                        diagnostics=diagnostics,
+                        skip_reason="optimizer_failed_unrepairable",
+                    )
 
         if int((long_weights > self.eps).sum()) < int(self.config.min_nonzero_names):
             repaired = self._repair_after_optimizer_failure(
@@ -878,6 +912,62 @@ class DecisionEngine:
         if abs(net_beta) > 1e-5:
             raise ValueError("beta_constraint_breach")
         return long_weights, short_weights
+
+    def _try_relaxed_turnover_fallback(
+        self,
+        *,
+        longs: pd.DataFrame,
+        shorts: pd.DataFrame,
+        max_weight: float,
+        score_weight: float,
+        sector_penalty: float,
+        turnover_penalty: float,
+        previous_long_weights: Mapping[str, float],
+        previous_short_weights: Mapping[str, float],
+        locked_long_weights: Mapping[str, float],
+        locked_short_weights: Mapping[str, float],
+        base_turnover_budget: float,
+        deploy_gap: float,
+    ) -> tuple[np.ndarray, np.ndarray, float] | None:
+        """Retry the strict optimizer with progressively larger turnover budgets.
+
+        The 0.15/day default is for STEADY-STATE rebalancing. Cold-start situations
+        — first run after a long pause, broker has pre-existing positions the
+        strategy didn't pick, large universe drift — produce a genuine L1 gap
+        between prev and optimal that exceeds the daily budget. The LP is then
+        infeasible NOT because alpha/risk constraints conflict, only because the
+        budget pinches the transition.
+
+        Strategy: try doubling the budget up to a cap (2.0 = effectively unbounded
+        per side for a long/short book that sums to 1.0 each side). The smallest
+        budget that works is returned. This lets the system auto-heal from
+        transition mismatches without manual intervention while preserving the
+        steady-state behaviour: when the strict 0.15 budget IS feasible, the
+        outer call uses it directly and this helper is never invoked.
+        """
+        candidate_budgets = [0.30, 0.60, 1.2, 2.0]
+        for budget in candidate_budgets:
+            if budget <= base_turnover_budget:
+                continue
+            try:
+                long_w, short_w = self._optimize_joint_weights_locked(
+                    longs=longs,
+                    shorts=shorts,
+                    max_weight=max_weight,
+                    score_weight=score_weight,
+                    sector_penalty=sector_penalty,
+                    turnover_penalty=turnover_penalty,
+                    previous_long_weights=previous_long_weights,
+                    previous_short_weights=previous_short_weights,
+                    locked_long_weights=locked_long_weights,
+                    locked_short_weights=locked_short_weights,
+                    turnover_budget=float(budget),
+                    deploy_gap=deploy_gap,
+                )
+                return long_w, short_w, float(budget)
+            except ValueError:
+                continue
+        return None
 
     def _try_relaxed_beta_fallback(
         self,
