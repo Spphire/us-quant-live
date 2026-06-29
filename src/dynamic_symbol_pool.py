@@ -160,9 +160,20 @@ class DynamicSymbolPool:
             )
             return set()
 
-        # 3) 拉取 target_date 之前的一段历史 bars，用于计算“滞后流动性”。
+        # 3) 拉取 target_date 之前的一段历史 bars，用于计算"滞后流动性"。
         bars_start = target_date - timedelta(days=self._bars_window_calendar_days)
-        bars_end = target_date
+        # IMPORTANT: end at target_date - 1 day, NOT target_date itself.
+        # Reasons:
+        #   (a) The pool is filtered by `session_date < target_date` anyway (see
+        #       _build_pool_for_date), so today's bar would be discarded.
+        #   (b) Free-tier Alpaca SIP rejects any request whose range includes the
+        #       most recent 15-minute window with HTTP 403 ("subscription does not
+        #       permit querying recent SIP data"). Setting end=target_date causes
+        #       SIP to fail; end=target_date-1 stays well outside that window so
+        #       free SIP returns the historical daily bars cleanly.
+        #   (c) Eliminates the 1-day lookahead risk where today's intraday partial
+        #       bar could leak into a feature calculation (defense in depth).
+        bars_end = target_date - timedelta(days=1)
         print(
             f"[Alpaca] Step 2/3: fetching bars for {len(tradable_candidates)} symbols ...",
             flush=True,

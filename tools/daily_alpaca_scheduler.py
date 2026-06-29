@@ -95,19 +95,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--feed",
         default="sip",
-        help="Feed for AlphaCore daily bars. MUST be 'sip' for the 1000-symbol universe — "
-             "IEX covers only ~2-3%% of market volume and yields sparse data that makes the "
-             "optimizer infeasible. Use 'iex' only for a quick low-coverage test.",
+        help="Feed for AlphaCore daily bars (historical, ends at session_date - 1). "
+             "Default 'sip' gives consolidated full-market OHLC for cleaner factor signals. "
+             "Free-tier SIP works for these historical bars because they never include the "
+             "recent 15-minute window. Use 'iex' to force single-exchange coverage if needed.",
     )
     parser.add_argument(
         "--dynamic-feed",
         default="sip",
-        help="Feed for DynamicSymbolPool bars. MUST be 'sip' for full market coverage.",
+        help="Feed for DynamicSymbolPool bars (historical liquidity ranking, ends at "
+             "session_date - 1). Default 'sip' for full-market liquidity. Free-tier compatible.",
     )
     parser.add_argument(
         "--execution-price-feed",
-        default="sip",
-        help="Feed for latest-trade refresh during execution. MUST be 'sip' for accurate pricing.",
+        default="iex",
+        help="Feed for the latest-trade price refresh during execution (requires RECENT data). "
+             "Default 'iex' — free-tier SIP rejects recent-data queries with HTTP 403, so SIP "
+             "is NOT usable for execution pricing without a paid market-data subscription. "
+             "IEX gives single-exchange last-trade, which is acceptable for top-1000 liquid "
+             "names (all present on IEX). Set 'sip' only if you have an entitled subscription.",
     )
 
     parser.add_argument("--decision-time-cn", default="12:00")
