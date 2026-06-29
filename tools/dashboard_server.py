@@ -49,12 +49,17 @@ class DataAggregator:
             long_count = sum(1 for p in positions_data if p.get("side") == "long")
             short_count = sum(1 for p in positions_data if p.get("side") == "short")
 
+            # Extract the latest session's decision/execute status from the
+            # scheduler's sessions-keyed state.json.
+            latest_date, decision_task, execute_task = self._latest_session_tasks(state)
+
             return {
                 "equity": equity,
                 "session_idx": session_idx,
                 "positions_count": {"long": long_count, "short": short_count, "total": len(positions_data)},
-                "last_decision": state.get("last_decision", {}),
-                "last_execute": state.get("last_execute", {}),
+                "session_date": latest_date,
+                "last_decision": decision_task,
+                "last_execute": execute_task,
                 "next_decision_time": state.get("next_decision_time"),
                 "next_execute_time": state.get("next_execute_time"),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -94,17 +99,10 @@ class DataAggregator:
             }
 
     def get_history(self, limit: int = 30) -> list[dict[str, Any]]:
-        """Get execution history."""
+        """Get execution history across all run directories."""
         with self.cache_lock:
-            output_root = self.artifacts_root / "output"
-            if not output_root.exists():
-                return []
-
-            # Find all execution_summary.json files
             summaries = []
-            for run_dir in sorted(output_root.iterdir(), reverse=True):
-                if not run_dir.is_dir():
-                    continue
+            for run_dir in self._iter_run_dirs():
                 summary_file = run_dir / "execution_summary.json"
                 if not summary_file.exists():
                     continue
@@ -260,19 +258,13 @@ class DataAggregator:
             "lot_ledger": self.project_root / "artifacts" / "alpaca_executor" / "lot_ledger.json",
             "state": self.artifacts_root / "state.json",
         }
-        # Also include latest execution_summary
-        output_root = self.artifacts_root / "output"
-        if output_root.exists():
-            try:
-                latest = max(
-                    (d for d in output_root.iterdir() if d.is_dir() and (d / "execution_summary.json").exists()),
-                    key=lambda d: d.stat().st_mtime,
-                    default=None,
-                )
-                if latest is not None:
-                    files["latest_summary"] = latest / "execution_summary.json"
-            except Exception:
-                pass
+        # Also include the most recent execution_summary across all run directories
+        run_dirs = self._iter_run_dirs()
+        for run_dir in run_dirs:
+            summary = run_dir / "execution_summary.json"
+            if summary.exists():
+                files["latest_summary"] = summary
+                break
 
         mtimes: dict[str, float] = {}
         for key, path in files.items():
@@ -283,6 +275,33 @@ class DataAggregator:
                 pass
         return mtimes
 
+    def _iter_run_dirs(self) -> list[Path]:
+        """Enumerate all scheduler run output directories, newest first.
+
+        The scheduler writes per-session output to:
+            artifacts/daily_alpaca_scheduler/<YYYYMMDD>_decision/
+            artifacts/daily_alpaca_scheduler/<YYYYMMDD>_execute/
+        Older/test data may also live under:
+            artifacts/daily_alpaca_scheduler/output/<run>/
+        We collect both so the dashboard works regardless of layout, sorted by
+        directory mtime (newest first) so "latest" picks the most recent run.
+        """
+        run_dirs: list[Path] = []
+        # New layout: <date>_decision / <date>_execute directly under artifacts_root
+        if self.artifacts_root.exists():
+            for d in self.artifacts_root.iterdir():
+                if d.is_dir() and (d.name.endswith("_decision") or d.name.endswith("_execute")):
+                    run_dirs.append(d)
+        # Legacy layout: output/<run>/
+        output_root = self.artifacts_root / "output"
+        if output_root.exists():
+            for d in output_root.iterdir():
+                if d.is_dir():
+                    run_dirs.append(d)
+        # Newest first by mtime
+        run_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return run_dirs
+
     def _read_scheduler_state(self) -> dict[str, Any]:
         """Read scheduler state.json."""
         state_file = self.artifacts_root / "state.json"
@@ -292,6 +311,24 @@ class DataAggregator:
             return json.loads(state_file.read_text(encoding="utf-8"))
         except Exception:
             return {}
+
+    def _latest_session_tasks(self, state: dict[str, Any]) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
+        """Extract the latest session's decision/execute task records from state.
+
+        state.json format:
+            {"version": 1, "sessions": {"2026-06-29": {"decision": {...}, "execute": {...}}}}
+        Returns (latest_session_date, decision_task, execute_task). Missing pieces
+        come back as empty dicts.
+        """
+        sessions = state.get("sessions", {})
+        if not isinstance(sessions, dict) or not sessions:
+            return None, {}, {}
+        # Session keys are ISO dates (YYYY-MM-DD); lexicographic sort == chronological
+        latest_date = max(sessions.keys())
+        session = sessions.get(latest_date, {}) or {}
+        decision = session.get("decision", {}) or {}
+        execute = session.get("execute", {}) or {}
+        return latest_date, decision, execute
 
     def _read_lot_ledger(self) -> dict[str, Any]:
         """Read lot_ledger.json."""
@@ -304,34 +341,21 @@ class DataAggregator:
             return {"ledger": {"long": [], "short": []}, "meta": {}}
 
     def _get_latest_execution_summary(self) -> dict[str, Any]:
-        """Get most recent execution_summary.json."""
-        output_root = self.artifacts_root / "output"
-        if not output_root.exists():
-            return {}
-
-        latest_dir = None
-        for run_dir in sorted(output_root.iterdir(), reverse=True):
-            if run_dir.is_dir() and (run_dir / "execution_summary.json").exists():
-                latest_dir = run_dir
-                break
-
-        if not latest_dir:
-            return {}
-
-        try:
-            return json.loads((latest_dir / "execution_summary.json").read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        """Get most recent execution_summary.json across all run directories."""
+        for run_dir in self._iter_run_dirs():
+            summary_file = run_dir / "execution_summary.json"
+            if summary_file.exists():
+                try:
+                    return json.loads(summary_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+        return {}
 
     def _read_latest_positions(self) -> list[dict[str, Any]]:
-        """Read broker_positions_after.csv from latest run."""
-        output_root = self.artifacts_root / "output"
-        if not output_root.exists():
-            return []
-
+        """Read broker_positions_after.csv from the most recent run directory."""
         latest_dir = None
-        for run_dir in sorted(output_root.iterdir(), reverse=True):
-            if run_dir.is_dir() and (run_dir / "broker_positions_after.csv").exists():
+        for run_dir in self._iter_run_dirs():
+            if (run_dir / "broker_positions_after.csv").exists():
                 latest_dir = run_dir
                 break
 
