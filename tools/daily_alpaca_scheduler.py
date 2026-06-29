@@ -94,18 +94,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument(
         "--feed",
-        default="iex",
-        help="Feed passed to Alpaca daily bars in AlphaCore. Use sip only if the account is entitled.",
+        default="sip",
+        help="Feed for AlphaCore daily bars. MUST be 'sip' for the 1000-symbol universe — "
+             "IEX covers only ~2-3%% of market volume and yields sparse data that makes the "
+             "optimizer infeasible. Use 'iex' only for a quick low-coverage test.",
     )
     parser.add_argument(
         "--dynamic-feed",
-        default="iex",
-        help="Feed passed to DynamicSymbolPool bars. Use sip only if the account is entitled.",
+        default="sip",
+        help="Feed for DynamicSymbolPool bars. MUST be 'sip' for full market coverage.",
     )
     parser.add_argument(
         "--execution-price-feed",
-        default="iex",
-        help="Feed passed to latest-trade refresh during execution.",
+        default="sip",
+        help="Feed for latest-trade refresh during execution. MUST be 'sip' for accurate pricing.",
     )
 
     parser.add_argument("--decision-time-cn", default="12:00")

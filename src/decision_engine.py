@@ -795,8 +795,15 @@ class DecisionEngine:
 
         if float(long_lower.sum()) > 1.0 + 1e-8 or float(short_lower.sum()) > 1.0 + 1e-8:
             raise ValueError("locked_weight_exceeds_side_budget")
-        if np.any(lower > max_weight + 1e-8):
-            raise ValueError("locked_weight_exceeds_name_cap")
+        # Per-name upper bound: normally the single-name cap, but if a locked lot
+        # already exceeds the cap (e.g. carried from a prior session, or a broker
+        # position that drifted above cap due to price moves), pin that name's upper
+        # bound to its locked weight so the lower bound never exceeds the upper bound.
+        # This keeps the LP feasible — the cap still constrains all NON-over-locked
+        # names, and over-cap locked names are simply held in place rather than forcing
+        # an infeasible problem (which previously dropped the whole decision to the
+        # carry/repair fallback every session).
+        upper = np.maximum(lower, max_weight)
         if n_long * max_weight < 1.0 - 1e-12 or n_short * max_weight < 1.0 - 1e-12:
             raise ValueError("insufficient_weight_capacity")
 
@@ -839,7 +846,7 @@ class DecisionEngine:
             ]
         )
         bounds: list[tuple[float, float | None]] = (
-            [(float(lo), max_weight) for lo in lower] + [(0.0, None)] * n + [(0.0, None)] * m_sector
+            [(float(lo), float(up)) for lo, up in zip(lower, upper)] + [(0.0, None)] * n + [(0.0, None)] * m_sector
         )
 
         a_eq = np.column_stack([a_eq, np.zeros((a_eq.shape[0], n + m_sector))])
@@ -862,7 +869,7 @@ class DecisionEngine:
         )
         if not result.success:
             raise ValueError(str(result.message).replace(" ", "_"))
-        x = np.clip(result.x[:n], lower, max_weight)
+        x = np.clip(result.x[:n], lower, upper)
         long_weights = x[:n_long]
         short_weights = x[n_long:]
         if abs(float(long_weights.sum()) - 1.0) > 1e-6 or abs(float(short_weights.sum()) - 1.0) > 1e-6:
@@ -945,8 +952,10 @@ class DecisionEngine:
         lower = np.concatenate([long_lower, short_lower])
         if float(long_lower.sum()) > 1.0 + 1e-8 or float(short_lower.sum()) > 1.0 + 1e-8:
             raise ValueError("locked_weight_exceeds_side_budget")
-        if np.any(lower > max_weight + 1e-8):
-            raise ValueError("locked_weight_exceeds_name_cap")
+        # See _optimize_joint_weights_locked: pin per-name upper to the locked weight
+        # when it exceeds the single-name cap, keeping the LP feasible instead of
+        # rejecting over-cap locked lots and dropping to the carry/repair fallback.
+        upper = np.maximum(lower, max_weight)
         if n_long * max_weight < 1.0 - 1e-12 or n_short * max_weight < 1.0 - 1e-12:
             raise ValueError("insufficient_weight_capacity")
 
@@ -987,7 +996,7 @@ class DecisionEngine:
             ]
         )
         bounds: list[tuple[float, float | None]] = (
-            [(float(lo), max_weight) for lo in lower] + [(0.0, None)] * n + [(0.0, None)] * m_sector
+            [(float(lo), float(up)) for lo, up in zip(lower, upper)] + [(0.0, None)] * n + [(0.0, None)] * m_sector
         )
         a_eq = np.column_stack([a_eq, np.zeros((a_eq.shape[0], n + m_sector))])
         turnover_top = np.column_stack([np.eye(n), -np.eye(n), np.zeros((n, m_sector))])
@@ -1031,7 +1040,7 @@ class DecisionEngine:
         )
         if not result.success:
             raise ValueError(str(result.message).replace(" ", "_"))
-        x = np.clip(result.x[:n], lower, max_weight)
+        x = np.clip(result.x[:n], lower, upper)
         long_weights = x[:n_long]
         short_weights = x[n_long:]
         if abs(float(long_weights.sum()) - 1.0) > 1e-6 or abs(float(short_weights.sum()) - 1.0) > 1e-6:
@@ -1042,10 +1051,14 @@ class DecisionEngine:
         return long_weights, short_weights
 
     def _sanitize_locked_lower(self, values: np.ndarray, *, max_weight: float) -> np.ndarray:
+        # Clean tiny/negative noise and, if the locked weights collectively round
+        # just above the side budget (sum > 1.0) due to floating point, scale them
+        # back under 1.0. We do NOT clip individual over-cap locked weights here —
+        # the optimizer accommodates them via a per-name upper bound (see
+        # _optimize_joint_weights_locked), so a genuinely over-cap locked lot is
+        # held in place rather than discarded.
         lower = np.asarray(values, dtype=float).copy()
         lower[np.abs(lower) <= self.eps] = 0.0
-        if np.any(lower > max_weight) and float(lower.max()) <= max_weight + 1e-7:
-            lower = np.minimum(lower, max_weight)
         total = float(lower.sum())
         if total > 1.0 and total <= 1.0 + 1e-7:
             lower *= (1.0 - 1e-9) / total
