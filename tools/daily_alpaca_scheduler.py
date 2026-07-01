@@ -474,6 +474,10 @@ def _run_task(
                 task_state["status"] = "completed"
         else:
             task_state["status"] = "completed"
+            # After a successful execute, generate the execution-quality report
+            # (fill rate, slippage bps, tracking error, cancel attribution) so
+            # every session leaves a consistent post-trade record for review.
+            _generate_execution_quality(paths.execute_output_root)
     else:
         task_state["status"] = "failed"
 
@@ -594,6 +598,32 @@ def _task_can_attempt(task_state: dict[str, Any], args: argparse.Namespace, now_
         if last_at and (now_cn - last_at).total_seconds() < retry_after_minutes * 60:
             return False
     return True
+
+
+def _generate_execution_quality(execute_output_root: Path) -> None:
+    """Generate execution_quality.json for a completed execute run (best-effort).
+
+    Imports the analyzer lazily so a problem here never blocks the trading loop.
+    """
+    try:
+        tools_dir = Path(__file__).resolve().parent
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from execution_quality import write_quality_file  # noqa: WPS433
+
+        result = write_quality_file(Path(execute_output_root))
+        counts = result.get("counts", {}) if isinstance(result, dict) else {}
+        slip = result.get("slippage_bps", {}) if isinstance(result, dict) else {}
+        print(
+            f"[Scheduler] execution quality: "
+            f"fill={result.get('fill_rate_count', 0) * 100:.1f}% "
+            f"({counts.get('filled', 0)}/{counts.get('total_orders', 0)}), "
+            f"slippage_nw={slip.get('avg_notional_weighted')}bps, "
+            f"unfilled=${result.get('unfilled_notional', 0):,.0f}",
+            flush=True,
+        )
+    except Exception as exc:  # never let analytics break the daemon
+        print(f"[Scheduler] warning: execution-quality generation failed: {exc}", flush=True)
 
 
 def _capture_task_outputs(task_state: dict[str, Any], task: str, paths: DayPaths) -> None:
