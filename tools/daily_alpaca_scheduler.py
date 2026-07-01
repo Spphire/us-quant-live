@@ -116,7 +116,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "names (all present on IEX). Set 'sip' only if you have an entitled subscription.",
     )
 
-    parser.add_argument("--decision-time-cn", default="12:00")
+    # NOTE: decision fires at 12:30 BJ (not 12:00). BJ 12:00 == US Eastern 00:00 which
+    # is exactly midnight ET — the free-tier Alpaca SIP endpoint marks the previous
+    # trading day's daily bar as "recent" for ~15-30 minutes past midnight and rejects
+    # queries against it with HTTP 403 "subscription does not permit querying recent
+    # SIP data". Empirically at 00:00:26 ET the request 403's; by 00:17 ET it succeeds.
+    # BJ 12:30 == 00:30 ET stays comfortably past the rollover, so decision runs
+    # succeed on the first attempt instead of relying on the 30-minute retry.
+    parser.add_argument("--decision-time-cn", default="12:30")
     parser.add_argument("--execute-time-cn", default="22:00")
     parser.add_argument("--target-ny-time", default="10:00")
     parser.add_argument(
