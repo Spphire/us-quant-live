@@ -161,14 +161,25 @@ def _solve_projection(
     specs: Sequence[_TargetSpec],
     *,
     buying_power_cap: float,
+    gross_notional_cap: float | None = None,
+    fixed_gross_notional: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     count = len(specs)
+    safe_gross_cap = (
+        max(0.0, float(gross_notional_cap))
+        if gross_notional_cap is not None
+        else None
+    )
+    safe_fixed_gross = max(0.0, float(fixed_gross_notional))
     if count == 0:
+        feasible = safe_gross_cap is None or safe_fixed_gross <= safe_gross_cap + 1e-6
         return np.zeros(0, dtype=float), {
-            "success": True,
-            "status": 0,
-            "message": "no_optimizable_targets",
+            "success": bool(feasible),
+            "status": 0 if feasible else 2,
+            "message": "no_optimizable_targets" if feasible else "fixed_gross_exceeds_capacity_cap",
             "solver": "scipy.optimize.milp/highs",
+            "gross_notional_cap": safe_gross_cap,
+            "fixed_gross_notional": safe_fixed_gross,
         }
 
     # Variables are target qty, absolute signed-weight deviation, entry qty,
@@ -237,6 +248,22 @@ def _solve_projection(
     row_lower.append(-np.inf)
     row_upper.append(safe_cap / normalizer)
 
+    conservative_residual_gross = sum(
+        max(0.0, float(spec.short_position_residual_qty)) * float(spec.reference_price)
+        for spec in specs
+    )
+    if safe_gross_cap is not None:
+        gross_row = np.zeros(variable_count, dtype=float)
+        gross_normalizer = max(safe_gross_cap, 1.0)
+        for idx, spec in enumerate(specs):
+            gross_row[q0 + idx] = float(spec.reference_price) / gross_normalizer
+        rows.append(gross_row)
+        row_lower.append(-np.inf)
+        row_upper.append(
+            (safe_gross_cap - safe_fixed_gross - conservative_residual_gross)
+            / gross_normalizer
+        )
+
     base_constraint = LinearConstraint(np.vstack(rows), np.asarray(row_lower), np.asarray(row_upper))
     primary_result = milp(
         c=primary_objective,
@@ -291,6 +318,9 @@ def _solve_projection(
         else None,
         "mip_gap": _safe_float(getattr(result, "mip_gap", None), default=float("nan")),
         "mip_node_count": int(_safe_float(getattr(result, "mip_node_count", 0))),
+        "gross_notional_cap": safe_gross_cap,
+        "fixed_gross_notional": float(safe_fixed_gross),
+        "conservative_short_residual_gross_notional": float(conservative_residual_gross),
     }
     if result.success and result.x is not None:
         return np.asarray(result.x[q0 : q0 + count], dtype=float), solver_diag
@@ -310,13 +340,13 @@ def _solve_projection(
         max(0.0, float(desired[idx]) - float(spec.current_same_side_qty)) * float(spec.buying_power_price)
         for idx, spec in enumerate(specs)
     )
-    scale = min(1.0, safe_cap / required) if required > EPS else 1.0
+    entry_scale = min(1.0, safe_cap / required) if required > EPS else 1.0
     fallback = np.asarray(
         [
             min(
                 spec.qty_upper_bound,
                 spec.current_same_side_qty
-                + max(0.0, desired[idx] - spec.current_same_side_qty) * scale,
+                + max(0.0, desired[idx] - spec.current_same_side_qty) * entry_scale,
             )
             if desired[idx] > spec.current_same_side_qty
             else desired[idx]
@@ -324,11 +354,30 @@ def _solve_projection(
         ],
         dtype=float,
     )
+    gross_scale = 1.0
+    if safe_gross_cap is not None:
+        active_residual_gross = sum(
+            float(spec.short_position_residual_qty) * float(spec.reference_price)
+            for idx, spec in enumerate(specs)
+            if fallback[idx] > EPS
+        )
+        variable_gross = sum(
+            max(0.0, float(fallback[idx])) * float(spec.reference_price)
+            for idx, spec in enumerate(specs)
+        )
+        available_for_variable = max(
+            0.0,
+            safe_gross_cap - safe_fixed_gross - active_residual_gross,
+        )
+        if variable_gross > available_for_variable + 1e-6:
+            gross_scale = available_for_variable / max(variable_gross, 1e-9)
+            fallback *= gross_scale
     for idx, spec in enumerate(specs):
         if spec.integral_target:
             fallback[idx] = float(math.floor(fallback[idx] + 1e-12))
     solver_diag["fallback_used"] = True
-    solver_diag["fallback_entry_scale"] = float(scale)
+    solver_diag["fallback_entry_scale"] = float(entry_scale)
+    solver_diag["fallback_gross_scale"] = float(gross_scale)
     return fallback, solver_diag
 
 
@@ -338,6 +387,8 @@ def _summarize_solution(
     *,
     account_equity: float,
     buying_power_cap: float,
+    gross_notional_cap: float | None = None,
+    fixed_gross_notional: float = 0.0,
 ) -> dict[str, Any]:
     equity = max(float(account_equity), 1e-9)
     used = 0.0
@@ -346,10 +397,12 @@ def _summarize_solution(
     max_abs_weight_gap = 0.0
     max_relative = 0.0
     integer_rounding_loss = 0.0
+    projected_gross = max(0.0, float(fixed_gross_notional))
     for spec, qty_raw in zip(specs, target_qty):
         qty = max(0.0, float(qty_raw))
         expected_qty = 0.0 if qty <= EPS else max(0.0, qty + spec.short_position_residual_qty)
         actual_notional = expected_qty * spec.reference_price
+        projected_gross += abs(actual_notional)
         gap = actual_notional - spec.desired_notional
         weight_gap = gap / equity
         l1 += abs(weight_gap)
@@ -361,6 +414,11 @@ def _summarize_solution(
         if spec.side == "short" and spec.integral_target:
             integer_rounding_loss += abs(gap)
     cap = max(0.0, float(buying_power_cap))
+    gross_cap = (
+        max(0.0, float(gross_notional_cap))
+        if gross_notional_cap is not None
+        else None
+    )
     return {
         "estimated_entry_buying_power_used": float(used),
         "buying_power_cap": float(cap),
@@ -374,6 +432,14 @@ def _summarize_solution(
         "max_abs_symbol_weight_error_pct": float(max_abs_weight_gap * 100.0),
         "max_symbol_relative_target_error": float(max_relative),
         "integer_short_absolute_notional_gap": float(integer_rounding_loss),
+        "projected_final_gross_notional": float(projected_gross),
+        "gross_notional_cap": gross_cap,
+        "gross_notional_cap_utilization": (
+            float(projected_gross / gross_cap) if gross_cap is not None and gross_cap > EPS else None
+        ),
+        "gross_notional_cap_slack": (
+            float(gross_cap - projected_gross) if gross_cap is not None else None
+        ),
     }
 
 
@@ -381,14 +447,23 @@ def _summarize_projection_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
     buying_power_cap: float,
+    gross_notional_cap: float | None = None,
 ) -> dict[str, Any]:
     used = sum(_safe_float(row.get("estimated_entry_buying_power")) for row in rows)
     weight_gaps = [_safe_float(row.get("projection_weight_gap")) for row in rows]
     max_relative = 0.0
     integer_gap = 0.0
+    projected_gross = 0.0
     for row in rows:
-        raw_notional = abs(_safe_float(row.get("raw_target_notional")))
+        raw_notional = abs(
+            _safe_float(
+                row.get("capacity_adjusted_target_notional")
+                if row.get("capacity_adjusted_target_notional") not in (None, "")
+                else row.get("raw_target_notional")
+            )
+        )
         gap = abs(_safe_float(row.get("projection_notional_gap")))
+        projected_gross += abs(_safe_float(row.get("expected_final_notional")))
         if raw_notional > EPS:
             max_relative = max(max_relative, gap / raw_notional)
         if str(row.get("target_side")) == "short" and bool(row.get("integer_target_required")):
@@ -397,6 +472,11 @@ def _summarize_projection_rows(
     l1 = float(sum(abs(value) for value in weight_gaps))
     mean_abs = float(l1 / len(weight_gaps)) if weight_gaps else 0.0
     max_abs = float(max((abs(value) for value in weight_gaps), default=0.0))
+    gross_cap = (
+        max(0.0, float(gross_notional_cap))
+        if gross_notional_cap is not None
+        else None
+    )
     return {
         "estimated_entry_buying_power_used": float(used),
         "buying_power_cap": float(cap),
@@ -410,6 +490,14 @@ def _summarize_projection_rows(
         "max_abs_symbol_weight_error_pct": float(max_abs * 100.0),
         "max_symbol_relative_target_error": float(max_relative),
         "integer_short_absolute_notional_gap": float(integer_gap),
+        "projected_final_gross_notional": float(projected_gross),
+        "gross_notional_cap": gross_cap,
+        "gross_notional_cap_utilization": (
+            float(projected_gross / gross_cap) if gross_cap is not None and gross_cap > EPS else None
+        ),
+        "gross_notional_cap_slack": (
+            float(gross_cap - projected_gross) if gross_cap is not None else None
+        ),
     }
 
 
@@ -431,12 +519,41 @@ def project_executable_targets(
     sizing_adverse_offset_bps: float,
     short_buying_power_adverse_offset_bps: float,
     scenario_buffers: Sequence[float] = (0.85, 0.90, 0.95),
+    total_buying_power_capacity: float | None = None,
+    gross_capacity_target_ratio: float = 0.95,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, Any]]:
     equity = max(float(account_equity), 1e-9)
     buffer = min(max(float(buying_power_buffer), 0.0), 1.0)
     cap = max(0.0, float(buying_power)) * buffer
+    gross_capacity_ratio = min(max(float(gross_capacity_target_ratio), 0.0), 1.0)
+    total_capacity = (
+        max(0.0, float(total_buying_power_capacity))
+        if total_buying_power_capacity is not None
+        else None
+    )
+    raw_weights = {
+        str(symbol).strip().upper(): _safe_float(weight)
+        for symbol, weight in raw_target_signed_weights.items()
+        if str(symbol).strip() and abs(_safe_float(weight)) > EPS
+    }
+    raw_gross_weight = sum(abs(weight) for weight in raw_weights.values())
+    raw_gross_notional = raw_gross_weight * equity
+    gross_target_notional = (
+        total_capacity * gross_capacity_ratio
+        if total_capacity is not None
+        else raw_gross_notional
+    )
+    capacity_scale = (
+        min(1.0, gross_target_notional / raw_gross_notional)
+        if raw_gross_notional > EPS
+        else 1.0
+    )
+    capacity_adjusted_weights = {
+        symbol: float(weight * capacity_scale)
+        for symbol, weight in raw_weights.items()
+    }
     specs, blocked = _build_target_specs(
-        raw_target_signed_weights=raw_target_signed_weights,
+        raw_target_signed_weights=capacity_adjusted_weights,
         current_signed_qty=current_signed_qty,
         current_signed_notional=current_signed_notional,
         reference_prices=reference_prices,
@@ -448,7 +565,15 @@ def project_executable_targets(
         sizing_adverse_offset_bps=sizing_adverse_offset_bps,
         short_buying_power_adverse_offset_bps=short_buying_power_adverse_offset_bps,
     )
-    solved_qty, solver_diag = _solve_projection(specs, buying_power_cap=cap)
+    fixed_gross_notional = sum(
+        abs(_safe_float(item.get("current_signed_notional"))) for item in blocked
+    )
+    solved_qty, solver_diag = _solve_projection(
+        specs,
+        buying_power_cap=cap,
+        gross_notional_cap=gross_target_notional if total_capacity is not None else None,
+        fixed_gross_notional=fixed_gross_notional,
+    )
 
     order_target_weights: dict[str, float] = {}
     target_lattice_signed_qty: dict[str, float] = {}
@@ -464,7 +589,10 @@ def project_executable_targets(
         expected_abs_qty = 0.0 if qty <= EPS else max(0.0, qty + spec.short_position_residual_qty)
         expected_signed_qty = expected_abs_qty if spec.side == "long" else -expected_abs_qty
         expected_notional = expected_signed_qty * spec.reference_price
-        raw_target_notional = spec.raw_weight * equity
+        raw_weight = _safe_float(raw_weights.get(spec.symbol))
+        capacity_adjusted_weight = float(spec.raw_weight)
+        raw_target_notional = raw_weight * equity
+        capacity_adjusted_target_notional = capacity_adjusted_weight * equity
         estimated_delta_notional = expected_notional - spec.current_signed_notional
         reasons = list(spec.constraints)
         carried_by_min_trade = False
@@ -518,19 +646,31 @@ def project_executable_targets(
             {
                 "symbol": spec.symbol,
                 "target_side": spec.side,
-                "raw_target_signed_weight": float(spec.raw_weight),
+                "raw_target_signed_weight": float(raw_weight),
+                "capacity_adjusted_target_signed_weight": float(capacity_adjusted_weight),
                 "raw_target_notional": float(raw_target_notional),
+                "capacity_adjusted_target_notional": float(capacity_adjusted_target_notional),
                 "reference_price": float(spec.reference_price),
                 "current_signed_qty": float(spec.current_signed_qty),
                 "current_signed_notional": float(spec.current_signed_notional),
-                "raw_target_abs_qty": float(spec.desired_notional / spec.reference_price),
+                "raw_target_abs_qty": float(abs(raw_target_notional) / spec.reference_price),
+                "capacity_adjusted_target_abs_qty": float(
+                    spec.desired_notional / spec.reference_price
+                ),
                 "target_lattice_abs_qty": float(qty),
                 "target_lattice_signed_qty": float(target_lattice_signed_qty[spec.symbol]),
                 "short_position_residual_qty": float(spec.short_position_residual_qty),
                 "expected_final_signed_qty": float(expected_signed_qty),
+                "expected_final_notional": float(expected_notional),
                 "executable_expected_signed_weight": float(expected_notional / equity),
-                "projection_weight_gap": float((expected_notional - raw_target_notional) / equity),
-                "projection_notional_gap": float(expected_notional - raw_target_notional),
+                "projection_weight_gap": float(
+                    (expected_notional - capacity_adjusted_target_notional) / equity
+                ),
+                "projection_notional_gap": float(
+                    expected_notional - capacity_adjusted_target_notional
+                ),
+                "raw_strategy_weight_gap": float((expected_notional - raw_target_notional) / equity),
+                "raw_strategy_notional_gap": float(expected_notional - raw_target_notional),
                 "estimated_entry_qty": float(entry_qty),
                 "estimated_entry_buying_power": float(entry_bp),
                 "buying_power_price": float(spec.buying_power_price),
@@ -547,24 +687,36 @@ def project_executable_targets(
             executable_expected_weights[symbol] = float(current_notional / equity)
             order_target_weights[symbol] = float(current_notional / equity)
         target_lattice_signed_qty[symbol] = float(current_qty)
-        raw_weight = _safe_float(item.get("raw_target_signed_weight"))
+        capacity_adjusted_weight = _safe_float(item.get("raw_target_signed_weight"))
+        raw_weight = _safe_float(raw_weights.get(symbol))
+        capacity_adjusted_notional = capacity_adjusted_weight * equity
         symbol_rows.append(
             {
                 "symbol": symbol,
                 "target_side": "long" if raw_weight >= 0 else "short",
                 "raw_target_signed_weight": float(raw_weight),
+                "capacity_adjusted_target_signed_weight": float(capacity_adjusted_weight),
                 "raw_target_notional": float(raw_weight * equity),
+                "capacity_adjusted_target_notional": float(capacity_adjusted_notional),
                 "reference_price": None,
                 "current_signed_qty": float(current_qty),
                 "current_signed_notional": float(current_notional),
                 "raw_target_abs_qty": None,
+                "capacity_adjusted_target_abs_qty": None,
                 "target_lattice_abs_qty": abs(float(current_qty)),
                 "target_lattice_signed_qty": float(current_qty),
                 "short_position_residual_qty": 0.0,
                 "expected_final_signed_qty": float(current_qty),
+                "expected_final_notional": float(current_notional),
                 "executable_expected_signed_weight": float(current_notional / equity),
-                "projection_weight_gap": float((current_notional / equity) - raw_weight),
-                "projection_notional_gap": float(current_notional - raw_weight * equity),
+                "projection_weight_gap": float(
+                    (current_notional / equity) - capacity_adjusted_weight
+                ),
+                "projection_notional_gap": float(
+                    current_notional - capacity_adjusted_notional
+                ),
+                "raw_strategy_weight_gap": float((current_notional / equity) - raw_weight),
+                "raw_strategy_notional_gap": float(current_notional - raw_weight * equity),
                 "estimated_entry_qty": 0.0,
                 "estimated_entry_buying_power": 0.0,
                 "buying_power_price": None,
@@ -585,20 +737,26 @@ def project_executable_targets(
                 "symbol": str(symbol).upper(),
                 "target_side": "flat",
                 "raw_target_signed_weight": 0.0,
+                "capacity_adjusted_target_signed_weight": 0.0,
                 "raw_target_notional": 0.0,
+                "capacity_adjusted_target_notional": 0.0,
                 "reference_price": _safe_float(reference_prices.get(symbol))
                 if _safe_float(reference_prices.get(symbol)) > EPS
                 else None,
                 "current_signed_qty": float(current_qty),
                 "current_signed_notional": float(current_notional),
                 "raw_target_abs_qty": 0.0,
+                "capacity_adjusted_target_abs_qty": 0.0,
                 "target_lattice_abs_qty": 0.0,
                 "target_lattice_signed_qty": 0.0,
                 "short_position_residual_qty": 0.0,
                 "expected_final_signed_qty": 0.0,
+                "expected_final_notional": 0.0,
                 "executable_expected_signed_weight": 0.0,
                 "projection_weight_gap": 0.0,
                 "projection_notional_gap": 0.0,
+                "raw_strategy_weight_gap": 0.0,
+                "raw_strategy_notional_gap": 0.0,
                 "estimated_entry_qty": 0.0,
                 "estimated_entry_buying_power": 0.0,
                 "buying_power_price": None,
@@ -612,33 +770,89 @@ def project_executable_targets(
         solved_qty,
         account_equity=equity,
         buying_power_cap=cap,
+        gross_notional_cap=gross_target_notional if total_capacity is not None else None,
+        fixed_gross_notional=fixed_gross_notional,
     )
-    actual_summary = _summarize_projection_rows(symbol_rows, buying_power_cap=cap)
+    actual_summary = _summarize_projection_rows(
+        symbol_rows,
+        buying_power_cap=cap,
+        gross_notional_cap=gross_target_notional if total_capacity is not None else None,
+    )
     scenario_rows: list[dict[str, Any]] = []
     scenario_values = sorted({min(max(float(value), 0.0), 1.0) for value in scenario_buffers} | {buffer})
     for scenario_buffer in scenario_values:
         scenario_cap = max(0.0, float(buying_power)) * scenario_buffer
-        scenario_qty, scenario_solver = _solve_projection(specs, buying_power_cap=scenario_cap)
+        scenario_qty, scenario_solver = _solve_projection(
+            specs,
+            buying_power_cap=scenario_cap,
+            gross_notional_cap=gross_target_notional if total_capacity is not None else None,
+            fixed_gross_notional=fixed_gross_notional,
+        )
         scenario_rows.append(
             {
                 "buffer": float(scenario_buffer),
-                **_summarize_solution(specs, scenario_qty, account_equity=equity, buying_power_cap=scenario_cap),
+                **_summarize_solution(
+                    specs,
+                    scenario_qty,
+                    account_equity=equity,
+                    buying_power_cap=scenario_cap,
+                    gross_notional_cap=gross_target_notional
+                    if total_capacity is not None
+                    else None,
+                    fixed_gross_notional=fixed_gross_notional,
+                ),
                 "solver_success": bool(scenario_solver.get("success")),
                 "solver_status": scenario_solver.get("status"),
             }
         )
 
-    raw_long_gross = sum(max(0.0, _safe_float(value)) for value in raw_target_signed_weights.values())
-    raw_short_gross = sum(max(0.0, -_safe_float(value)) for value in raw_target_signed_weights.values())
+    raw_long_gross = sum(max(0.0, value) for value in raw_weights.values())
+    raw_short_gross = sum(max(0.0, -value) for value in raw_weights.values())
+    capacity_adjusted_long_gross = sum(
+        max(0.0, value) for value in capacity_adjusted_weights.values()
+    )
+    capacity_adjusted_short_gross = sum(
+        max(0.0, -value) for value in capacity_adjusted_weights.values()
+    )
     executable_long_gross = sum(max(0.0, value) for value in executable_expected_weights.values())
     executable_short_gross = sum(max(0.0, -value) for value in executable_expected_weights.values())
+    projected_final_gross_notional = float(
+        actual_summary.get("projected_final_gross_notional") or 0.0
+    )
     diagnostics = {
         "schema_version": "1.0",
         "optimizer": "executable_target_projector",
         "account_equity": float(equity),
         "buying_power": float(buying_power),
+        "entry_buying_power_buffer": float(buffer),
         "buying_power_buffer": float(buffer),
+        "entry_buying_power_cap": float(cap),
         "buying_power_cap": float(cap),
+        "entry_buying_power_source_semantics": "remaining_broker_buying_power",
+        "total_buying_power_capacity": total_capacity,
+        "gross_capacity_target_ratio": float(gross_capacity_ratio),
+        "gross_capacity_target_notional": float(gross_target_notional),
+        "gross_capacity_target_scale": float(capacity_scale),
+        "raw_target_gross_notional": float(raw_gross_notional),
+        "capacity_adjusted_target_gross_notional": float(
+            sum(abs(value) for value in capacity_adjusted_weights.values()) * equity
+        ),
+        "projected_final_gross_notional": projected_final_gross_notional,
+        "projected_final_gross_utilization_of_total_capacity": (
+            float(projected_final_gross_notional / total_capacity)
+            if total_capacity is not None and total_capacity > EPS
+            else None
+        ),
+        "gross_capacity_target_gap_notional": float(
+            projected_final_gross_notional - gross_target_notional
+        ),
+        "gross_capacity_constraint_enforced": bool(total_capacity is not None),
+        "strategy_capacity_scaling_error_l1_weight": float(
+            sum(
+                abs(raw_weights.get(symbol, 0.0) - capacity_adjusted_weights.get(symbol, 0.0))
+                for symbol in set(raw_weights) | set(capacity_adjusted_weights)
+            )
+        ),
         "min_trade_notional": float(min_trade_notional),
         "qty_decimals": int(qty_decimals),
         "whole_shares_only": bool(whole_shares_only),
@@ -647,6 +861,8 @@ def project_executable_targets(
         "short_buying_power_adverse_offset_bps": float(short_buying_power_adverse_offset_bps),
         "raw_long_gross_weight": float(raw_long_gross),
         "raw_short_gross_weight": float(raw_short_gross),
+        "capacity_adjusted_long_gross_weight": float(capacity_adjusted_long_gross),
+        "capacity_adjusted_short_gross_weight": float(capacity_adjusted_short_gross),
         "executable_long_gross_weight": float(executable_long_gross),
         "executable_short_gross_weight": float(executable_short_gross),
         "solver": solver_diag,
@@ -657,6 +873,10 @@ def project_executable_targets(
         "symbol_count": int(len(symbol_rows)),
         "symbols": sorted(symbol_rows, key=lambda row: str(row["symbol"])),
         "buying_power_buffer_scenarios": scenario_rows,
+        "raw_target_signed_weights": dict(sorted(raw_weights.items())),
+        "capacity_adjusted_target_signed_weights": dict(
+            sorted(capacity_adjusted_weights.items())
+        ),
         "executable_expected_signed_weights": dict(sorted(executable_expected_weights.items())),
         "target_lattice_signed_qty": dict(sorted(target_lattice_signed_qty.items())),
     }

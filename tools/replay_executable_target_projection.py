@@ -18,6 +18,7 @@ from src.alpaca_executor import (  # noqa: E402
     _buying_power,
     _scale_entry_instructions_to_buying_power,
     _split_release_entry_instructions,
+    _total_regt_buying_power_capacity,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
 
@@ -37,7 +38,14 @@ def _mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline replay of executable target projection from a live run.")
     parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--buying-power-buffer", type=float, default=0.90)
+    parser.add_argument(
+        "--entry-buying-power-buffer",
+        "--buying-power-buffer",
+        dest="buying_power_buffer",
+        type=float,
+        default=0.95,
+    )
+    parser.add_argument("--gross-capacity-target-ratio", type=float, default=0.95)
     parser.add_argument("--min-trade-notional", type=float, default=None)
     parser.add_argument("--min-trade-weight-bps", type=float, default=1.0)
     parser.add_argument("--output-json", type=Path, default=None)
@@ -66,6 +74,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         or account_snapshot.get("equity")
     )
     buying_power, buying_power_source = _buying_power(account_snapshot)
+    total_regt_capacity, gross_position, regt_buying_power, total_capacity_source = (
+        _total_regt_buying_power_capacity(
+            account=account_snapshot,
+            signed_notional=current_notional,
+        )
+    )
     min_trade_notional_floor = float(order_plan.get("min_trade_notional_absolute_floor") or 1.0)
     min_trade_notional = (
         float(args.min_trade_notional)
@@ -94,6 +108,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         short_buying_power_adverse_offset_bps=float(
             order_plan.get("short_buying_power_adverse_offset_bps") or 300.0
         ),
+        total_buying_power_capacity=float(total_regt_capacity),
+        gross_capacity_target_ratio=float(args.gross_capacity_target_ratio),
     )
     instructions, skipped_orders = _build_order_instructions(
         target_signed_weights=order_weights,
@@ -144,6 +160,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": "1.0",
         "replay_source_run_dir": run_dir.as_posix(),
         "primary_weight_error": {
+            "target_semantics": "capacity_adjusted_strategy_weights",
+            "strategy_capacity_scaling_error_l1_weight": diagnostics.get(
+                "strategy_capacity_scaling_error_l1_weight"
+            ),
+            "strategy_capacity_scaling_error_l1_weight_pct": (
+                float(diagnostics.get("strategy_capacity_scaling_error_l1_weight") or 0.0)
+                * 100.0
+            ),
             "final_tracking_error_l1_weight": diagnostics.get("tracking_error_l1_weight"),
             "final_tracking_error_l1_weight_pct": diagnostics.get("tracking_error_l1_weight_pct"),
             "final_mean_abs_symbol_weight_error": diagnostics.get("mean_abs_symbol_weight_error"),
@@ -166,6 +190,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "buying_power_cap_utilization": diagnostics.get("buying_power_cap_utilization"),
             "effective_min_trade_notional": float(min_trade_notional),
             "min_trade_weight_bps": float(args.min_trade_weight_bps),
+            "gross_position_before": float(gross_position),
+            "regt_buying_power_remaining": float(regt_buying_power),
+            "total_regt_buying_power_capacity": float(total_regt_capacity),
+            "total_regt_buying_power_capacity_source": total_capacity_source,
+            "gross_capacity_target_ratio": diagnostics.get("gross_capacity_target_ratio"),
+            "gross_capacity_target_notional": diagnostics.get("gross_capacity_target_notional"),
+            "projected_final_gross_notional": diagnostics.get("projected_final_gross_notional"),
+            "projected_final_gross_utilization_of_total_capacity": diagnostics.get(
+                "projected_final_gross_utilization_of_total_capacity"
+            ),
+            "gross_capacity_target_gap_notional": diagnostics.get(
+                "gross_capacity_target_gap_notional"
+            ),
         },
         "auxiliary_notional_translation": {
             "legacy_short_floor_gap": old_floor.get("lost_notional"),
@@ -200,6 +237,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "solver_success": diagnostics.get("solver", {}).get("success"),
         "primary_objective": diagnostics.get("solver", {}).get("objective_priority", [None])[0],
         "tracking_error_l1_weight_pct": diagnostics.get("tracking_error_l1_weight_pct"),
+        "tracking_target_semantics": "capacity_adjusted_strategy_weights",
+        "strategy_capacity_scaling_error_l1_weight_pct": float(
+            diagnostics.get("strategy_capacity_scaling_error_l1_weight") or 0.0
+        )
+        * 100.0,
         "mean_abs_symbol_weight_error_pct": diagnostics.get("mean_abs_symbol_weight_error_pct"),
         "max_abs_symbol_weight_error_pct": diagnostics.get("max_abs_symbol_weight_error_pct"),
         "optimizer_pre_min_trade_l1_weight_pct": pre_min_summary.get("tracking_error_l1_weight_pct"),
@@ -213,6 +255,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "buying_power_cap": diagnostics.get("buying_power_cap"),
         "estimated_entry_buying_power_used": diagnostics.get("estimated_entry_buying_power_used"),
         "buying_power_cap_utilization": diagnostics.get("buying_power_cap_utilization"),
+        "total_regt_buying_power_capacity": diagnostics.get("total_buying_power_capacity"),
+        "gross_capacity_target_ratio": diagnostics.get("gross_capacity_target_ratio"),
+        "gross_capacity_target_notional": diagnostics.get("gross_capacity_target_notional"),
+        "projected_final_gross_notional": diagnostics.get("projected_final_gross_notional"),
+        "projected_final_gross_utilization_of_total_capacity": diagnostics.get(
+            "projected_final_gross_utilization_of_total_capacity"
+        ),
+        "gross_capacity_target_gap_notional": diagnostics.get("gross_capacity_target_gap_notional"),
         "blocked_target_count": diagnostics.get("blocked_target_count"),
         "simulated_order_count": len(instructions),
         "simulated_release_order_count": len(release_instructions),

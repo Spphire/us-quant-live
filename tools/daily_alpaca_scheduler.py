@@ -80,7 +80,7 @@ class DayPaths:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Keep an Alpaca daily workflow online: run DecisionEngine at 12:00 Beijing "
+            "Keep an Alpaca daily workflow online: run DecisionEngine at 12:30 Beijing "
             "and execute the same day's decision_targets.csv at 22:00 Beijing."
         )
     )
@@ -143,7 +143,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--marketable-limit-max-offset-bps", type=float, default=150.0)
     parser.add_argument("--sizing-adverse-offset-bps", type=float, default=None)
     parser.add_argument("--short-buying-power-adverse-offset-bps", type=float, default=300.0)
-    parser.add_argument("--buying-power-buffer", type=float, default=0.90)
+    parser.add_argument(
+        "--entry-buying-power-buffer",
+        "--buying-power-buffer",
+        dest="buying_power_buffer",
+        type=float,
+        default=0.95,
+    )
+    parser.add_argument("--gross-capacity-target-ratio", type=float, default=0.95)
     parser.add_argument("--min-trade-notional", type=float, default=1.0)
     parser.add_argument("--min-trade-weight-bps", type=float, default=1.0)
     parser.add_argument("--order-timeout-seconds", type=float, default=300.0)
@@ -1232,8 +1239,10 @@ def _build_command(
         _num(args.adverse_price_offset_bps),
         "--short-buying-power-adverse-offset-bps",
         _num(args.short_buying_power_adverse_offset_bps),
-        "--buying-power-buffer",
+        "--entry-buying-power-buffer",
         _num(args.buying_power_buffer),
+        "--gross-capacity-target-ratio",
+        _num(args.gross_capacity_target_ratio),
         "--min-trade-notional",
         _num(args.min_trade_notional),
         "--min-trade-weight-bps",

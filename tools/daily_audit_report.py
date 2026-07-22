@@ -2908,6 +2908,12 @@ def _build_decision_intent_trace(
     summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     raw_weights = plan.get("raw_target_signed_weights", {}) if isinstance(plan.get("raw_target_signed_weights"), dict) else {}
+    strategy_weights = (
+        plan.get("capacity_adjusted_target_signed_weights", {})
+        if isinstance(plan.get("capacity_adjusted_target_signed_weights"), dict)
+        and plan.get("capacity_adjusted_target_signed_weights")
+        else raw_weights
+    )
     projected_weights = (
         plan.get("executable_expected_signed_weights", {})
         if isinstance(plan.get("executable_expected_signed_weights"), dict)
@@ -2936,18 +2942,28 @@ def _build_decision_intent_trace(
 
     equity = _safe_float(plan.get("account_equity") or summary.get("account_equity") or summary.get("account_equity_post_trade"))
     min_trade_notional = _safe_float(plan.get("min_trade_notional"), default=200.0)
-    symbols = sorted(set(raw_weights) | set(projected_weights) | set(decision_by_symbol) | set(order_by_symbol) | set(skipped_by_symbol))
+    symbols = sorted(
+        set(raw_weights)
+        | set(strategy_weights)
+        | set(projected_weights)
+        | set(decision_by_symbol)
+        | set(order_by_symbol)
+        | set(skipped_by_symbol)
+    )
     rows: list[dict[str, Any]] = []
     for symbol in symbols:
         decision = decision_by_symbol.get(symbol, {})
         orders = order_by_symbol.get(symbol, {})
         skipped = skipped_by_symbol.get(symbol, [])
         raw_weight = _safe_float(raw_weights.get(symbol))
+        strategy_weight = _safe_float(strategy_weights.get(symbol))
         projected_weight = _safe_float(projected_weights.get(symbol))
-        projection_delta_weight = projected_weight - raw_weight
+        projection_delta_weight = projected_weight - strategy_weight
+        capacity_scaling_delta_weight = strategy_weight - raw_weight
         before_mv = _safe_float(decision.get("before_market_value"))
         projected_target_notional = projected_weight * equity if equity else 0.0
         raw_target_notional = raw_weight * equity if equity else 0.0
+        strategy_target_notional = strategy_weight * equity if equity else 0.0
         desired_delta = projected_target_notional - before_mv
         planned_order_count = _safe_int(orders.get("planned_order_count"))
         skip_reasons = [str(item.get("reason") or "") for item in skipped if str(item.get("reason") or "")]
@@ -2963,13 +2979,20 @@ def _build_decision_intent_trace(
             {
                 "symbol": symbol,
                 "raw_target_signed_weight": raw_weight,
+                "strategy_target_signed_weight": strategy_weight,
                 "projected_target_signed_weight": projected_weight,
                 "projection_delta_weight": projection_delta_weight,
+                "capacity_scaling_delta_weight": capacity_scaling_delta_weight,
                 "raw_target_notional_estimate": raw_target_notional,
+                "strategy_target_notional_estimate": strategy_target_notional,
                 "projected_target_notional_estimate": projected_target_notional,
                 "projection_delta_notional_estimate": projection_delta_weight * equity if equity else 0.0,
-                "projection_reason": _target_projection_reason(raw_weight, projected_weight),
+                "capacity_scaling_delta_notional_estimate": (
+                    capacity_scaling_delta_weight * equity if equity else 0.0
+                ),
+                "projection_reason": _target_projection_reason(strategy_weight, projected_weight),
                 "raw_target_side": _side_from_weight(raw_weight),
+                "strategy_target_side": _side_from_weight(strategy_weight),
                 "projected_target_side": _side_from_weight(projected_weight),
                 "before_side": decision.get("before_side", ""),
                 "after_side": decision.get("after_side", ""),
@@ -4723,6 +4746,11 @@ def _build_ideal_vs_actual_gap(
         focus = focus_by_symbol.get(symbol, {})
 
         raw_target_notional = _safe_float(intent.get("raw_target_notional_estimate"))
+        strategy_target_notional = _safe_float(
+            intent.get("strategy_target_notional_estimate")
+            if intent.get("strategy_target_notional_estimate") not in (None, "")
+            else raw_target_notional
+        )
         projected_target_notional = _safe_float(intent.get("projected_target_notional_estimate"))
         execute_target_notional = (
             _safe_float(drift.get("execute_target_notional_estimate"))
@@ -4735,9 +4763,11 @@ def _build_ideal_vs_actual_gap(
             or market_ctx.get("after_market_value")
         )
         after_raw_gap = after_market_value - raw_target_notional
+        after_strategy_gap = after_market_value - strategy_target_notional
         after_projected_gap = after_market_value - projected_target_notional
         after_execute_gap = after_market_value - execute_target_notional
-        projection_gap = projected_target_notional - raw_target_notional
+        capacity_scaling_gap = strategy_target_notional - raw_target_notional
+        projection_gap = projected_target_notional - strategy_target_notional
         projection_gap_abs = abs(projection_gap)
         target_drift = _safe_float(drift.get("target_notional_delta_estimate"))
         target_drift_abs = abs(target_drift)
@@ -4763,7 +4793,7 @@ def _build_ideal_vs_actual_gap(
             skipped_notional=skipped_notional,
             submitted_unfilled_notional=submitted_unfilled,
             after_projected_target_gap_abs=abs(after_projected_gap),
-            ideal_actual_gap_abs=abs(after_raw_gap),
+            ideal_actual_gap_abs=abs(after_strategy_gap),
         )
         performance_drag = _performance_drag_bucket(
             snapshot_plus_realized_pnl=total_pnl,
@@ -4787,7 +4817,7 @@ def _build_ideal_vs_actual_gap(
             diagnostics.append("symbol_loss")
 
         gap_score = (
-            abs(after_raw_gap)
+            abs(after_strategy_gap)
             + projection_gap_abs * 0.50
             + target_drift_abs * 0.50
             + order_drift_abs * 0.35
@@ -4803,19 +4833,29 @@ def _build_ideal_vs_actual_gap(
                 "performance_drag_bucket": performance_drag,
                 "gap_score": gap_score,
                 "raw_target_signed_weight": _safe_float(intent.get("raw_target_signed_weight")),
+                "strategy_target_signed_weight": _safe_float(
+                    intent.get("strategy_target_signed_weight")
+                    if intent.get("strategy_target_signed_weight") not in (None, "")
+                    else intent.get("raw_target_signed_weight")
+                ),
                 "projected_target_signed_weight": _safe_float(intent.get("projected_target_signed_weight")),
                 "execute_projected_target_signed_weight": _safe_float(drift.get("execute_projected_target_signed_weight")),
                 "raw_target_notional_estimate": raw_target_notional,
+                "strategy_target_notional_estimate": strategy_target_notional,
                 "projected_target_notional_estimate": projected_target_notional,
                 "execute_target_notional_estimate": execute_target_notional,
                 "after_market_value": after_market_value,
-                "ideal_actual_gap": after_raw_gap,
-                "ideal_actual_gap_abs": abs(after_raw_gap),
+                "raw_alpha_actual_gap": after_raw_gap,
+                "raw_alpha_actual_gap_abs": abs(after_raw_gap),
+                "ideal_actual_gap": after_strategy_gap,
+                "ideal_actual_gap_abs": abs(after_strategy_gap),
                 "after_projected_target_gap": after_projected_gap,
                 "after_projected_target_gap_abs": abs(after_projected_gap),
                 "after_execute_target_gap": after_execute_gap,
                 "after_execute_target_gap_abs": abs(after_execute_gap),
                 "projection_reason": projection_reason,
+                "capacity_scaling_gap_notional": capacity_scaling_gap,
+                "capacity_scaling_gap_abs": abs(capacity_scaling_gap),
                 "projection_gap_notional": projection_gap,
                 "projection_gap_abs": projection_gap_abs,
                 "order_intent_status": intent.get("order_intent_status", ""),
@@ -4886,6 +4926,9 @@ def _build_ideal_vs_actual_gap(
         _safe_float(row.get("after_projected_target_gap_abs")) for row in rows
     )
     gross_projection_gap_abs = sum(_safe_float(row.get("projection_gap_abs")) for row in rows)
+    gross_capacity_scaling_gap_abs = sum(
+        _safe_float(row.get("capacity_scaling_gap_abs")) for row in rows
+    )
     safe_equity = max(float(equity), 1e-9)
     symbol_count = len(rows)
     summary_payload = {
@@ -4918,6 +4961,7 @@ def _build_ideal_vs_actual_gap(
         "gross_ideal_actual_gap_abs": gross_ideal_actual_gap_abs,
         "gross_after_projected_target_gap_abs": gross_after_projected_target_gap_abs,
         "gross_projection_gap_abs": gross_projection_gap_abs,
+        "gross_capacity_scaling_gap_abs": gross_capacity_scaling_gap_abs,
         "gross_decision_execute_target_drift_abs": sum(
             _safe_float(row.get("decision_execute_target_drift_abs")) for row in rows
         ),
@@ -4951,7 +4995,8 @@ def _build_ideal_vs_actual_gap(
         "factor_buckets": _bucket_gap_rows(rows, "primary_factor")[:20],
         "side_buckets": _bucket_gap_rows(rows, "after_side")[:20],
         "note": (
-            "Decomposes raw strategy targets versus actual after-position exposure. "
+            "Decomposes capacity-adjusted strategy targets versus actual after-position exposure; "
+            "raw alpha-to-capacity scaling is recorded separately. "
             "The buckets are diagnostic exposure gaps, not proof that a gap caused symbol PnL."
         ),
     }
@@ -5021,8 +5066,38 @@ def _build_executable_target_projection_outputs(
         "integer_short_absolute_notional_gap": final_projection.get(
             "integer_short_absolute_notional_gap"
         ),
+        "total_buying_power_capacity": final_projection.get("total_buying_power_capacity"),
+        "gross_capacity_target_ratio": final_projection.get("gross_capacity_target_ratio"),
+        "gross_capacity_target_notional": final_projection.get(
+            "gross_capacity_target_notional"
+        ),
+        "gross_capacity_target_scale": final_projection.get("gross_capacity_target_scale"),
+        "capacity_adjusted_target_gross_notional": final_projection.get(
+            "capacity_adjusted_target_gross_notional"
+        ),
+        "projected_final_gross_notional": final_projection.get(
+            "projected_final_gross_notional"
+        ),
+        "projected_final_gross_utilization_of_total_capacity": final_projection.get(
+            "projected_final_gross_utilization_of_total_capacity"
+        ),
+        "gross_capacity_target_gap_notional": final_projection.get(
+            "gross_capacity_target_gap_notional"
+        ),
+        "gross_capacity_constraint_enforced": final_projection.get(
+            "gross_capacity_constraint_enforced"
+        ),
+        "strategy_capacity_scaling_error_l1_weight": final_projection.get(
+            "strategy_capacity_scaling_error_l1_weight"
+        ),
         "raw_long_gross_weight": final_projection.get("raw_long_gross_weight"),
         "raw_short_gross_weight": final_projection.get("raw_short_gross_weight"),
+        "capacity_adjusted_long_gross_weight": final_projection.get(
+            "capacity_adjusted_long_gross_weight"
+        ),
+        "capacity_adjusted_short_gross_weight": final_projection.get(
+            "capacity_adjusted_short_gross_weight"
+        ),
         "executable_long_gross_weight": final_projection.get("executable_long_gross_weight"),
         "executable_short_gross_weight": final_projection.get("executable_short_gross_weight"),
         "blocked_target_count": final_projection.get("blocked_target_count"),
@@ -5039,18 +5114,27 @@ def _build_executable_target_projection_outputs(
 
 def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
     account_after = _read_json(run_dir / "broker_account_after.json", {})
+    execution_summary = _read_json(run_dir / "execution_summary.json", {})
+    final_projection = (
+        execution_summary.get("executable_target_projection", {})
+        if isinstance(execution_summary.get("executable_target_projection"), dict)
+        else {}
+    )
     long_market_value = _optional_float(account_after.get("long_market_value"))
     short_market_value = _optional_float(account_after.get("short_market_value"))
     regt_buying_power = _optional_float(account_after.get("regt_buying_power"))
     broker_position_market_value = _optional_float(account_after.get("position_market_value"))
-    target_ratio = 0.90
+    target_ratio = _optional_float(final_projection.get("gross_capacity_target_ratio")) or 0.95
+    target_enforced = bool(final_projection.get("gross_capacity_constraint_enforced"))
 
     payload: dict[str, Any] = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": "missing",
         "source_account_snapshot": (run_dir / "broker_account_after.json").as_posix(),
+        "gross_capacity_target_ratio": target_ratio,
         "configured_buying_power_target_ratio": target_ratio,
+        "gross_capacity_target_policy_status": "enforced" if target_enforced else "benchmark_only",
         "gross_long_market_value": None,
         "gross_short_market_value_abs": None,
         "gross_position_notional": None,
@@ -5066,8 +5150,8 @@ def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
         "gross_error_vs_total_pct_points": None,
         "note": (
             "Total RegT capacity is reconstructed as gross position notional plus remaining "
-            "RegT buying power. The 90% portfolio-capacity target is an audit benchmark and is "
-            "separate from the legacy incremental-entry buying-power cap."
+            "RegT buying power. The 95% target is enforced for runs produced by the gross-capacity "
+            "projector; older runs are evaluated against it as a retrospective benchmark."
         ),
     }
     if long_market_value is None or short_market_value is None or regt_buying_power is None:
@@ -9690,7 +9774,7 @@ def _write_review(
         "- `79_ideal_vs_actual_gap_summary.json` — ideal-vs-actual gap totals, buckets, and top drag symbols\n",
         "- `80_executable_target_projection.csv` — raw weights, executable target shares/weights, per-symbol gaps, and binding constraints\n",
         "- `81_executable_target_projection_summary.json` — optimizer priority, buying-power use, integer-short gap, and 85/90/95% scenarios\n",
-        "- `82_position_capacity_summary.json` — gross-position use versus the 90% target and total RegT capacity\n",
+        "- `82_position_capacity_summary.json` — gross-position use versus the 95% target and total RegT capacity\n",
         "- `70_account_config_diff.csv` — Alpaca account trading configuration before/after diff\n",
         "- `71_account_config_summary.json` — account configuration change summary for constraint attribution\n",
         "- Source run dir `run_evidence_digest.json` — semantic digest of raw broker, execution, market, API, source, and scheduler evidence\n",
@@ -10685,10 +10769,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_csv(audit_dir / "40_target_transition_trace.csv", target_transition_rows, target_transition_fields)
     _write_json(audit_dir / "41_target_transition_summary.json", target_transition_summary)
     decision_intent_fields = [
-        "symbol", "raw_target_signed_weight", "projected_target_signed_weight", "projection_delta_weight",
-        "raw_target_notional_estimate", "projected_target_notional_estimate",
+        "symbol", "raw_target_signed_weight", "strategy_target_signed_weight",
+        "projected_target_signed_weight", "capacity_scaling_delta_weight", "projection_delta_weight",
+        "raw_target_notional_estimate", "strategy_target_notional_estimate",
+        "projected_target_notional_estimate", "capacity_scaling_delta_notional_estimate",
         "projection_delta_notional_estimate", "projection_reason", "raw_target_side",
-        "projected_target_side", "before_side", "after_side", "before_market_value",
+        "strategy_target_side", "projected_target_side", "before_side", "after_side", "before_market_value",
         "after_market_value", "desired_delta_notional_estimate", "planned_delta_notional",
         "planned_abs_notional", "planned_order_count", "filled_qty_from_order_trace",
         "remaining_qty_from_order_trace", "order_intent_status", "skip_reason", "skip_count",
@@ -10786,12 +10872,16 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_json(audit_dir / "69_attribution_dossier.json", attribution_dossier_summary)
     ideal_actual_gap_fields = [
         "gap_rank", "symbol", "primary_gap_bucket", "performance_drag_bucket", "gap_score",
-        "raw_target_signed_weight", "projected_target_signed_weight", "execute_projected_target_signed_weight",
-        "raw_target_notional_estimate", "projected_target_notional_estimate",
+        "raw_target_signed_weight", "strategy_target_signed_weight",
+        "projected_target_signed_weight", "execute_projected_target_signed_weight",
+        "raw_target_notional_estimate", "strategy_target_notional_estimate",
+        "projected_target_notional_estimate",
         "execute_target_notional_estimate", "after_market_value",
-        "ideal_actual_gap", "ideal_actual_gap_abs", "after_projected_target_gap",
+        "raw_alpha_actual_gap", "raw_alpha_actual_gap_abs", "ideal_actual_gap",
+        "ideal_actual_gap_abs", "after_projected_target_gap",
         "after_projected_target_gap_abs", "after_execute_target_gap", "after_execute_target_gap_abs",
-        "projection_reason", "projection_gap_notional", "projection_gap_abs",
+        "projection_reason", "capacity_scaling_gap_notional", "capacity_scaling_gap_abs",
+        "projection_gap_notional", "projection_gap_abs",
         "order_intent_status", "decision_execute_drift_reasons", "decision_execute_order_presence",
         "decision_execute_target_drift", "decision_execute_target_drift_abs",
         "decision_execute_order_drift", "decision_execute_order_drift_abs",
@@ -10810,10 +10900,13 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_json(audit_dir / "79_ideal_vs_actual_gap_summary.json", ideal_actual_gap_summary)
     executable_projection_fields = [
         "projection_phase", "symbol", "target_side", "raw_target_signed_weight",
-        "raw_target_notional", "reference_price", "current_signed_qty", "current_signed_notional",
-        "raw_target_abs_qty", "target_lattice_abs_qty", "target_lattice_signed_qty",
-        "short_position_residual_qty", "expected_final_signed_qty",
-        "executable_expected_signed_weight", "projection_weight_gap", "projection_notional_gap",
+        "capacity_adjusted_target_signed_weight", "raw_target_notional",
+        "capacity_adjusted_target_notional", "reference_price", "current_signed_qty",
+        "current_signed_notional", "raw_target_abs_qty", "capacity_adjusted_target_abs_qty",
+        "target_lattice_abs_qty", "target_lattice_signed_qty", "short_position_residual_qty",
+        "expected_final_signed_qty", "expected_final_notional", "executable_expected_signed_weight",
+        "projection_weight_gap", "projection_notional_gap", "raw_strategy_weight_gap",
+        "raw_strategy_notional_gap",
         "estimated_entry_qty", "estimated_entry_buying_power", "buying_power_price",
         "integer_target_required", "constraint_reasons", "buying_power", "buying_power_buffer",
         "buying_power_cap", "estimated_entry_buying_power_used_total",
@@ -11654,6 +11747,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "ideal_actual_gap_projection_abs": _safe_float(ideal_actual_gap.get("gross_projection_gap_abs"))
                 if isinstance(ideal_actual_gap, dict)
                 else 0.0,
+                "ideal_actual_gap_capacity_scaling_abs": _safe_float(
+                    ideal_actual_gap.get("gross_capacity_scaling_gap_abs")
+                )
+                if isinstance(ideal_actual_gap, dict)
+                else 0.0,
                 "ideal_actual_gap_decision_target_drift_abs": _safe_float(
                     ideal_actual_gap.get("gross_decision_execute_target_drift_abs")
                 )
@@ -11734,7 +11832,32 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(executable_projection, dict)
                 else None,
+                "optimizer_gross_capacity_target_ratio": _optional_float(
+                    executable_projection.get("gross_capacity_target_ratio")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_gross_capacity_target_notional": _optional_float(
+                    executable_projection.get("gross_capacity_target_notional")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_projected_final_gross_notional": _optional_float(
+                    executable_projection.get("projected_final_gross_notional")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_gross_capacity_constraint_enforced": bool(
+                    executable_projection.get("gross_capacity_constraint_enforced")
+                )
+                if isinstance(executable_projection, dict)
+                else False,
                 "position_capacity_status": position_capacity.get("status")
+                if isinstance(position_capacity, dict)
+                else "",
+                "gross_capacity_target_policy_status": position_capacity.get(
+                    "gross_capacity_target_policy_status"
+                )
                 if isinstance(position_capacity, dict)
                 else "",
                 "gross_position_notional": _optional_float(
@@ -11754,6 +11877,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 else None,
                 "configured_buying_power_target_ratio": _optional_float(
                     position_capacity.get("configured_buying_power_target_ratio")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "gross_capacity_target_ratio": _optional_float(
+                    position_capacity.get("gross_capacity_target_ratio")
                 )
                 if isinstance(position_capacity, dict)
                 else None,
@@ -12384,6 +12512,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "ideal_actual_gap_projection_abs": sum(
                 _safe_float(row.get("ideal_actual_gap_projection_abs")) for row in rows
             ),
+            "ideal_actual_gap_capacity_scaling_abs": sum(
+                _safe_float(row.get("ideal_actual_gap_capacity_scaling_abs")) for row in rows
+            ),
             "ideal_actual_gap_decision_target_drift_abs": sum(
                 _safe_float(row.get("ideal_actual_gap_decision_target_drift_abs")) for row in rows
             ),
@@ -12493,7 +12624,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "attribution_primary_bucket_counts",
             "ideal_actual_gap_status", "ideal_actual_gap_material_symbols",
             "ideal_actual_gap_gross_abs", "ideal_actual_gap_after_projected_abs",
-            "ideal_actual_gap_projection_abs", "ideal_actual_gap_decision_target_drift_abs",
+            "ideal_actual_gap_projection_abs", "ideal_actual_gap_capacity_scaling_abs",
+            "ideal_actual_gap_decision_target_drift_abs",
             "ideal_actual_gap_decision_order_drift_abs",
             "ideal_actual_gap_submitted_unfilled_notional", "ideal_actual_gap_skipped_notional",
             "ideal_actual_gap_order_gap_notional", "ideal_actual_gap_pnl_loss_abs",
@@ -12504,8 +12636,13 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "max_symbol_strategy_to_actual_weight_error", "executable_projection_status",
             "optimizer_tracking_error_l1_weight", "optimizer_mean_abs_symbol_weight_error",
             "optimizer_max_abs_symbol_weight_error", "optimizer_buying_power_cap_utilization",
-            "position_capacity_status", "gross_position_notional", "regt_buying_power_remaining",
-            "total_regt_buying_power_capacity", "configured_buying_power_target_ratio",
+            "optimizer_gross_capacity_target_ratio", "optimizer_gross_capacity_target_notional",
+            "optimizer_projected_final_gross_notional",
+            "optimizer_gross_capacity_constraint_enforced",
+            "position_capacity_status", "gross_capacity_target_policy_status",
+            "gross_position_notional", "regt_buying_power_remaining",
+            "total_regt_buying_power_capacity", "gross_capacity_target_ratio",
+            "configured_buying_power_target_ratio",
             "configured_gross_target_notional", "gross_utilization_of_total_bp",
             "gross_error_vs_target_notional", "gross_error_vs_target_pct_points",
             "gross_error_vs_total_notional", "gross_error_vs_total_pct_points",

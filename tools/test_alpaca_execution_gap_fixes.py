@@ -21,6 +21,7 @@ from src.alpaca_executor import (  # noqa: E402
     _is_insufficient_buying_power_error,
     _is_insufficient_qty_available_error,
     _submit_and_track_orders,
+    _total_regt_buying_power_capacity,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
 from tools.daily_audit_report import (  # noqa: E402
@@ -157,6 +158,8 @@ def _project_targets(
     equity=90000.0,
     buying_power=360000.0,
     buffer=0.90,
+    total_capacity=None,
+    gross_capacity_ratio=0.95,
 ):
     assets = {
         symbol: {"shortable": True, "fractionable": True}
@@ -178,6 +181,8 @@ def _project_targets(
         shorting_enabled=True,
         sizing_adverse_offset_bps=12.0,
         short_buying_power_adverse_offset_bps=300.0,
+        total_buying_power_capacity=total_capacity,
+        gross_capacity_target_ratio=gross_capacity_ratio,
     )
 
 
@@ -276,6 +281,43 @@ def test_projector_uses_buying_power_only_as_secondary_objective():
     assert diagnostics["solver"]["objective_priority"][0] == "minimize_absolute_weight_error"
     assert diagnostics["solver"]["secondary_optimization_used"]
     print("  [OK] equal weight-error tie uses higher exposure only in secondary solve")
+
+
+def test_projector_enforces_final_gross_capacity_target():
+    _, lattice_qty, diagnostics = _project_targets(
+        weights={"A": 0.50, "B": 0.50, "C": -0.50, "D": -0.50},
+        prices={"A": 100.0, "B": 100.0, "C": 100.0, "D": 100.0},
+        equity=100000.0,
+        buying_power=400000.0,
+        buffer=0.95,
+        total_capacity=200000.0,
+        gross_capacity_ratio=0.95,
+    )
+    assert diagnostics["solver"]["success"], diagnostics["solver"]
+    assert diagnostics["gross_capacity_constraint_enforced"] is True
+    assert abs(diagnostics["gross_capacity_target_notional"] - 190000.0) < 1e-6
+    assert diagnostics["projected_final_gross_notional"] <= 190000.0 + 1e-6
+    assert abs(diagnostics["gross_capacity_target_scale"] - 0.95) < 1e-12
+    adjusted = diagnostics["capacity_adjusted_target_signed_weights"]
+    assert adjusted == {"A": 0.475, "B": 0.475, "C": -0.475, "D": -0.475}
+    assert sum(abs(float(qty)) * 100.0 for qty in lattice_qty.values()) <= 190000.0 + 1e-6
+    print("  [OK] final gross is capped at 95% of stable total RegT capacity")
+
+
+def test_total_regt_capacity_reconstruction():
+    total, gross, remaining, source = _total_regt_buying_power_capacity(
+        account={
+            "long_market_value": "89727.87",
+            "short_market_value": "-86240.25",
+            "regt_buying_power": "1811.90",
+        },
+        signed_notional={},
+    )
+    assert abs(gross - 175968.12) < 1e-6
+    assert abs(remaining - 1811.90) < 1e-6
+    assert abs(total - 177780.02) < 1e-6
+    assert "regt_buying_power" in source
+    print("  [OK] total RegT capacity uses gross position plus remaining RegT buying power")
 
 
 def test_projection_audit_prefers_staged_entry_snapshot():
@@ -616,10 +658,10 @@ def test_position_capacity_uses_total_regt_capacity():
     assert summary["status"] == "pass"
     assert abs(summary["gross_position_notional"] - 175968.12) < 1e-6
     assert abs(summary["total_regt_buying_power_capacity"] - 177780.02) < 1e-6
-    assert abs(summary["configured_gross_target_notional"] - 160002.018) < 1e-6
-    assert abs(summary["gross_error_vs_target_notional"] - 15966.102) < 1e-6
+    assert abs(summary["configured_gross_target_notional"] - 168891.019) < 1e-6
+    assert abs(summary["gross_error_vs_target_notional"] - 7077.101) < 1e-6
     assert abs(summary["gross_utilization_of_total_bp"] - (175968.12 / 177780.02)) < 1e-12
-    assert summary["gross_error_vs_target_pct_points"] > 8.9
+    assert 3.9 < summary["gross_error_vs_target_pct_points"] < 4.1
     assert summary["gross_error_vs_total_pct_points"] < -1.0
     print("  [OK] gross position is benchmarked against reconstructed total RegT capacity")
 
@@ -635,6 +677,8 @@ def main() -> int:
         ("Residual-aware integer short delta", test_projector_short_residual_produces_integer_order_delta),
         ("Buying-power scenario diagnostics", test_projector_logs_buffer_scenarios),
         ("Lexicographic weight-error priority", test_projector_uses_buying_power_only_as_secondary_objective),
+        ("Final gross capacity target", test_projector_enforces_final_gross_capacity_target),
+        ("Total RegT capacity reconstruction", test_total_regt_capacity_reconstruction),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
         ("Min-trade short carry safety", test_min_trade_short_carry_cannot_emit_residual_order),
         ("Weight-based min-trade threshold", test_min_trade_threshold_scales_with_weight_error_budget),

@@ -529,7 +529,7 @@
                 seriesStrategyExecutable: 'Strategy to executable',
                 seriesExecutableActual: 'Executable to actual',
                 seriesGrossUtilization: 'Gross utilization',
-                seriesConfiguredTarget: '90% target',
+                seriesConfiguredTarget: '95% target',
                 seriesTotalCapacity: '100% capacity',
                 seriesErrorVsTarget: 'Error vs target',
                 seriesErrorVsTotal: 'Error vs total',
@@ -666,7 +666,7 @@
                 seriesStrategyExecutable: '策略到可执行',
                 seriesExecutableActual: '可执行到实际',
                 seriesGrossUtilization: '实际总仓位利用率',
-                seriesConfiguredTarget: '90% 目标',
+                seriesConfiguredTarget: '95% 目标',
                 seriesTotalCapacity: '100% 总容量',
                 seriesErrorVsTarget: '相对目标误差',
                 seriesErrorVsTotal: '相对总容量误差',
@@ -1318,7 +1318,7 @@
                         <div class="audit-item">
                             <div class="audit-label">${t('metricGrossCapacity')}</div>
                             <div class="audit-value">${formatRatioPercent(latest.gross_utilization_of_total_bp)}</div>
-                            <div class="audit-sub">90% gap ${formatSignedPoints(latest.gross_error_vs_target_pct_points)} | 100% gap ${formatSignedPoints(latest.gross_error_vs_total_pct_points)}</div>
+                            <div class="audit-sub">${formatRatioPercent(latest.gross_capacity_target_ratio ?? latest.configured_buying_power_target_ratio, 0)} gap ${formatSignedPoints(latest.gross_error_vs_target_pct_points)} | 100% gap ${formatSignedPoints(latest.gross_error_vs_total_pct_points)} · ${escapeHTML(latest.gross_capacity_target_policy_status || 'benchmark_only')}</div>
                         </div>
                         <div class="audit-item">
                             <div class="audit-label">Strict Attribution</div>
@@ -1452,7 +1452,7 @@
                     <div class="timeline-row">
                         <div class="timeline-dot ${decStatus === 'completed' ? 'completed' : ['running', 'started'].includes(decStatus) ? 'running' : ''}"></div>
                         <div class="timeline-label">
-                            <div>12:00 CN ${t('timelineDecision')}</div>
+                            <div>12:30 CN ${t('timelineDecision')}</div>
                             <div class="timeline-sub">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</div>
                         </div>
                         <span class="badge ${decStatus === 'started' ? 'running' : decStatus}">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</span>
@@ -1638,7 +1638,7 @@
                 const capacityMeta = document.getElementById('buyingPowerErrorChartMeta');
                 if (capacityMeta) {
                     capacityMeta.textContent = latestCapacity
-                        ? `${capacityRows[0].session_date} to ${latestCapacity.session_date} · ${capacityRows.length} days · ${formatRatioPercent(latestCapacity.gross_utilization_of_total_bp)} · 90% gap ${formatSignedPoints(latestCapacity.gross_error_vs_target_pct_points)}`
+                        ? `${capacityRows[0].session_date} to ${latestCapacity.session_date} · ${capacityRows.length} days · ${formatRatioPercent(latestCapacity.gross_utilization_of_total_bp)} · ${formatRatioPercent(latestCapacity.gross_capacity_target_ratio ?? latestCapacity.configured_buying_power_target_ratio, 0)} gap ${formatSignedPoints(latestCapacity.gross_error_vs_target_pct_points)}`
                         : 'No strict RegT-capacity evidence';
                 }
 
@@ -1749,7 +1749,12 @@
                     },
                     {
                         color: capacityColors.target,
-                        data: capacityRows.map(row => auditMetric(row, 'configured_buying_power_target_ratio', 100)),
+                        data: capacityRows.map(row => {
+                            const ratio = auditMetric(row, 'gross_capacity_target_ratio');
+                            return ratio === null
+                                ? auditMetric(row, 'configured_buying_power_target_ratio', 100)
+                                : ratio * 100;
+                        }),
                         dash: [6, 5],
                         points: false
                     },

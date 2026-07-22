@@ -307,10 +307,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--entry-buying-power-buffer",
         "--buying-power-buffer",
+        dest="buying_power_buffer",
         type=float,
-        default=0.90,
-        help="Fraction of fresh buying power that staged_regt may consume for new/increasing legs.",
+        default=0.95,
+        help="Broker-feasibility fraction of fresh buying power available to new/increasing legs.",
+    )
+    parser.add_argument(
+        "--gross-capacity-target-ratio",
+        type=float,
+        default=0.95,
+        help="Target final gross position as a fraction of reconstructed total RegT capacity.",
     )
     parser.add_argument(
         "--staged-release-timeout-seconds",
@@ -837,6 +845,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--min-trade-notional must be non-negative.")
         if float(args.min_trade_weight_bps) < 0:
             raise ValueError("--min-trade-weight-bps must be non-negative.")
+        if not 0.0 <= float(args.buying_power_buffer) <= 1.0:
+            raise ValueError("--entry-buying-power-buffer must be between 0 and 1.")
+        if not 0.0 <= float(args.gross_capacity_target_ratio) <= 1.0:
+            raise ValueError("--gross-capacity-target-ratio must be between 0 and 1.")
 
         account_for_sizing = client.get_account()
         _write_json_file(output_root / "broker_account_for_sizing.json", account_for_sizing)
@@ -846,6 +858,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             signed_notional=broker_signed_notional_before,
         )
         sizing_buying_power, sizing_buying_power_source = _buying_power(account_for_sizing)
+        (
+            sizing_total_regt_capacity,
+            sizing_gross_position,
+            sizing_regt_buying_power,
+            sizing_total_regt_capacity_source,
+        ) = _total_regt_buying_power_capacity(
+            account=account_for_sizing,
+            signed_notional=broker_signed_notional_before,
+        )
         effective_min_trade_notional = _effective_min_trade_notional(
             account_equity=sizing_equity,
             absolute_floor=float(args.min_trade_notional),
@@ -868,9 +889,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             shorting_enabled=shorting_enabled,
             sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
             short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
+            total_buying_power_capacity=float(sizing_total_regt_capacity),
+            gross_capacity_target_ratio=float(args.gross_capacity_target_ratio),
         )
         executable_expected_signed_weights = dict(
             executable_projection_diag.get("executable_expected_signed_weights") or {}
+        )
+        capacity_adjusted_target_signed_weights = dict(
+            executable_projection_diag.get("capacity_adjusted_target_signed_weights") or {}
         )
         final_executable_projection_diag = executable_projection_diag
         target_short_floor_diag = {
@@ -899,6 +925,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "collected_at_utc": _utc_now(),
                 "raw_target_signed_weights": raw_target_signed_weights,
+                "capacity_adjusted_target_signed_weights": capacity_adjusted_target_signed_weights,
                 "projected_target_signed_weights": target_signed_weights,
                 "order_target_signed_weights": target_signed_weights,
                 "target_lattice_signed_qty": target_lattice_signed_qty,
@@ -910,6 +937,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "buying_power_for_sizing": float(sizing_buying_power),
                 "buying_power_source": str(sizing_buying_power_source),
                 "buying_power_buffer": float(args.buying_power_buffer),
+                "gross_capacity_target_ratio": float(args.gross_capacity_target_ratio),
+                "gross_position_for_capacity": float(sizing_gross_position),
+                "regt_buying_power_remaining": float(sizing_regt_buying_power),
+                "total_regt_buying_power_capacity": float(sizing_total_regt_capacity),
+                "total_regt_buying_power_capacity_source": str(
+                    sizing_total_regt_capacity_source
+                ),
                 "effective_min_trade_notional": float(effective_min_trade_notional),
                 "min_trade_notional_absolute_floor": float(args.min_trade_notional),
                 "min_trade_weight_bps": float(args.min_trade_weight_bps),
@@ -967,6 +1001,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "broker_signed_qty_before": dict(sorted(broker_signed_qty_before.items())),
                 "target_signed_weights": dict(sorted(target_signed_weights.items())),
                 "raw_target_signed_weights": dict(sorted(raw_target_signed_weights.items())),
+                "capacity_adjusted_target_signed_weights": dict(
+                    sorted(capacity_adjusted_target_signed_weights.items())
+                ),
                 "target_lattice_signed_qty": dict(sorted(target_lattice_signed_qty.items())),
                 "executable_expected_signed_weights": dict(sorted(executable_expected_signed_weights.items())),
             },
@@ -986,6 +1023,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "projection_buying_power_cap": executable_projection_diag.get("buying_power_cap"),
                 "projection_estimated_entry_buying_power_used": executable_projection_diag.get(
                     "estimated_entry_buying_power_used"
+                ),
+                "projection_gross_capacity_target_ratio": executable_projection_diag.get(
+                    "gross_capacity_target_ratio"
+                ),
+                "projection_gross_capacity_target_notional": executable_projection_diag.get(
+                    "gross_capacity_target_notional"
+                ),
+                "projection_projected_final_gross_notional": executable_projection_diag.get(
+                    "projected_final_gross_notional"
                 ),
             },
         )
@@ -1043,6 +1089,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
                     "sizing_adverse_offset_bps": float(sizing_adverse_offset_bps),
                     "short_buying_power_adverse_offset_bps": float(short_buying_power_adverse_offset_bps),
+                    "buying_power_buffer": float(args.buying_power_buffer),
+                    "gross_capacity_target_ratio": float(args.gross_capacity_target_ratio),
+                    "total_regt_buying_power_capacity": float(sizing_total_regt_capacity),
                     "min_trade_notional": float(effective_min_trade_notional),
                     "min_trade_notional_absolute_floor": float(args.min_trade_notional),
                     "min_trade_weight_bps": float(args.min_trade_weight_bps),
@@ -1056,6 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "sec_cache_source": sec_cache_source,
                     "dynamic_symbol_count": int(len(symbols)),
                     "raw_target_signed_weights": raw_target_signed_weights,
+                    "capacity_adjusted_target_signed_weights": capacity_adjusted_target_signed_weights,
                     "target_signed_weights": target_signed_weights,
                     "target_lattice_signed_qty": target_lattice_signed_qty,
                     "executable_expected_signed_weights": executable_expected_signed_weights,
@@ -1173,6 +1223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     short_sales_whole_shares_only=bool(args.short_sales_whole_shares_only),
                     shorting_enabled=bool(shorting_enabled),
                     buying_power_buffer=float(args.buying_power_buffer),
+                    gross_capacity_target_ratio=float(args.gross_capacity_target_ratio),
                     short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
                     release_timeout_seconds=release_timeout,
                     entry_timeout_seconds=entry_timeout,
@@ -1197,6 +1248,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         str(symbol): float(value) for symbol, value in staged_expected_weights.items()
                     }
                     final_executable_projection_diag = dict(staged_diagnostics["entry_projection"])
+                    capacity_adjusted_target_signed_weights = dict(
+                        final_executable_projection_diag.get(
+                            "capacity_adjusted_target_signed_weights"
+                        )
+                        or capacity_adjusted_target_signed_weights
+                    )
             else:
                 execution_records = _submit_and_track_orders(
                     client=client,
@@ -1482,8 +1539,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ledger_write_enabled": bool(ledger_write_enabled),
             "staged_diagnostics": staged_diagnostics,
             "raw_target_signed_weights": raw_target_signed_weights,
+            "capacity_adjusted_target_signed_weights": capacity_adjusted_target_signed_weights,
             "order_target_signed_weights": target_signed_weights,
             "executable_expected_signed_weights": executable_expected_signed_weights,
+            "gross_capacity_target_ratio": float(args.gross_capacity_target_ratio),
             "initial_executable_target_projection": executable_projection_diag,
             "executable_target_projection": final_executable_projection_diag,
             "lot_ledger_path": ledger_path.as_posix(),
@@ -1822,6 +1881,39 @@ def _buying_power(account: Mapping[str, Any]) -> tuple[float, str]:
     return 0.0, "unavailable"
 
 
+def _total_regt_buying_power_capacity(
+    *,
+    account: Mapping[str, Any],
+    signed_notional: Mapping[str, float],
+) -> tuple[float, float, float, str]:
+    long_market_value = _safe_float(account.get("long_market_value"))
+    short_market_value = _safe_float(account.get("short_market_value"))
+    if long_market_value is not None and short_market_value is not None:
+        gross_position = abs(float(long_market_value)) + abs(float(short_market_value))
+        gross_source = "alpaca_account.long_market_value+abs(short_market_value)"
+    else:
+        gross_position = float(sum(abs(float(value)) for value in signed_notional.values()))
+        gross_source = "broker_positions.gross_signed_notional"
+
+    regt_buying_power = _safe_float(account.get("regt_buying_power"))
+    if regt_buying_power is None:
+        raise ValueError(
+            "Alpaca account snapshot is missing regt_buying_power; cannot enforce final gross capacity."
+        )
+    total_capacity = gross_position + float(regt_buying_power)
+    if total_capacity <= 0.0:
+        raise ValueError(
+            "Reconstructed total RegT capacity must be positive: "
+            f"gross={gross_position}, regt_buying_power={regt_buying_power}."
+        )
+    return (
+        float(total_capacity),
+        float(gross_position),
+        float(regt_buying_power),
+        f"{gross_source}+alpaca_account.regt_buying_power",
+    )
+
+
 def _effective_min_trade_notional(
     *,
     account_equity: float,
@@ -1842,7 +1934,7 @@ def _resolve_session_idx(
     last_idx = lot_manager.meta.get("last_session_idx")
     if last_idx is not None:
         # session_idx must count trading days, not process invocations. The same
-        # trading day is touched multiple times (12:00 decision, 22:00 execute, plus
+        # trading day is touched multiple times (12:30 decision, 22:00 execute, plus
         # any manual retry); all of them must share one index so that per-factor
         # min-hold (measured in sessions) is not silently consumed faster than the
         # market actually advances. Only roll the index forward when we observe a
@@ -3355,6 +3447,7 @@ def _submit_staged_regt_orders(
     short_sales_whole_shares_only: bool,
     shorting_enabled: bool,
     buying_power_buffer: float,
+    gross_capacity_target_ratio: float,
     short_buying_power_adverse_offset_bps: float,
     release_timeout_seconds: float,
     entry_timeout_seconds: float,
@@ -3562,6 +3655,15 @@ def _submit_staged_regt_orders(
     refreshed_signed_qty = _signed_qty_from_positions(refreshed_positions)
     refreshed_account = client.get_account()
     buying_power, buying_power_source = _buying_power(refreshed_account)
+    (
+        total_regt_capacity,
+        refreshed_gross_position,
+        refreshed_regt_buying_power,
+        total_regt_capacity_source,
+    ) = _total_regt_buying_power_capacity(
+        account=refreshed_account,
+        signed_notional=refreshed_signed_notional,
+    )
     refreshed_equity, refreshed_equity_source = _resolve_account_equity(
         account=refreshed_account,
         signed_notional=refreshed_signed_notional,
@@ -3594,6 +3696,8 @@ def _submit_staged_regt_orders(
         shorting_enabled=bool(shorting_enabled),
         sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
         short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
+        total_buying_power_capacity=float(total_regt_capacity),
+        gross_capacity_target_ratio=float(gross_capacity_target_ratio),
     )
     entry_instructions, entry_skipped = _build_order_instructions(
         target_signed_weights=entry_target_signed_weights,
@@ -3627,6 +3731,11 @@ def _submit_staged_regt_orders(
         {
             "fresh_buying_power": float(buying_power),
             "fresh_buying_power_source": str(buying_power_source),
+            "fresh_gross_position": float(refreshed_gross_position),
+            "fresh_regt_buying_power": float(refreshed_regt_buying_power),
+            "fresh_total_regt_capacity": float(total_regt_capacity),
+            "fresh_total_regt_capacity_source": str(total_regt_capacity_source),
+            "gross_capacity_target_ratio": float(gross_capacity_target_ratio),
             "initial_account_equity": float(account_equity),
             "fresh_account_equity": float(refreshed_equity),
             "fresh_account_equity_source": str(refreshed_equity_source),
@@ -3652,6 +3761,11 @@ def _submit_staged_regt_orders(
         "refreshed_account_raw": dict(refreshed_account) if isinstance(refreshed_account, dict) else refreshed_account,
         "fresh_buying_power": float(buying_power),
         "fresh_buying_power_source": str(buying_power_source),
+        "fresh_gross_position": float(refreshed_gross_position),
+        "fresh_regt_buying_power": float(refreshed_regt_buying_power),
+        "fresh_total_regt_capacity": float(total_regt_capacity),
+        "fresh_total_regt_capacity_source": str(total_regt_capacity_source),
+        "gross_capacity_target_ratio": float(gross_capacity_target_ratio),
         "fresh_account_equity": float(refreshed_equity),
         "fresh_account_equity_source": str(refreshed_equity_source),
         "effective_min_trade_notional": float(entry_min_trade_notional),

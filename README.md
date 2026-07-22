@@ -49,8 +49,10 @@ python tools/build_exe.py
 
 后台守护由两层组成：
 
-- `daily_alpaca_scheduler.py`：按北京时间 `12:00` 运行当日 `decision`，按北京时间 `22:00` 执行当日目标仓位。
+- `daily_alpaca_scheduler.py`：按北京时间 `12:30` 运行当日 `decision`，按北京时间 `22:00` 执行当日目标仓位。
 - `watch_daily_alpaca_scheduler.ps1`：监控 scheduler 心跳、任务日志和 executor 子进程；scheduler 掉线时自动拉起。
+
+执行器将 raw alpha 多空权重统一缩放到总 RegT 容量的 `95%`，并以最终 gross 仓位不超过该目标作为硬约束；动态剩余 `buying_power` 仅用于新增订单的券商可行性保护。
 
 以下命令默认在项目根目录运行。
 

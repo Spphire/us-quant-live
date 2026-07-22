@@ -27,7 +27,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$remaining=@(Get-ProjectTargets); if($remaining.Count -gt 0){ Write-Output ('warning: remaining project processes after restart cleanup: '+(($remaining | ForEach-Object { [string]$_.ProcessId }) -join ',')) }; " ^
   "Remove-Item -LiteralPath (Join-Path $root 'artifacts\daily_alpaca_scheduler\daemon\tray_launcher.pid') -Force -ErrorAction SilentlyContinue; " ^
   "Remove-Item -LiteralPath (Join-Path $root 'artifacts\daily_alpaca_scheduler\daemon\scheduler.pid') -Force -ErrorAction SilentlyContinue; " ^
-  "Remove-Item -LiteralPath (Join-Path $root 'artifacts\daily_alpaca_scheduler\watchdog\watchdog.pid') -Force -ErrorAction SilentlyContinue" ^
+  "Remove-Item -LiteralPath (Join-Path $root 'artifacts\daily_alpaca_scheduler\watchdog\watchdog.pid') -Force -ErrorAction SilentlyContinue; " ^
+  "exit 0" ^
   >> "%STARTUP_LOG%" 2>>&1
 
 if errorlevel 1 (

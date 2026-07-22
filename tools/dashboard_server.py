@@ -451,7 +451,7 @@ class DataAggregator:
                 "feed": "sip",
                 "execution_mode": "staged_regt",
                 "target_ny_time": "10:00",
-                "decision_time_cn": "12:00",
+                "decision_time_cn": "12:30",
                 "execute_time_cn": "22:00",
             },
             "system": {
