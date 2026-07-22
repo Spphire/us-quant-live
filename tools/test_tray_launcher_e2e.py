@@ -19,7 +19,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = PROJECT_ROOT / "tools" / "tray_launcher.py"
-DASHBOARD_URL = "http://127.0.0.1:8766/api/overview"
+DASHBOARD_URL = "http://127.0.0.1:18076/api/overview"
 
 
 def find_launcher_pids() -> list[int]:

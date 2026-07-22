@@ -53,6 +53,57 @@ $watchdogLogPath = Join-Path $watchdogRoot "watchdog.log"
 $watchdogStatePath = Join-Path $watchdogRoot "watchdog_state.json"
 $watchdogCommandPath = Join-Path $watchdogRoot "watchdog.command.txt"
 
+function New-WatchdogMutex {
+    param([string]$Name)
+
+    try {
+        return [System.Threading.Mutex]::new($false, "Global\$Name")
+    } catch {
+        return [System.Threading.Mutex]::new($false, $Name)
+    }
+}
+
+function Enter-WatchdogMutex {
+    param(
+        [string]$Name,
+        [int]$TimeoutSeconds = 0
+    )
+
+    $mutex = New-WatchdogMutex -Name $Name
+    $acquired = $false
+    try {
+        if ($TimeoutSeconds -gt 0) {
+            $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        } else {
+            $acquired = $mutex.WaitOne(0)
+        }
+    } catch [System.Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+
+    if (-not $acquired) {
+        $mutex.Dispose()
+        return $null
+    }
+    return $mutex
+}
+
+function Exit-WatchdogMutex {
+    param($Mutex)
+
+    if ($null -eq $Mutex) {
+        return
+    }
+    try {
+        $Mutex.ReleaseMutex() | Out-Null
+    } catch {
+    }
+    try {
+        $Mutex.Dispose()
+    } catch {
+    }
+}
+
 function Get-ProcessFromPidFile {
     param(
         [string]$Path,
@@ -383,90 +434,113 @@ if ($Stop) {
 }
 
 if (-not $Foreground -and -not $Once) {
-    $existing = Get-ProcessFromPidFile -Path $watchdogPidPath -CommandContains @(
-        [string](Resolve-Path -LiteralPath $watchdogScriptPath),
-        [string](Resolve-Path -LiteralPath $ProjectRoot)
-    )
-    if ($null -ne $existing) {
-        if (-not $Force) {
-            Write-Host "[AlpacaWatchdog] already running pid=$($existing.Id). Use -Force to restart." -ForegroundColor Yellow
-            Show-WatchdogStatus
-            exit 0
+    $launchMutex = Enter-WatchdogMutex -Name "us-quant-live-watchdog-launch" -TimeoutSeconds 20
+    if ($null -eq $launchMutex) {
+        Write-Host "[AlpacaWatchdog] another launch is already in progress" -ForegroundColor Yellow
+        exit 0
+    }
+
+    try {
+        $existing = Get-ProcessFromPidFile -Path $watchdogPidPath -CommandContains @(
+            [string](Resolve-Path -LiteralPath $watchdogScriptPath),
+            [string](Resolve-Path -LiteralPath $ProjectRoot)
+        )
+        if ($null -ne $existing) {
+            if (-not $Force) {
+                Write-Host "[AlpacaWatchdog] already running pid=$($existing.Id). Use -Force to restart." -ForegroundColor Yellow
+                Show-WatchdogStatus
+                exit 0
+            }
+            Write-Host "[AlpacaWatchdog] restarting existing pid=$($existing.Id)" -ForegroundColor Yellow
+            Stop-Process -Id $existing.Id -Force
+            Remove-Item -LiteralPath $watchdogPidPath -Force -ErrorAction SilentlyContinue
         }
-        Write-Host "[AlpacaWatchdog] restarting existing pid=$($existing.Id)" -ForegroundColor Yellow
-        Stop-Process -Id $existing.Id -Force
-        Remove-Item -LiteralPath $watchdogPidPath -Force -ErrorAction SilentlyContinue
-    }
 
-    $backgroundArgs = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", $watchdogScriptPath,
-        "-Python", $Python,
-        "-ProjectRoot", $ProjectRoot,
-        "-AccountsJsonPath", $AccountsJsonPath,
-        "-AccountName", $AccountName,
-        "-CheckSeconds", [string]$CheckSeconds,
-        "-HeartbeatStaleMinutes", [string]$HeartbeatStaleMinutes,
-        "-StartupGraceMinutes", [string]$StartupGraceMinutes,
-        "-ActiveTaskGraceMinutes", [string]$ActiveTaskGraceMinutes,
-        "-TaskLogFreshMinutes", [string]$TaskLogFreshMinutes,
-        "-Foreground"
-    )
-    if ($SchedulerLauncherArgs.Count -gt 0) {
-        $backgroundArgs += "-SchedulerLauncherArgs"
-        $backgroundArgs += $SchedulerLauncherArgs
-    }
-
-    $quotedArgs = $backgroundArgs | ForEach-Object {
-        $text = [string]$_
-        if ($text -match '[\s"]') {
-            '"' + ($text -replace '"', '\"') + '"'
-        } else {
-            $text
+        $backgroundArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $watchdogScriptPath,
+            "-Python", $Python,
+            "-ProjectRoot", $ProjectRoot,
+            "-AccountsJsonPath", $AccountsJsonPath,
+            "-AccountName", $AccountName,
+            "-CheckSeconds", [string]$CheckSeconds,
+            "-HeartbeatStaleMinutes", [string]$HeartbeatStaleMinutes,
+            "-StartupGraceMinutes", [string]$StartupGraceMinutes,
+            "-ActiveTaskGraceMinutes", [string]$ActiveTaskGraceMinutes,
+            "-TaskLogFreshMinutes", [string]$TaskLogFreshMinutes,
+            "-Foreground"
+        )
+        if ($SchedulerLauncherArgs.Count -gt 0) {
+            $backgroundArgs += "-SchedulerLauncherArgs"
+            $backgroundArgs += $SchedulerLauncherArgs
         }
+
+        $quotedArgs = $backgroundArgs | ForEach-Object {
+            $text = [string]$_
+            if ($text -match '[\s"]') {
+                '"' + ($text -replace '"', '\"') + '"'
+            } else {
+                $text
+            }
+        }
+        "powershell $($quotedArgs -join ' ')" | Set-Content -LiteralPath $watchdogCommandPath -Encoding UTF8
+
+        Write-Host "[AlpacaWatchdog] starting watchdog in background" -ForegroundColor Cyan
+        Write-Host "[AlpacaWatchdog] project root: $ProjectRoot" -ForegroundColor Cyan
+        Write-Host "[AlpacaWatchdog] stdout: $watchdogStdoutPath" -ForegroundColor Cyan
+        Write-Host "[AlpacaWatchdog] stderr: $watchdogStderrPath" -ForegroundColor Cyan
+        $process = Start-Process `
+            -FilePath "powershell" `
+            -ArgumentList $backgroundArgs `
+            -WorkingDirectory $ProjectRoot `
+            -RedirectStandardOutput $watchdogStdoutPath `
+            -RedirectStandardError $watchdogStderrPath `
+            -WindowStyle Hidden `
+            -PassThru
+
+        Set-Content -LiteralPath $watchdogPidPath -Value $process.Id -Encoding ASCII
+        Write-Host "[AlpacaWatchdog] started pid=$($process.Id)" -ForegroundColor Green
+        exit 0
+    } finally {
+        Exit-WatchdogMutex -Mutex $launchMutex
     }
-    "powershell $($quotedArgs -join ' ')" | Set-Content -LiteralPath $watchdogCommandPath -Encoding UTF8
-
-    Write-Host "[AlpacaWatchdog] starting watchdog in background" -ForegroundColor Cyan
-    Write-Host "[AlpacaWatchdog] project root: $ProjectRoot" -ForegroundColor Cyan
-    Write-Host "[AlpacaWatchdog] stdout: $watchdogStdoutPath" -ForegroundColor Cyan
-    Write-Host "[AlpacaWatchdog] stderr: $watchdogStderrPath" -ForegroundColor Cyan
-    $process = Start-Process `
-        -FilePath "powershell" `
-        -ArgumentList $backgroundArgs `
-        -WorkingDirectory $ProjectRoot `
-        -RedirectStandardOutput $watchdogStdoutPath `
-        -RedirectStandardError $watchdogStderrPath `
-        -WindowStyle Hidden `
-        -PassThru
-
-    Set-Content -LiteralPath $watchdogPidPath -Value $process.Id -Encoding ASCII
-    Write-Host "[AlpacaWatchdog] started pid=$($process.Id)" -ForegroundColor Green
-    exit 0
 }
 
-Write-WatchdogLog "online. check_seconds=$CheckSeconds heartbeat_stale_minutes=$HeartbeatStaleMinutes"
-$restartCount = 0
-while ($true) {
-    try {
-        $health = Test-SchedulerHealth
-        if ([bool]$health.restart_needed) {
-            $restartCount += 1
-            Invoke-SchedulerStart -Reason ([string]$health.reason)
-            $health["action"] = "restart_scheduler"
-        } else {
-            $health["action"] = "none"
-        }
-        $health["restart_count"] = $restartCount
-        Save-WatchdogState -Payload $health
-        Write-WatchdogLog "check reason=$($health.reason) action=$($health.action) scheduler_pid=$($health.scheduler_pid) executor_count=$($health.executor_process_count) heartbeat_age_minutes=$($health.heartbeat_age_minutes)"
-    } catch {
-        Write-WatchdogLog "warning: check failed: $($_.Exception.Message)"
+$runMutex = $null
+if (-not $Once) {
+    $runMutex = Enter-WatchdogMutex -Name "us-quant-live-watchdog-run" -TimeoutSeconds 0
+    if ($null -eq $runMutex) {
+        Write-WatchdogLog "another watchdog foreground loop is already running; exiting"
+        exit 0
     }
+}
 
-    if ($Once) {
-        break
+try {
+    Write-WatchdogLog "online. check_seconds=$CheckSeconds heartbeat_stale_minutes=$HeartbeatStaleMinutes"
+    $restartCount = 0
+    while ($true) {
+        try {
+            $health = Test-SchedulerHealth
+            if ([bool]$health.restart_needed) {
+                $restartCount += 1
+                Invoke-SchedulerStart -Reason ([string]$health.reason)
+                $health["action"] = "restart_scheduler"
+            } else {
+                $health["action"] = "none"
+            }
+            $health["restart_count"] = $restartCount
+            Save-WatchdogState -Payload $health
+            Write-WatchdogLog "check reason=$($health.reason) action=$($health.action) scheduler_pid=$($health.scheduler_pid) executor_count=$($health.executor_process_count) heartbeat_age_minutes=$($health.heartbeat_age_minutes)"
+        } catch {
+            Write-WatchdogLog "warning: check failed: $($_.Exception.Message)"
+        }
+
+        if ($Once) {
+            break
+        }
+        Start-Sleep -Seconds ([math]::Max($CheckSeconds, 5))
     }
-    Start-Sleep -Seconds ([math]::Max($CheckSeconds, 5))
+} finally {
+    Exit-WatchdogMutex -Mutex $runMutex
 }

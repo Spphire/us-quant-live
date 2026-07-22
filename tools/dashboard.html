@@ -183,9 +183,44 @@
         .badge.long, .badge.completed, .badge.success { background: rgba(16, 185, 129, 0.18); color: #10b981; }
         .badge.short, .badge.failed, .badge.error { background: rgba(239, 68, 68, 0.18); color: #ef4444; }
         .badge.pending, .badge.warning { background: rgba(251, 191, 36, 0.18); color: #fbbf24; }
+        .badge.attention, .badge.blocked { background: rgba(251, 191, 36, 0.18); color: #fbbf24; }
+        .badge.pass, .badge.ready { background: rgba(16, 185, 129, 0.18); color: #10b981; }
+        .badge.historical_limited { background: rgba(96, 165, 250, 0.18); color: #60a5fa; }
         .badge.info, .badge.running { background: rgba(96, 165, 250, 0.18); color: #60a5fa; }
         .badge.locked { background: rgba(251, 146, 60, 0.18); color: #fb923c; }
         .badge.unlocked { background: rgba(148, 163, 184, 0.18); color: #94a3b8; }
+        .audit-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 0.75rem;
+        }
+        .audit-item {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid #1e2a4a;
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            min-height: 86px;
+        }
+        .audit-label {
+            font-size: 0.72rem;
+            color: #8b92a8;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            margin-bottom: 0.35rem;
+        }
+        .audit-value {
+            font-size: 1.05rem;
+            font-weight: 650;
+            color: #ffffff;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+        }
+        .audit-sub {
+            margin-top: 0.35rem;
+            font-size: 0.78rem;
+            color: #8b92a8;
+            line-height: 1.35;
+        }
         .positive { color: #10b981; }
         .negative { color: #ef4444; }
         .neutral { color: #8b92a8; }
@@ -230,6 +265,40 @@
             margin-right: -0.5rem;
         }
         canvas { max-height: 320px; }
+        .execution-charts-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .execution-chart-panel {
+            min-width: 0;
+            margin-bottom: 0;
+        }
+        .execution-chart-panel canvas {
+            width: 100% !important;
+            height: 300px !important;
+        }
+        .chart-key {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem 1rem;
+            margin: 0.75rem 0 0.35rem;
+            min-height: 36px;
+            color: #aab1c3;
+            font-size: 0.75rem;
+            line-height: 1.25;
+        }
+        .chart-key-item { display: inline-flex; align-items: center; gap: 0.4rem; }
+        .chart-key-swatch {
+            width: 18px;
+            height: 3px;
+            border-radius: 1px;
+            flex: 0 0 auto;
+        }
+        @media (max-width: 1080px) {
+            .execution-charts-grid { grid-template-columns: 1fr; }
+        }
         .charts-row {
             display: grid;
             grid-template-columns: 2fr 1fr;
@@ -452,7 +521,19 @@
                 statusCompleted: 'Completed',
                 statusFailed: 'Failed',
                 statusRunning: 'Running',
+                statusStarted: 'Started',
                 chartEquityTitle: 'Portfolio Equity (Last 30 Days)',
+                chartWeightErrorTitle: 'Daily Weight Error (L1)',
+                chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
+                seriesStrategyActual: 'Strategy to actual',
+                seriesStrategyExecutable: 'Strategy to executable',
+                seriesExecutableActual: 'Executable to actual',
+                seriesGrossUtilization: 'Gross utilization',
+                seriesConfiguredTarget: '90% target',
+                seriesTotalCapacity: '100% capacity',
+                seriesErrorVsTarget: 'Error vs target',
+                seriesErrorVsTotal: 'Error vs total',
+                metricGrossCapacity: 'Gross / RegT Capacity',
 
                 // Positions
                 searchSymbol: 'Search symbol...',
@@ -577,7 +658,19 @@
                 statusCompleted: '已完成',
                 statusFailed: '失败',
                 statusRunning: '运行中',
+                statusStarted: '已启动',
                 chartEquityTitle: '账户权益曲线（最近30天）',
+                chartWeightErrorTitle: '每日权重误差（L1）',
+                chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
+                seriesStrategyActual: '策略到实际',
+                seriesStrategyExecutable: '策略到可执行',
+                seriesExecutableActual: '可执行到实际',
+                seriesGrossUtilization: '实际总仓位利用率',
+                seriesConfiguredTarget: '90% 目标',
+                seriesTotalCapacity: '100% 总容量',
+                seriesErrorVsTarget: '相对目标误差',
+                seriesErrorVsTotal: '相对总容量误差',
+                metricGrossCapacity: '总仓位 / RegT 总容量',
 
                 // Positions
                 searchSymbol: '搜索股票代码...',
@@ -713,9 +806,10 @@
 
         // === CORE STATE & UTILS ===
         let currentTab = 'overview';
-        let charts = { equity: null, lotPie: null };
+        let charts = { equity: null, weightError: null, buyingPowerError: null, lotPie: null };
         let sseConnection = null;
         let lastUpdateTime = Date.now();
+        let positionSortState = { key: 'market_value', direction: 'desc' };
 
         async function fetchJSON(endpoint) {
             const resp = await fetch(`/api/${endpoint}`);
@@ -730,12 +824,389 @@
         }
 
         function formatCurrency(val) {
-            return '$' + Math.abs(val).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            const num = Number(val) || 0;
+            const sign = num < 0 ? '-' : '';
+            return sign + '$' + Math.abs(num).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        }
+
+        function formatOptionalCurrency(val) {
+            if (val === null || val === undefined || val === '') return 'n/a';
+            return formatCurrency(val);
         }
 
         function formatPercent(val) {
-            const sign = val >= 0 ? '+' : '';
-            return sign + val.toFixed(2) + '%';
+            const num = Number(val);
+            if (!Number.isFinite(num)) return 'n/a';
+            const sign = num >= 0 ? '+' : '';
+            return sign + num.toFixed(2) + '%';
+        }
+
+        function formatWeightError(val) {
+            if (val === null || val === undefined || val === '') return 'n/a';
+            const num = Number(val);
+            if (!Number.isFinite(num)) return 'n/a';
+            return (Math.abs(num) * 100).toFixed(3) + '%';
+        }
+
+        function formatRatioPercent(val, digits = 3) {
+            if (val === null || val === undefined || val === '') return 'n/a';
+            const num = Number(val);
+            if (!Number.isFinite(num)) return 'n/a';
+            return (num * 100).toFixed(digits) + '%';
+        }
+
+        function formatSignedPoints(val, digits = 3) {
+            if (val === null || val === undefined || val === '') return 'n/a';
+            const num = Number(val);
+            if (!Number.isFinite(num)) return 'n/a';
+            return `${num >= 0 ? '+' : ''}${num.toFixed(digits)} pp`;
+        }
+
+        function escapeHTML(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[ch]));
+        }
+
+        function formatNumber(val, digits = 0) {
+            const num = Number(val);
+            if (!Number.isFinite(num)) return '0';
+            return num.toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits });
+        }
+
+        function badgeClass(status) {
+            const token = String(status || 'unknown').toLowerCase();
+            if (['pass', 'ready', 'completed', 'success', 'true'].includes(token)) return 'pass';
+            if (['attention', 'blocked', 'warning', 'failed', 'error'].includes(token)) return token;
+            if (token === 'historical_limited') return 'historical_limited';
+            if (token === 'running') return 'running';
+            return 'info';
+        }
+
+        function statusBadge(status) {
+            const token = status || 'unknown';
+            return `<span class="badge ${badgeClass(token)}">${escapeHTML(token)}</span>`;
+        }
+
+        function jsString(value) {
+            return JSON.stringify(String(value ?? ''));
+        }
+
+        function historyDateKey(row) {
+            const raw = String(row?.session_date || row?.decision_date || row?.run_dir || '').trim();
+            const compact = raw.match(/\d{8}/)?.[0];
+            if (compact) return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+            const iso = raw.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+            return iso || raw;
+        }
+
+        function runTypeOrder(row) {
+            const type = String(row?.run_type || '').toLowerCase();
+            if (type === 'execute') return 2;
+            if (type === 'decision') return 1;
+            return 0;
+        }
+
+        function compareHistoryRowsAsc(a, b) {
+            const dateCmp = historyDateKey(a).localeCompare(historyDateKey(b));
+            if (dateCmp !== 0) return dateCmp;
+            const runCmp = runTypeOrder(a) - runTypeOrder(b);
+            if (runCmp !== 0) return runCmp;
+            return Number(a?.session_idx || 0) - Number(b?.session_idx || 0);
+        }
+
+        function compareHistoryRowsNewestFirst(a, b) {
+            return -compareHistoryRowsAsc(a, b);
+        }
+
+        function buildEquitySeries(history) {
+            const rows = Array.isArray(history) ? history : [];
+            const numericRows = rows.filter(row => Number.isFinite(Number(row.account_equity_post_trade)));
+            const executeRows = numericRows.filter(row => String(row.run_type || '').toLowerCase() === 'execute');
+            const sourceRows = executeRows.length ? executeRows : numericRows;
+            const byDate = new Map();
+            for (const row of sourceRows) {
+                const dateKey = historyDateKey(row);
+                if (!dateKey) continue;
+                const current = byDate.get(dateKey);
+                if (!current || runTypeOrder(row) >= runTypeOrder(current)) byDate.set(dateKey, row);
+            }
+            return Array.from(byDate.values())
+                .sort(compareHistoryRowsAsc)
+                .slice(-30)
+                .map(row => ({
+                    label: historyDateKey(row),
+                    value: Number(row.account_equity_post_trade),
+                    runDir: row.run_dir || '',
+                    runType: row.run_type || ''
+                }));
+        }
+
+        function auditMetric(row, key, scale = 1) {
+            const value = row?.[key];
+            if (value === null || value === undefined || value === '') return null;
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric * scale : null;
+        }
+
+        function buildExecutionAuditSeries(auditPayload) {
+            const rows = Array.isArray(auditPayload?.rollup?.rows) ? auditPayload.rollup.rows : [];
+            return rows
+                .filter(row => String(row?.session_date || '').length > 0)
+                .slice()
+                .sort((a, b) => String(a.session_date).localeCompare(String(b.session_date)))
+                .slice(-30);
+        }
+
+        function chartKeyHTML(items) {
+            return items.map(item => `
+                <span class="chart-key-item">
+                    <span class="chart-key-swatch" style="background:${item.color}"></span>
+                    ${escapeHTML(item.label)}
+                </span>
+            `).join('');
+        }
+
+        function setupCanvas(canvas) {
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(320, rect.width || canvas.clientWidth || 640);
+            const height = Math.max(220, rect.height || canvas.clientHeight || 320);
+            canvas.width = Math.round(width * dpr);
+            canvas.height = Math.round(height * dpr);
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, width, height);
+            return { ctx, width, height };
+        }
+
+        function renderNoCanvasData(canvas, message) {
+            const { ctx, width, height } = setupCanvas(canvas);
+            ctx.fillStyle = '#8b92a8';
+            ctx.font = '13px system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(message, width / 2, height / 2);
+        }
+
+        function renderEquityCanvasFallback(canvas, labels, values) {
+            canvas.dataset.fallbackChart = 'equity';
+            canvas.dataset.fallbackLabels = JSON.stringify(labels);
+            if (!labels.length || !values.length) {
+                renderNoCanvasData(canvas, 'No equity history');
+                return;
+            }
+            const { ctx, width, height } = setupCanvas(canvas);
+            const pad = { left: 74, right: 24, top: 24, bottom: 46 };
+            const chartW = Math.max(1, width - pad.left - pad.right);
+            const chartH = Math.max(1, height - pad.top - pad.bottom);
+            const minValue = Math.min(...values);
+            const maxValue = Math.max(...values);
+            const range = maxValue - minValue || Math.max(1, Math.abs(maxValue) * 0.02);
+            const yMin = minValue - range * 0.08;
+            const yMax = maxValue + range * 0.08;
+            const xFor = i => pad.left + (labels.length === 1 ? chartW / 2 : (i / (labels.length - 1)) * chartW);
+            const yFor = value => pad.top + (1 - ((value - yMin) / (yMax - yMin || 1))) * chartH;
+
+            ctx.strokeStyle = '#1e2a4a';
+            ctx.lineWidth = 1;
+            ctx.font = '11px system-ui, sans-serif';
+            ctx.fillStyle = '#8b92a8';
+            ctx.textAlign = 'right';
+            for (let i = 0; i <= 4; i++) {
+                const y = pad.top + (i / 4) * chartH;
+                const value = yMax - (i / 4) * (yMax - yMin);
+                ctx.beginPath();
+                ctx.moveTo(pad.left, y);
+                ctx.lineTo(width - pad.right, y);
+                ctx.stroke();
+                ctx.fillText(formatCurrency(value), pad.left - 10, y + 4);
+            }
+
+            const gradient = ctx.createLinearGradient(0, pad.top, 0, height - pad.bottom);
+            gradient.addColorStop(0, 'rgba(96, 165, 250, 0.22)');
+            gradient.addColorStop(1, 'rgba(96, 165, 250, 0.02)');
+            ctx.beginPath();
+            values.forEach((value, i) => {
+                const x = xFor(i);
+                const y = yFor(value);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.lineTo(xFor(values.length - 1), height - pad.bottom);
+            ctx.lineTo(xFor(0), height - pad.bottom);
+            ctx.closePath();
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            ctx.beginPath();
+            values.forEach((value, i) => {
+                const x = xFor(i);
+                const y = yFor(value);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.strokeStyle = '#60a5fa';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+
+            ctx.fillStyle = '#60a5fa';
+            values.forEach((value, i) => {
+                ctx.beginPath();
+                ctx.arc(xFor(i), yFor(value), 3, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            ctx.fillStyle = '#8b92a8';
+            ctx.textAlign = 'center';
+            const labelEvery = Math.max(1, Math.ceil(labels.length / 7));
+            labels.forEach((label, i) => {
+                if (i % labelEvery !== 0 && i !== labels.length - 1) return;
+                ctx.fillText(label.slice(5), xFor(i), height - 18);
+            });
+        }
+
+        function renderMultiAxisLineFallback(canvas, labels, datasets, emptyMessage) {
+            canvas.dataset.fallbackChart = 'multi-line';
+            canvas.dataset.fallbackLabels = JSON.stringify(labels);
+            const active = datasets.filter(dataset => dataset.data.some(value => Number.isFinite(value)));
+            if (!labels.length || !active.length) {
+                renderNoCanvasData(canvas, emptyMessage);
+                return;
+            }
+
+            const { ctx, width, height } = setupCanvas(canvas);
+            const hasSecondary = active.some(dataset => dataset.axis === 'secondary');
+            const pad = { left: 58, right: hasSecondary ? 58 : 24, top: 22, bottom: 44 };
+            const chartW = Math.max(1, width - pad.left - pad.right);
+            const chartH = Math.max(1, height - pad.top - pad.bottom);
+            const xFor = index => pad.left + (
+                labels.length === 1 ? chartW / 2 : (index / (labels.length - 1)) * chartW
+            );
+
+            function axisBounds(axis) {
+                const values = active
+                    .filter(dataset => (dataset.axis || 'primary') === axis)
+                    .flatMap(dataset => dataset.data)
+                    .filter(value => Number.isFinite(value));
+                if (!values.length) return { min: 0, max: 1 };
+                let min = Math.min(...values);
+                let max = Math.max(...values);
+                if (axis === 'primary' && min >= 0 && max < 30) min = 0;
+                const range = max - min || Math.max(1, Math.abs(max) * 0.1);
+                return { min: min - range * 0.08, max: max + range * 0.08 };
+            }
+
+            const primary = axisBounds('primary');
+            const secondary = axisBounds('secondary');
+            const yFor = (value, axis) => {
+                const bounds = axis === 'secondary' ? secondary : primary;
+                return pad.top + (1 - ((value - bounds.min) / (bounds.max - bounds.min || 1))) * chartH;
+            };
+
+            ctx.font = '11px system-ui, sans-serif';
+            for (let i = 0; i <= 4; i++) {
+                const y = pad.top + (i / 4) * chartH;
+                ctx.strokeStyle = '#1e2a4a';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(pad.left, y);
+                ctx.lineTo(width - pad.right, y);
+                ctx.stroke();
+
+                ctx.fillStyle = '#8b92a8';
+                ctx.textAlign = 'right';
+                ctx.fillText(
+                    `${(primary.max - (i / 4) * (primary.max - primary.min)).toFixed(1)}%`,
+                    pad.left - 8,
+                    y + 4
+                );
+                if (hasSecondary) {
+                    ctx.textAlign = 'left';
+                    ctx.fillText(
+                        `${(secondary.max - (i / 4) * (secondary.max - secondary.min)).toFixed(1)}pp`,
+                        width - pad.right + 8,
+                        y + 4
+                    );
+                }
+            }
+
+            active.forEach(dataset => {
+                let drawing = false;
+                ctx.beginPath();
+                dataset.data.forEach((value, index) => {
+                    if (!Number.isFinite(value)) {
+                        drawing = false;
+                        return;
+                    }
+                    const x = xFor(index);
+                    const y = yFor(value, dataset.axis || 'primary');
+                    if (!drawing) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                    drawing = true;
+                });
+                ctx.strokeStyle = dataset.color;
+                ctx.lineWidth = dataset.width || 2;
+                ctx.setLineDash(dataset.dash || []);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                if (dataset.points !== false) {
+                    ctx.fillStyle = dataset.color;
+                    dataset.data.forEach((value, index) => {
+                        if (!Number.isFinite(value)) return;
+                        ctx.beginPath();
+                        ctx.arc(xFor(index), yFor(value, dataset.axis || 'primary'), 2.5, 0, Math.PI * 2);
+                        ctx.fill();
+                    });
+                }
+            });
+
+            ctx.fillStyle = '#8b92a8';
+            ctx.textAlign = 'center';
+            const labelEvery = Math.max(1, Math.ceil(labels.length / 6));
+            labels.forEach((label, index) => {
+                if (index % labelEvery !== 0 && index !== labels.length - 1) return;
+                ctx.fillText(String(label).slice(5), xFor(index), height - 16);
+            });
+        }
+
+        function renderDoughnutCanvasFallback(canvas, labels, values, colors) {
+            canvas.dataset.fallbackChart = 'doughnut';
+            if (!labels.length || !values.length) {
+                renderNoCanvasData(canvas, 'No lot data');
+                return;
+            }
+            const { ctx, width, height } = setupCanvas(canvas);
+            const total = values.reduce((sum, value) => sum + Number(value || 0), 0);
+            const radius = Math.max(60, Math.min(width, height) * 0.34);
+            const innerRadius = radius * 0.58;
+            const cx = width / 2;
+            const cy = height / 2;
+            let angle = -Math.PI / 2;
+            values.forEach((raw, i) => {
+                const value = Number(raw || 0);
+                const slice = total ? (value / total) * Math.PI * 2 : 0;
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.arc(cx, cy, radius, angle, angle + slice);
+                ctx.closePath();
+                ctx.fillStyle = colors[i % colors.length];
+                ctx.fill();
+                angle += slice;
+            });
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.beginPath();
+            ctx.arc(cx, cy, innerRadius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.fillStyle = '#e4e8f0';
+            ctx.font = '600 20px system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(String(total), cx, cy + 7);
         }
 
         function showModal(title, bodyHTML) {
@@ -783,8 +1254,10 @@
             try {
                 const data = await fetchJSON('overview');
                 renderOverviewMetrics(data);
+                renderAuditPanel(data.audit || {});
                 renderOverviewTimeline(data);
                 await loadEquityChart();
+                await loadExecutionErrorCharts();
                 updateLastUpdate();
             } catch (err) {
                 console.error('Failed to load overview:', err);
@@ -821,6 +1294,151 @@
             else document.getElementById('overview').insertAdjacentHTML('afterbegin', html);
         }
 
+        function renderAuditPanel(audit) {
+            const latest = audit.latest || {};
+            const totals = audit.totals || {};
+            const statusCounts = audit.status_counts || {};
+            const html = `
+                <div class="panel" id="auditPanel">
+                    <div class="panel-title">
+                        Audit Attribution
+                        <button class="btn secondary" onclick="showAuditDetail()">Details</button>
+                    </div>
+                    <div class="audit-grid">
+                        <div class="audit-item">
+                            <div class="audit-label">Latest Audit</div>
+                            <div class="audit-value">${statusBadge(latest.audit_status || 'unknown')}</div>
+                            <div class="audit-sub">${escapeHTML(latest.session_date || '')} · issues ${latest.audit_issues ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">权重跟踪误差 (L1)</div>
+                            <div class="audit-value">${formatWeightError(latest.strategy_to_actual_weight_error_l1)}</div>
+                            <div class="audit-sub">策略→可执行 ${formatWeightError(latest.strategy_to_executable_weight_error_l1)} | 可执行→实际 ${formatWeightError(latest.executable_to_actual_weight_error_l1)}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">${t('metricGrossCapacity')}</div>
+                            <div class="audit-value">${formatRatioPercent(latest.gross_utilization_of_total_bp)}</div>
+                            <div class="audit-sub">90% gap ${formatSignedPoints(latest.gross_error_vs_target_pct_points)} | 100% gap ${formatSignedPoints(latest.gross_error_vs_total_pct_points)}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Strict Attribution</div>
+                            <div class="audit-value">${statusBadge(latest.strict_attribution_status || 'unknown')}</div>
+                            <div class="audit-sub">blockers ${latest.strict_attribution_blocking_items ?? 0} · ready days ${audit.strict_attribution_ready_days ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Position Residuals</div>
+                            <div class="audit-value">${formatNumber(latest.position_reconciliation_material_residuals || 0)}</div>
+                            <div class="audit-sub">snapshot ${escapeHTML(latest.position_snapshot_integrity_status || 'unknown')} · diagnosis ${escapeHTML(latest.residual_diagnosis_status || 'unknown')}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Price Evidence</div>
+                            <div class="audit-value">${statusBadge(latest.market_price_status || 'unknown')}</div>
+                            <div class="audit-sub">missing refs ${latest.market_price_missing_reference_symbols ?? 0} · fallback-only ${latest.market_price_fallback_only_symbols ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">1Min Bars</div>
+                            <div class="audit-value">${statusBadge(latest.intraday_bar_status || 'unknown')}</div>
+                            <div class="audit-sub">missing ${latest.intraday_bar_missing_symbols ?? 0} | filled missing ${latest.intraday_bar_filled_symbols_missing ?? 0} | errors ${latest.intraday_bar_error_count ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Quotes</div>
+                            <div class="audit-value">${statusBadge(latest.quote_status || 'unknown')}</div>
+                            <div class="audit-sub">missing ${latest.quote_missing_symbols ?? 0} | invalid ${latest.quote_invalid_symbols ?? 0} | wide ${latest.quote_wide_spread_symbols ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Account Activity</div>
+                            <div class="audit-value">${formatCurrency(latest.account_activity_unknown_net_amount || 0)}</div>
+                            <div class="audit-sub">unknown net · non-trade ${formatCurrency(latest.account_activity_non_trade_equity_impact || 0)}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Corporate Actions</div>
+                            <div class="audit-value">${statusBadge(latest.corporate_action_status || 'unknown')}</div>
+                            <div class="audit-sub">rows ${latest.corporate_action_rows ?? 0} | residual matches ${latest.corporate_action_matched_position_residual_symbols ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Portfolio History</div>
+                            <div class="audit-value">${statusBadge(latest.portfolio_history_status || 'unknown')}</div>
+                            <div class="audit-sub">rows ${latest.portfolio_history_rows ?? 0} | delta ${formatCurrency(latest.portfolio_history_summary_vs_after_delta || 0)}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Calendar</div>
+                            <div class="audit-value">${statusBadge(latest.calendar_status || 'unknown')}</div>
+                            <div class="audit-sub">official ${latest.calendar_session_date_in_calendar ? 'yes' : 'no'} | next ${escapeHTML(latest.calendar_expected_next_trading_date || '')} | gaps ${(audit.official_calendar_gaps || {}).gap_count ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Account State</div>
+                            <div class="audit-value">${statusBadge(latest.account_state_bridge_status || 'unknown')}</div>
+                            <div class="audit-sub">eq ${formatOptionalCurrency(latest.account_state_equity_delta)} | cash ${formatOptionalCurrency(latest.account_state_cash_delta)} | exp ${formatOptionalCurrency(latest.account_state_gross_exposure_delta)}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Market Context</div>
+                            <div class="audit-value">${statusBadge(latest.market_context_status || 'unknown')}</div>
+                            <div class="audit-sub">pnl ${formatOptionalCurrency(latest.market_context_snapshot_plus_realized_pnl)} | beta/gross ${formatNumber(latest.market_context_net_beta_exposure_to_gross ?? 0)} | bench bars ${latest.market_context_benchmark_symbols_with_bars ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Attribution Dossier</div>
+                            <div class="audit-value">${statusBadge(latest.attribution_dossier_status || 'unknown')}</div>
+                            <div class="audit-sub">focus ${latest.attribution_focus_symbol_count ?? 0} | evidence gaps ${latest.attribution_evidence_gap_count ?? 0}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Evidence Digest</div>
+                            <div class="audit-value">${statusBadge(latest.run_evidence_digest_status || 'unknown')}</div>
+                            <div class="audit-sub">missing ${latest.run_evidence_digest_missing_files ?? 0} | strict ${latest.run_evidence_digest_strict_missing_files ?? 0} | events ${latest.run_evidence_digest_run_event_count ?? 0} | hash files ${latest.run_evidence_digest_hash_manifest_file_count ?? 0} | complete ${escapeHTML(latest.run_evidence_digest_artifact_completeness_status || 'unknown')} (${latest.run_evidence_digest_artifact_completeness_partial_category_count ?? 0})</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Startup Binding</div>
+                            <div class="audit-value">${statusBadge(latest.startup_binding_status || 'unknown')}</div>
+                            <div class="audit-sub">issues ${latest.startup_binding_issue_count ?? 0} | autostart ${latest.startup_autostart_registered ? 'yes' : 'no'} | health ${escapeHTML(latest.startup_process_health_status || 'unknown')}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Run Health</div>
+                            <div class="audit-value">${statusBadge(latest.run_failure_status || 'unknown')}</div>
+                            <div class="audit-sub">${escapeHTML(latest.run_failure_class || 'none')} | ${escapeHTML(latest.run_failure_error_type || '')}</div>
+                        </div>
+                        <div class="audit-item">
+                            <div class="audit-label">Rollup</div>
+                            <div class="audit-value">${formatNumber(audit.trading_day_count || 0)} days</div>
+                            <div class="audit-sub">pass ${statusCounts.pass || 0} · attention ${statusCounts.attention || 0} · total blockers ${totals.strict_attribution_blocking_items || 0}</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            const existing = document.getElementById('auditPanel');
+            if (existing) existing.outerHTML = html;
+            else document.getElementById('overview').insertAdjacentHTML('beforeend', html);
+            window.latestAuditOverview = audit;
+        }
+
+        async function showAuditDetail() {
+            try {
+                const audit = await fetchJSON('audit');
+                const latest = audit.latest || {};
+                const details = audit.latest_details || {};
+                const body = `
+                    <div class="audit-grid" style="margin-bottom:1rem;">
+                        <div class="audit-item"><div class="audit-label">Latest</div><div class="audit-value">${statusBadge(latest.audit_status || 'unknown')}</div><div class="audit-sub">${escapeHTML(latest.session_date || '')}</div></div>
+                        <div class="audit-item"><div class="audit-label">Strict</div><div class="audit-value">${statusBadge(latest.strict_attribution_status || 'unknown')}</div><div class="audit-sub">blockers ${latest.strict_attribution_blocking_items ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Residuals</div><div class="audit-value">${latest.position_reconciliation_material_residuals ?? 0}</div><div class="audit-sub">${escapeHTML(latest.position_snapshot_integrity_status || '')}</div></div>
+                        <div class="audit-item"><div class="audit-label">1Min Bars</div><div class="audit-value">${statusBadge(latest.intraday_bar_status || 'unknown')}</div><div class="audit-sub">missing ${latest.intraday_bar_missing_symbols ?? 0} | filled missing ${latest.intraday_bar_filled_symbols_missing ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Quotes</div><div class="audit-value">${statusBadge(latest.quote_status || 'unknown')}</div><div class="audit-sub">missing ${latest.quote_missing_symbols ?? 0} | invalid ${latest.quote_invalid_symbols ?? 0} | wide ${latest.quote_wide_spread_symbols ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Corporate Actions</div><div class="audit-value">${statusBadge(latest.corporate_action_status || 'unknown')}</div><div class="audit-sub">rows ${latest.corporate_action_rows ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Portfolio History</div><div class="audit-value">${statusBadge(latest.portfolio_history_status || 'unknown')}</div><div class="audit-sub">rows ${latest.portfolio_history_rows ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Calendar</div><div class="audit-value">${statusBadge(latest.calendar_status || 'unknown')}</div><div class="audit-sub">official ${latest.calendar_session_date_in_calendar ? 'yes' : 'no'} | prev ${escapeHTML(latest.calendar_expected_previous_trading_date || '')} | next ${escapeHTML(latest.calendar_expected_next_trading_date || '')}</div></div>
+                        <div class="audit-item"><div class="audit-label">Account State</div><div class="audit-value">${statusBadge(latest.account_state_bridge_status || 'unknown')}</div><div class="audit-sub">eq ${formatOptionalCurrency(latest.account_state_equity_delta)} | cash ${formatOptionalCurrency(latest.account_state_cash_delta)} | vs summary ${formatOptionalCurrency(latest.account_state_equity_delta_vs_summary_delta)}</div></div>
+                        <div class="audit-item"><div class="audit-label">Market Context</div><div class="audit-value">${statusBadge(latest.market_context_status || 'unknown')}</div><div class="audit-sub">pnl ${formatOptionalCurrency(latest.market_context_snapshot_plus_realized_pnl)} | beta/gross ${formatNumber(latest.market_context_net_beta_exposure_to_gross ?? 0)} | bench bars ${latest.market_context_benchmark_symbols_with_bars ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Attribution Dossier</div><div class="audit-value">${statusBadge(latest.attribution_dossier_status || 'unknown')}</div><div class="audit-sub">focus ${latest.attribution_focus_symbol_count ?? 0} | evidence gaps ${latest.attribution_evidence_gap_count ?? 0}</div></div>
+                        <div class="audit-item"><div class="audit-label">Evidence Digest</div><div class="audit-value">${statusBadge(latest.run_evidence_digest_status || 'unknown')}</div><div class="audit-sub">missing ${latest.run_evidence_digest_missing_files ?? 0} | strict ${latest.run_evidence_digest_strict_missing_files ?? 0} | events ${latest.run_evidence_digest_run_event_count ?? 0} | hash files ${latest.run_evidence_digest_hash_manifest_file_count ?? 0} | complete ${escapeHTML(latest.run_evidence_digest_artifact_completeness_status || 'unknown')} (${latest.run_evidence_digest_artifact_completeness_partial_category_count ?? 0})</div></div>
+                        <div class="audit-item"><div class="audit-label">Startup Binding</div><div class="audit-value">${statusBadge(latest.startup_binding_status || 'unknown')}</div><div class="audit-sub">issues ${latest.startup_binding_issue_count ?? 0} | autostart ${latest.startup_autostart_registered ? 'yes' : 'no'} | health ${escapeHTML(latest.startup_process_health_status || 'unknown')}</div></div>
+                        <div class="audit-item"><div class="audit-label">Run Health</div><div class="audit-value">${statusBadge(latest.run_failure_status || 'unknown')}</div><div class="audit-sub">${escapeHTML(latest.run_failure_class || 'none')} | ${escapeHTML(latest.run_failure_error_type || '')}</div></div>
+                    </div>
+                    <pre>${escapeHTML(JSON.stringify({ latest, latest_details: details }, null, 2))}</pre>
+                `;
+                showModal('Audit Attribution', body);
+            } catch (err) {
+                showModal('Audit Attribution', `<pre>${escapeHTML(err.message || String(err))}</pre>`);
+            }
+        }
+
         function renderOverviewTimeline(data) {
             const lastDec = data.last_decision || {};
             const lastExe = data.last_execute || {};
@@ -832,20 +1450,20 @@
                 <div class="panel">
                     <div class="panel-title">${t('timelineTitle')}</div>
                     <div class="timeline-row">
-                        <div class="timeline-dot ${decStatus === 'completed' ? 'completed' : decStatus === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-dot ${decStatus === 'completed' ? 'completed' : ['running', 'started'].includes(decStatus) ? 'running' : ''}"></div>
                         <div class="timeline-label">
                             <div>12:00 CN ${t('timelineDecision')}</div>
                             <div class="timeline-sub">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</div>
                         </div>
-                        <span class="badge ${decStatus}">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</span>
+                        <span class="badge ${decStatus === 'started' ? 'running' : decStatus}">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</span>
                     </div>
                     <div class="timeline-row">
-                        <div class="timeline-dot ${exeStatus === 'completed' ? 'completed' : exeStatus === 'running' ? 'running' : ''}"></div>
+                        <div class="timeline-dot ${exeStatus === 'completed' ? 'completed' : ['running', 'started'].includes(exeStatus) ? 'running' : ''}"></div>
                         <div class="timeline-label">
                             <div>22:00 CN ${t('timelineExecute')}</div>
                             <div class="timeline-sub">${t('status' + exeStatus.charAt(0).toUpperCase() + exeStatus.slice(1))}</div>
                         </div>
-                        <span class="badge ${exeStatus}">${t('status' + exeStatus.charAt(0).toUpperCase() + exeStatus.slice(1))}</span>
+                        <span class="badge ${exeStatus === 'started' ? 'running' : exeStatus}">${t('status' + exeStatus.charAt(0).toUpperCase() + exeStatus.slice(1))}</span>
                     </div>
                 </div>
             `;
@@ -856,27 +1474,42 @@
 
         async function loadEquityChart() {
             try {
-                const history = await fetchJSON('history?limit=30');
-                const labels = history.map(h => h.decision_date || '').reverse();
-                const values = history.map(h => h.account_equity_post_trade || 0).reverse();
+                const history = await fetchJSON('history?limit=120');
+                const series = buildEquitySeries(history);
+                const labels = series.map(point => point.label);
+                const values = series.map(point => point.value);
 
                 const chartHTML = `
-                    <div class="panel">
+                    <div class="panel" id="equityChartPanel">
                         <div class="panel-title">${t('chartEquityTitle')}</div>
+                        <div class="timeline-sub" id="equityChartMeta"></div>
                         <canvas id="equityChart"></canvas>
                     </div>
                 `;
-                const chartEl = document.querySelector('#overview .panel:last-child');
-                if (chartEl && chartEl.querySelector('canvas')) {
-                    // Update existing chart
-                } else {
+                if (!document.getElementById('equityChartPanel')) {
                     document.getElementById('overview').insertAdjacentHTML('beforeend', chartHTML);
+                }
+                const metaEl = document.getElementById('equityChartMeta');
+                if (metaEl) {
+                    const first = labels[0] || 'n/a';
+                    const last = labels[labels.length - 1] || 'n/a';
+                    const renderer = typeof Chart === 'undefined' ? 'canvas fallback' : 'Chart.js';
+                    metaEl.textContent = labels.length
+                        ? `${first} to ${last} · ${labels.length} execute points · ${renderer}`
+                        : `No execute equity points · ${renderer}`;
                 }
 
                 const ctx = document.getElementById('equityChart');
                 if (!ctx) return;
 
-                if (charts.equity) charts.equity.destroy();
+                if (charts.equity?.destroy) charts.equity.destroy();
+                if (typeof Chart === 'undefined') {
+                    charts.equity = null;
+                    renderEquityCanvasFallback(ctx, labels, values);
+                    return;
+                }
+                delete ctx.dataset.fallbackChart;
+                delete ctx.dataset.fallbackLabels;
                 charts.equity = new Chart(ctx.getContext('2d'), {
                     type: 'line',
                     data: {
@@ -904,7 +1537,15 @@
                                 bodyColor: '#e4e8f0',
                                 borderColor: '#1e2a4a',
                                 borderWidth: 1,
-                                padding: 10
+                                padding: 10,
+                                callbacks: {
+                                    afterBody: (items) => {
+                                        const index = items?.[0]?.dataIndex ?? -1;
+                                        const point = series[index];
+                                        if (!point) return '';
+                                        return `${point.runType || 'run'} ${point.runDir || ''}`.trim();
+                                    }
+                                }
                             }
                         },
                         scales: {
@@ -921,6 +1562,328 @@
                 });
             } catch (err) {
                 console.error('Failed to load equity chart:', err);
+            }
+        }
+
+        async function loadExecutionErrorCharts() {
+            try {
+                const auditPayload = await fetchJSON('audit');
+                const auditSeries = buildExecutionAuditSeries(auditPayload);
+                const weightRows = auditSeries.filter(row => [
+                    'strategy_to_actual_weight_error_l1',
+                    'strategy_to_executable_weight_error_l1',
+                    'executable_to_actual_weight_error_l1'
+                ].some(key => auditMetric(row, key) !== null));
+                const capacityRows = auditSeries.filter(
+                    row => auditMetric(row, 'gross_utilization_of_total_bp') !== null
+                );
+
+                const weightColors = {
+                    strategyActual: '#f87171',
+                    strategyExecutable: '#fbbf24',
+                    executableActual: '#60a5fa'
+                };
+                const capacityColors = {
+                    utilization: '#34d399',
+                    target: '#fbbf24',
+                    total: '#94a3b8',
+                    targetError: '#fb923c',
+                    totalError: '#f87171'
+                };
+                const weightKey = [
+                    { label: t('seriesStrategyActual'), color: weightColors.strategyActual },
+                    { label: t('seriesStrategyExecutable'), color: weightColors.strategyExecutable },
+                    { label: t('seriesExecutableActual'), color: weightColors.executableActual }
+                ];
+                const capacityKey = [
+                    { label: t('seriesGrossUtilization'), color: capacityColors.utilization },
+                    { label: t('seriesConfiguredTarget'), color: capacityColors.target },
+                    { label: t('seriesTotalCapacity'), color: capacityColors.total },
+                    { label: t('seriesErrorVsTarget'), color: capacityColors.targetError },
+                    { label: t('seriesErrorVsTotal'), color: capacityColors.totalError }
+                ];
+                const chartHTML = `
+                    <div class="execution-charts-grid" id="executionErrorCharts">
+                        <div class="panel execution-chart-panel">
+                            <div class="panel-title">${t('chartWeightErrorTitle')}</div>
+                            <div class="timeline-sub" id="weightErrorChartMeta"></div>
+                            <div class="chart-key">${chartKeyHTML(weightKey)}</div>
+                            <canvas id="weightErrorChart" height="300"></canvas>
+                        </div>
+                        <div class="panel execution-chart-panel">
+                            <div class="panel-title">${t('chartBuyingPowerTitle')}</div>
+                            <div class="timeline-sub" id="buyingPowerErrorChartMeta"></div>
+                            <div class="chart-key">${chartKeyHTML(capacityKey)}</div>
+                            <canvas id="buyingPowerErrorChart" height="300"></canvas>
+                        </div>
+                    </div>
+                `;
+
+                if (charts.weightError?.destroy) charts.weightError.destroy();
+                if (charts.buyingPowerError?.destroy) charts.buyingPowerError.destroy();
+                charts.weightError = null;
+                charts.buyingPowerError = null;
+                const existing = document.getElementById('executionErrorCharts');
+                if (existing) existing.outerHTML = chartHTML;
+                else document.getElementById('overview').insertAdjacentHTML('beforeend', chartHTML);
+
+                const latestWeight = weightRows[weightRows.length - 1];
+                const weightMeta = document.getElementById('weightErrorChartMeta');
+                if (weightMeta) {
+                    weightMeta.textContent = latestWeight
+                        ? `${weightRows[0].session_date} to ${latestWeight.session_date} · ${weightRows.length} days · latest ${t('seriesStrategyActual')} ${formatWeightError(latestWeight.strategy_to_actual_weight_error_l1)}`
+                        : 'No daily weight-error evidence';
+                }
+                const latestCapacity = capacityRows[capacityRows.length - 1];
+                const capacityMeta = document.getElementById('buyingPowerErrorChartMeta');
+                if (capacityMeta) {
+                    capacityMeta.textContent = latestCapacity
+                        ? `${capacityRows[0].session_date} to ${latestCapacity.session_date} · ${capacityRows.length} days · ${formatRatioPercent(latestCapacity.gross_utilization_of_total_bp)} · 90% gap ${formatSignedPoints(latestCapacity.gross_error_vs_target_pct_points)}`
+                        : 'No strict RegT-capacity evidence';
+                }
+
+                const weightLabels = weightRows.map(row => row.session_date);
+                const weightFallbackData = [
+                    {
+                        color: weightColors.strategyActual,
+                        data: weightRows.map(row => auditMetric(row, 'strategy_to_actual_weight_error_l1', 100))
+                    },
+                    {
+                        color: weightColors.strategyExecutable,
+                        data: weightRows.map(row => auditMetric(row, 'strategy_to_executable_weight_error_l1', 100))
+                    },
+                    {
+                        color: weightColors.executableActual,
+                        data: weightRows.map(row => auditMetric(row, 'executable_to_actual_weight_error_l1', 100))
+                    }
+                ];
+                const weightCanvas = document.getElementById('weightErrorChart');
+                if (weightCanvas) {
+                    if (typeof Chart === 'undefined') {
+                        renderMultiAxisLineFallback(
+                            weightCanvas,
+                            weightLabels,
+                            weightFallbackData,
+                            'No daily weight-error evidence'
+                        );
+                    } else {
+                        charts.weightError = new Chart(weightCanvas.getContext('2d'), {
+                            type: 'line',
+                            data: {
+                                labels: weightLabels,
+                                datasets: [
+                                    {
+                                        label: t('seriesStrategyActual'),
+                                        data: weightFallbackData[0].data,
+                                        borderColor: weightColors.strategyActual,
+                                        backgroundColor: 'rgba(248, 113, 113, 0.08)',
+                                        borderWidth: 2.25,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yWeight'
+                                    },
+                                    {
+                                        label: t('seriesStrategyExecutable'),
+                                        data: weightFallbackData[1].data,
+                                        borderColor: weightColors.strategyExecutable,
+                                        borderWidth: 2,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yWeight'
+                                    },
+                                    {
+                                        label: t('seriesExecutableActual'),
+                                        data: weightFallbackData[2].data,
+                                        borderColor: weightColors.executableActual,
+                                        borderWidth: 2,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yWeight'
+                                    }
+                                ]
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                interaction: { mode: 'index', intersect: false },
+                                plugins: {
+                                    legend: { display: false },
+                                    tooltip: {
+                                        backgroundColor: '#0f1729',
+                                        titleColor: '#e4e8f0',
+                                        bodyColor: '#e4e8f0',
+                                        borderColor: '#1e2a4a',
+                                        borderWidth: 1,
+                                        callbacks: {
+                                            label: context => `${context.dataset.label}: ${Number(context.parsed.y).toFixed(3)}%`
+                                        }
+                                    }
+                                },
+                                scales: {
+                                    yWeight: {
+                                        beginAtZero: true,
+                                        ticks: {
+                                            color: '#8b92a8',
+                                            callback: value => `${Number(value).toFixed(1)}%`
+                                        },
+                                        grid: { color: '#1e2a4a', lineWidth: 0.5 }
+                                    },
+                                    x: {
+                                        ticks: { color: '#8b92a8', font: {size: 10}, maxRotation: 45 },
+                                        grid: { color: '#1e2a4a', lineWidth: 0.5 }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
+                const capacityLabels = capacityRows.map(row => row.session_date);
+                const capacityFallbackData = [
+                    {
+                        color: capacityColors.utilization,
+                        data: capacityRows.map(row => auditMetric(row, 'gross_utilization_of_total_bp', 100))
+                    },
+                    {
+                        color: capacityColors.target,
+                        data: capacityRows.map(row => auditMetric(row, 'configured_buying_power_target_ratio', 100)),
+                        dash: [6, 5],
+                        points: false
+                    },
+                    {
+                        color: capacityColors.total,
+                        data: capacityRows.map(() => 100),
+                        dash: [3, 5],
+                        points: false
+                    },
+                    {
+                        color: capacityColors.targetError,
+                        data: capacityRows.map(row => auditMetric(row, 'gross_error_vs_target_pct_points')),
+                        axis: 'secondary'
+                    },
+                    {
+                        color: capacityColors.totalError,
+                        data: capacityRows.map(row => auditMetric(row, 'gross_error_vs_total_pct_points')),
+                        axis: 'secondary'
+                    }
+                ];
+                const capacityCanvas = document.getElementById('buyingPowerErrorChart');
+                if (capacityCanvas) {
+                    if (typeof Chart === 'undefined') {
+                        renderMultiAxisLineFallback(
+                            capacityCanvas,
+                            capacityLabels,
+                            capacityFallbackData,
+                            'No strict RegT-capacity evidence'
+                        );
+                    } else {
+                        charts.buyingPowerError = new Chart(capacityCanvas.getContext('2d'), {
+                            type: 'line',
+                            data: {
+                                labels: capacityLabels,
+                                datasets: [
+                                    {
+                                        label: t('seriesGrossUtilization'),
+                                        data: capacityFallbackData[0].data,
+                                        borderColor: capacityColors.utilization,
+                                        backgroundColor: 'rgba(52, 211, 153, 0.08)',
+                                        borderWidth: 2.5,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yUtilization'
+                                    },
+                                    {
+                                        label: t('seriesConfiguredTarget'),
+                                        data: capacityFallbackData[1].data,
+                                        borderColor: capacityColors.target,
+                                        borderWidth: 1.5,
+                                        borderDash: [6, 5],
+                                        pointRadius: 0,
+                                        yAxisID: 'yUtilization'
+                                    },
+                                    {
+                                        label: t('seriesTotalCapacity'),
+                                        data: capacityFallbackData[2].data,
+                                        borderColor: capacityColors.total,
+                                        borderWidth: 1.5,
+                                        borderDash: [3, 5],
+                                        pointRadius: 0,
+                                        yAxisID: 'yUtilization'
+                                    },
+                                    {
+                                        label: t('seriesErrorVsTarget'),
+                                        data: capacityFallbackData[3].data,
+                                        borderColor: capacityColors.targetError,
+                                        borderWidth: 2,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yError'
+                                    },
+                                    {
+                                        label: t('seriesErrorVsTotal'),
+                                        data: capacityFallbackData[4].data,
+                                        borderColor: capacityColors.totalError,
+                                        borderWidth: 2,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yError'
+                                    }
+                                ]
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                interaction: { mode: 'index', intersect: false },
+                                plugins: {
+                                    legend: { display: false },
+                                    tooltip: {
+                                        backgroundColor: '#0f1729',
+                                        titleColor: '#e4e8f0',
+                                        bodyColor: '#e4e8f0',
+                                        borderColor: '#1e2a4a',
+                                        borderWidth: 1,
+                                        callbacks: {
+                                            label: context => {
+                                                const suffix = context.dataset.yAxisID === 'yError' ? ' pp' : '%';
+                                                return `${context.dataset.label}: ${Number(context.parsed.y).toFixed(3)}${suffix}`;
+                                            }
+                                        }
+                                    }
+                                },
+                                scales: {
+                                    yUtilization: {
+                                        position: 'left',
+                                        ticks: {
+                                            color: '#8b92a8',
+                                            callback: value => `${Number(value).toFixed(1)}%`
+                                        },
+                                        grid: { color: '#1e2a4a', lineWidth: 0.5 }
+                                    },
+                                    yError: {
+                                        position: 'right',
+                                        ticks: {
+                                            color: '#8b92a8',
+                                            callback: value => `${Number(value).toFixed(1)} pp`
+                                        },
+                                        grid: { drawOnChartArea: false }
+                                    },
+                                    x: {
+                                        ticks: { color: '#8b92a8', font: {size: 10}, maxRotation: 45 },
+                                        grid: { color: '#1e2a4a', lineWidth: 0.5 }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to load execution error charts:', err);
             }
         }
 
@@ -959,14 +1922,14 @@
                     <table>
                         <thead>
                             <tr>
-                                <th onclick="sortPositions('symbol')">${t('thSymbol')}</th>
-                                <th onclick="sortPositions('side')">${t('thSide')}</th>
-                                <th onclick="sortPositions('qty')">${t('thQty')}</th>
-                                <th onclick="sortPositions('market_value')">${t('thMarketValue')}</th>
-                                <th onclick="sortPositions('avg_entry_price')">${t('thEntryPrice')}</th>
-                                <th onclick="sortPositions('current_price')">${t('thCurrentPrice')}</th>
-                                <th onclick="sortPositions('pl')">${t('thPL')}</th>
-                                <th onclick="sortPositions('plPct')">${t('thChange')}</th>
+                                <th data-sort-key="symbol" onclick="sortPositions('symbol')">${t('thSymbol')}</th>
+                                <th data-sort-key="side" onclick="sortPositions('side')">${t('thSide')}</th>
+                                <th data-sort-key="qty" onclick="sortPositions('qty')">${t('thQty')}</th>
+                                <th data-sort-key="market_value" onclick="sortPositions('market_value')">${t('thMarketValue')}</th>
+                                <th data-sort-key="avg_entry_price" onclick="sortPositions('avg_entry_price')">${t('thEntryPrice')}</th>
+                                <th data-sort-key="current_price" onclick="sortPositions('current_price')">${t('thCurrentPrice')}</th>
+                                <th data-sort-key="pl" onclick="sortPositions('pl')">${t('thPL')}</th>
+                                <th data-sort-key="plPct" onclick="sortPositions('plPct')">${t('thChange')}</th>
                             </tr>
                         </thead>
                         <tbody id="positionsTableBody"></tbody>
@@ -975,11 +1938,24 @@
             `;
             document.getElementById('positions').innerHTML = html;
 
-            window.positionsData = positions.map(p => ({
-                ...p,
-                pl: (p.current_price - p.avg_entry_price) * p.qty,
-                plPct: ((p.current_price - p.avg_entry_price) / p.avg_entry_price) * 100
-            }));
+            window.positionsData = positions.map(p => {
+                const qty = Number(p.qty) || 0;
+                const marketValue = Number(p.market_value) || 0;
+                const avgEntry = Number(p.avg_entry_price) || 0;
+                const current = Number(p.current_price) || 0;
+                const pl = (current - avgEntry) * qty;
+                return {
+                    ...p,
+                    symbol: String(p.symbol || ''),
+                    side: String(p.side || '').toLowerCase(),
+                    qty,
+                    market_value: marketValue,
+                    avg_entry_price: avgEntry,
+                    current_price: current,
+                    pl,
+                    plPct: avgEntry ? ((current - avgEntry) / avgEntry) * 100 : 0
+                };
+            });
             filterPositions();
         }
 
@@ -988,18 +1964,19 @@
             const sideFilter = document.getElementById('posSideFilter')?.value || 'all';
             const plFilter = document.getElementById('posPlFilter')?.value || 'all';
 
-            let filtered = window.positionsData || [];
+            let filtered = [...(window.positionsData || [])];
             if (search) filtered = filtered.filter(p => p.symbol.toLowerCase().includes(search));
             if (sideFilter !== 'all') filtered = filtered.filter(p => p.side === sideFilter);
             if (plFilter === 'profitable') filtered = filtered.filter(p => p.pl >= 0);
             if (plFilter === 'losing') filtered = filtered.filter(p => p.pl < 0);
+            filtered.sort(comparePositions);
 
             const rows = filtered.map(p => {
                 const plClass = p.pl >= 0 ? 'positive' : 'negative';
                 const sideUpper = p.side.toUpperCase();
                 return `<tr>
-                    <td><strong>${p.symbol}</strong></td>
-                    <td><span class="badge ${p.side}">${sideUpper}</span></td>
+                    <td><strong>${escapeHTML(p.symbol)}</strong></td>
+                    <td><span class="badge ${escapeHTML(p.side)}">${escapeHTML(sideUpper)}</span></td>
                     <td>${Math.abs(p.qty).toFixed(2)}</td>
                     <td>${formatCurrency(Math.abs(p.market_value))}</td>
                     <td>$${p.avg_entry_price.toFixed(2)}</td>
@@ -1012,10 +1989,38 @@
             if (tbody) {
                 tbody.innerHTML = rows || `<tr><td colspan="8" class="neutral" style="text-align:center;">${t('noMatch')}</td></tr>`;
             }
+            updatePositionSortHeaders();
         }
 
         function sortPositions(key) {
-            // TODO: implement sorting
+            if (positionSortState.key === key) {
+                positionSortState.direction = positionSortState.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                positionSortState = {
+                    key,
+                    direction: ['symbol', 'side'].includes(key) ? 'asc' : 'desc'
+                };
+            }
+            filterPositions();
+        }
+
+        function comparePositions(a, b) {
+            const key = positionSortState.key;
+            const direction = positionSortState.direction === 'asc' ? 1 : -1;
+            const av = a?.[key];
+            const bv = b?.[key];
+            if (typeof av === 'string' || typeof bv === 'string') {
+                return direction * String(av ?? '').localeCompare(String(bv ?? ''));
+            }
+            return direction * ((Number(av) || 0) - (Number(bv) || 0));
+        }
+
+        function updatePositionSortHeaders() {
+            document.querySelectorAll('#positions th[data-sort-key]').forEach(th => {
+                const active = th.dataset.sortKey === positionSortState.key;
+                th.classList.toggle('sort-asc', active && positionSortState.direction === 'asc');
+                th.classList.toggle('sort-desc', active && positionSortState.direction === 'desc');
+            });
         }
 
                 // === LOTS TAB ===
@@ -1080,32 +2085,38 @@
             const ctx = document.getElementById('lotPieChart');
             if (!ctx) return;
 
-            if (charts.lotPie) charts.lotPie.destroy();
-            charts.lotPie = new Chart(ctx.getContext('2d'), {
-                type: 'doughnut',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        data: values,
-                        backgroundColor: colors,
-                        borderWidth: 0
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    plugins: {
-                        legend: { display: false },
-                        tooltip: {
-                            backgroundColor: '#0f1729',
-                            titleColor: '#e4e8f0',
-                            bodyColor: '#e4e8f0',
-                            borderColor: '#1e2a4a',
-                            borderWidth: 1
+            if (charts.lotPie?.destroy) charts.lotPie.destroy();
+            if (typeof Chart === 'undefined') {
+                charts.lotPie = null;
+                renderDoughnutCanvasFallback(ctx, labels, values, colors);
+            } else {
+                delete ctx.dataset.fallbackChart;
+                charts.lotPie = new Chart(ctx.getContext('2d'), {
+                    type: 'doughnut',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            data: values,
+                            backgroundColor: colors,
+                            borderWidth: 0
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                backgroundColor: '#0f1729',
+                                titleColor: '#e4e8f0',
+                                bodyColor: '#e4e8f0',
+                                borderColor: '#1e2a4a',
+                                borderWidth: 1
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
 
             const legendHTML = labels.map((label, i) => `
                 <div class="legend-item">
@@ -1169,6 +2180,7 @@
         }
 
         function renderHistoryTable(history) {
+            const orderedHistory = [...(history || [])].sort(compareHistoryRowsNewestFirst);
             if (!history || history.length === 0) {
                 document.getElementById('history').innerHTML = `<div class="empty-state"><div class="empty-state-icon">📅</div><div>${t('noHistory')}</div></div>`;
                 return;
@@ -1182,40 +2194,73 @@
                             <tr>
                                 <th>${t('thDate')}</th>
                                 <th>${t('thSession')}</th>
+                                <th>Run</th>
                                 <th>${t('thStatus')}</th>
                                 <th>${t('thSymbols')}</th>
                                 <th>${t('thOrders')}</th>
                                 <th>${t('thSubmitted')}</th>
+                                <th>Audit</th>
+                                <th>Strict</th>
+                                <th>Startup</th>
+                                <th>Run Health</th>
+                                <th>权重误差 L1</th>
                                 <th>${t('thEquityAfter')}</th>
                                 <th>${t('thActions')}</th>
                             </tr>
                         </thead>
-                        <tbody>${history.map(h => {
-                            const statusBadge = h.ok ? 'success' : 'error';
+                        <tbody>${orderedHistory.map(h => {
+                            const runStatusBadge = h.ok ? 'success' : 'error';
                             const submitted = h.submitted ? t('yes') : t('no');
                             return `<tr>
-                                <td>${h.decision_date || 'N/A'}</td>
+                                <td>${historyDateKey(h) || 'N/A'}</td>
                                 <td>${h.session_idx ?? '-'}</td>
-                                <td><span class="badge ${statusBadge}">${h.decision_status || 'unknown'}</span></td>
+                                <td>${escapeHTML(h.run_type || '')}</td>
+                                <td><span class="badge ${runStatusBadge}">${h.decision_status || 'unknown'}</span></td>
                                 <td>${h.dynamic_symbols || 0}</td>
                                 <td>${h.order_plan_count || 0}</td>
                                 <td>${submitted}</td>
+                                <td>${statusBadge(h.audit_status || 'unknown')}</td>
+                                <td>${statusBadge(h.strict_attribution_status || 'unknown')}<div class="timeline-sub">blockers ${h.strict_attribution_blocking_items ?? 0}</div></td>
+                                <td>${statusBadge(h.startup_binding_status || 'unknown')}<div class="timeline-sub">issues ${h.startup_binding_issue_count ?? 0}</div></td>
+                                <td>${statusBadge(h.run_failure_status || 'unknown')}<div class="timeline-sub">${escapeHTML(h.run_failure_class || '')}</div></td>
+                                <td>${formatWeightError(h.strategy_to_actual_weight_error_l1 ?? h.audit?.strategy_to_actual_weight_error_l1)}</td>
                                 <td>${formatCurrency(h.account_equity_post_trade || 0)}</td>
-                                <td><button class="btn secondary" onclick="showHistoryDetail('${h.run_dir}')">${t('btnDetails')}</button></td>
+                                <td><button class="btn secondary" onclick="showHistoryDetail(${jsString(h.run_dir)})">${t('btnDetails')}</button></td>
                             </tr>`;
                         }).join('')}</tbody>
                     </table>
                 </div>
             `;
             document.getElementById('history').innerHTML = html;
-            window.historyData = history;
+            window.historyData = orderedHistory;
         }
 
         function showHistoryDetail(runDir) {
             const item = window.historyData.find(h => h.run_dir === runDir);
             if (!item) return;
-            const json = JSON.stringify(item, null, 2);
-            showModal(`${t('modalTitleExecution')}: ${runDir}`, `<pre>${json}</pre>`);
+            const audit = item.audit || {};
+            const body = `
+                <div class="audit-grid" style="margin-bottom:1rem;">
+                    <div class="audit-item"><div class="audit-label">Audit</div><div class="audit-value">${statusBadge(audit.audit_status || item.audit_status || 'unknown')}</div><div class="audit-sub">issues ${audit.audit_issues ?? item.audit_issues ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">权重跟踪误差 (L1)</div><div class="audit-value">${formatWeightError(audit.strategy_to_actual_weight_error_l1 ?? item.strategy_to_actual_weight_error_l1)}</div><div class="audit-sub">策略→可执行 ${formatWeightError(audit.strategy_to_executable_weight_error_l1 ?? item.strategy_to_executable_weight_error_l1)} | 可执行→实际 ${formatWeightError(audit.executable_to_actual_weight_error_l1 ?? item.executable_to_actual_weight_error_l1)}</div></div>
+                    <div class="audit-item"><div class="audit-label">Strict</div><div class="audit-value">${statusBadge(audit.strict_attribution_status || item.strict_attribution_status || 'unknown')}</div><div class="audit-sub">blockers ${audit.strict_attribution_blocking_items ?? item.strict_attribution_blocking_items ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Position Residuals</div><div class="audit-value">${audit.position_reconciliation_material_residuals ?? 0}</div><div class="audit-sub">${escapeHTML(audit.position_snapshot_integrity_status || '')}</div></div>
+                    <div class="audit-item"><div class="audit-label">Price</div><div class="audit-value">${statusBadge(audit.market_price_status || item.market_price_status || 'unknown')}</div><div class="audit-sub">missing refs ${audit.market_price_missing_reference_symbols ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Corporate Actions</div><div class="audit-value">${statusBadge(audit.corporate_action_status || item.corporate_action_status || 'unknown')}</div><div class="audit-sub">rows ${audit.corporate_action_rows ?? item.corporate_action_rows ?? 0} | residual matches ${audit.corporate_action_matched_position_residual_symbols ?? item.corporate_action_matched_position_residual_symbols ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">1Min Bars</div><div class="audit-value">${statusBadge(audit.intraday_bar_status || item.intraday_bar_status || 'unknown')}</div><div class="audit-sub">missing ${audit.intraday_bar_missing_symbols ?? item.intraday_bar_missing_symbols ?? 0} | filled missing ${audit.intraday_bar_filled_symbols_missing ?? item.intraday_bar_filled_symbols_missing ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Quotes</div><div class="audit-value">${statusBadge(audit.quote_status || item.quote_status || 'unknown')}</div><div class="audit-sub">missing ${audit.quote_missing_symbols ?? item.quote_missing_symbols ?? 0} | invalid ${audit.quote_invalid_symbols ?? item.quote_invalid_symbols ?? 0} | wide ${audit.quote_wide_spread_symbols ?? item.quote_wide_spread_symbols ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Portfolio History</div><div class="audit-value">${statusBadge(audit.portfolio_history_status || item.portfolio_history_status || 'unknown')}</div><div class="audit-sub">rows ${audit.portfolio_history_rows ?? item.portfolio_history_rows ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Calendar</div><div class="audit-value">${statusBadge(audit.calendar_status || item.calendar_status || 'unknown')}</div><div class="audit-sub">official ${(audit.calendar_session_date_in_calendar ?? item.calendar_session_date_in_calendar) ? 'yes' : 'no'} | next ${escapeHTML(audit.calendar_expected_next_trading_date || item.calendar_expected_next_trading_date || '')}</div></div>
+                    <div class="audit-item"><div class="audit-label">Account State</div><div class="audit-value">${statusBadge(audit.account_state_bridge_status || item.account_state_bridge_status || 'unknown')}</div><div class="audit-sub">eq ${formatOptionalCurrency(audit.account_state_equity_delta ?? item.account_state_equity_delta)} | cash ${formatOptionalCurrency(audit.account_state_cash_delta ?? item.account_state_cash_delta)} | exp ${formatOptionalCurrency(audit.account_state_gross_exposure_delta ?? item.account_state_gross_exposure_delta)}</div></div>
+                    <div class="audit-item"><div class="audit-label">Market Context</div><div class="audit-value">${statusBadge(audit.market_context_status || item.market_context_status || 'unknown')}</div><div class="audit-sub">pnl ${formatOptionalCurrency(audit.market_context_snapshot_plus_realized_pnl ?? item.market_context_snapshot_plus_realized_pnl)} | beta/gross ${formatNumber(audit.market_context_net_beta_exposure_to_gross ?? item.market_context_net_beta_exposure_to_gross ?? 0)}</div></div>
+                    <div class="audit-item"><div class="audit-label">Attribution Dossier</div><div class="audit-value">${statusBadge(audit.attribution_dossier_status || item.attribution_dossier_status || 'unknown')}</div><div class="audit-sub">focus ${audit.attribution_focus_symbol_count ?? item.attribution_focus_symbol_count ?? 0} | evidence gaps ${audit.attribution_evidence_gap_count ?? item.attribution_evidence_gap_count ?? 0}</div></div>
+                    <div class="audit-item"><div class="audit-label">Evidence Digest</div><div class="audit-value">${statusBadge(audit.run_evidence_digest_status || item.run_evidence_digest_status || 'unknown')}</div><div class="audit-sub">missing ${audit.run_evidence_digest_missing_files ?? item.run_evidence_digest_missing_files ?? 0} | strict ${audit.run_evidence_digest_strict_missing_files ?? item.run_evidence_digest_strict_missing_files ?? 0} | events ${audit.run_evidence_digest_run_event_count ?? item.run_evidence_digest_run_event_count ?? 0} | hash files ${audit.run_evidence_digest_hash_manifest_file_count ?? item.run_evidence_digest_hash_manifest_file_count ?? 0} | complete ${escapeHTML(audit.run_evidence_digest_artifact_completeness_status || item.run_evidence_digest_artifact_completeness_status || 'unknown')} (${audit.run_evidence_digest_artifact_completeness_partial_category_count ?? item.run_evidence_digest_artifact_completeness_partial_category_count ?? 0})</div></div>
+                    <div class="audit-item"><div class="audit-label">Startup Binding</div><div class="audit-value">${statusBadge(audit.startup_binding_status || item.startup_binding_status || 'unknown')}</div><div class="audit-sub">issues ${audit.startup_binding_issue_count ?? item.startup_binding_issue_count ?? 0} | autostart ${(audit.startup_autostart_registered ?? item.startup_autostart_registered) ? 'yes' : 'no'} | health ${escapeHTML(audit.startup_process_health_status || item.startup_process_health_status || 'unknown')}</div></div>
+                    <div class="audit-item"><div class="audit-label">Run Health</div><div class="audit-value">${statusBadge(audit.run_failure_status || item.run_failure_status || 'unknown')}</div><div class="audit-sub">${escapeHTML(audit.run_failure_class || item.run_failure_class || '')} | ${escapeHTML(audit.run_failure_error_type || item.run_failure_error_type || '')}</div></div>
+                </div>
+                <pre>${escapeHTML(JSON.stringify(item, null, 2))}</pre>
+            `;
+            showModal(`${t('modalTitleExecution')}: ${runDir}`, body);
         }
 
                 // === LOGS TAB ===
@@ -1284,6 +2329,8 @@
                 // === SETTINGS TAB ===
         async function loadSettings() {
             try {
+                document.getElementById('settings').innerHTML =
+                    `<div class="empty-state"><div class="empty-state-icon">⚙️</div><div>Loading settings...</div></div>`;
                 const config = await fetchJSON('config');
                 renderSettings(config);
                 updateLastUpdate();
@@ -1296,6 +2343,28 @@
             const trading = config.trading || {};
             const system = config.system || {};
             const ledger = config.ledger || {};
+            const startupBinding = config.startup_binding || {};
+            const autostartTask = startupBinding.autostart_task || {};
+            const startupLog = startupBinding.startup_log || {};
+            const startupPidFiles = startupBinding.pid_files || {};
+            const startupLogTail = String(startupLog.tail || '').slice(-1400);
+            const autostartStatus = autostartTask.available === false
+                ? 'not_available'
+                : autostartTask.registered
+                    ? 'registered'
+                    : autostartTask.not_registered
+                        ? 'not_registered'
+                        : autostartTask.ok
+                            ? 'ok'
+                            : 'attention';
+            const processHealth = config.process_health || {};
+            const processBindings = processHealth.bindings || {};
+            const processPids = processHealth.pid_files || {};
+            const processIssues = Array.isArray(processHealth.issues) ? processHealth.issues : [];
+            const due = config.scheduler_due_latest || {};
+            const dueDecision = due.decision || {};
+            const dueExecute = due.execute || {};
+            const runtime = config.scheduler_runtime_latest || {};
 
             const html = `
                 <div class="panel">
@@ -1318,6 +2387,58 @@
                         <div class="config-item"><span class="config-key">${t('cfgSchedulerPID')}</span><span class="config-value">${system.pid_scheduler || t('notRunning')}</span></div>
                         <div class="config-item"><span class="config-key">${t('cfgWatchdogPID')}</span><span class="config-value">${system.pid_watchdog || t('notRunning')}</span></div>
                         <div class="config-item" style="grid-column:1/-1;"><span class="config-key">${t('cfgProjectRoot')}</span><span class="config-value" style="font-size:0.75rem;">${system.project_root || 'N/A'}</span></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Startup / Autostart</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Start.bat</span><span class="config-value">${(startupBinding.start_bat || {}).exists ? statusBadge('pass') : statusBadge('missing')}</span></div>
+                        <div class="config-item"><span class="config-key">Autostart Task</span><span class="config-value">${statusBadge(autostartStatus)}</span></div>
+                        <div class="config-item"><span class="config-key">Task Return</span><span class="config-value">${autostartTask.returncode ?? 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Launcher PID File</span><span class="config-value">${(startupPidFiles.launcher || {}).tail || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Scheduler PID File</span><span class="config-value">${(startupPidFiles.scheduler || {}).tail || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Startup Log</span><span class="config-value">${startupLog.exists ? statusBadge('pass') : statusBadge('missing')}</span></div>
+                        <div class="config-item"><span class="config-key">Log Modified</span><span class="config-value" style="font-size:0.75rem;">${startupLog.modified_at_utc || 'N/A'}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Start Path</span><span class="config-value" style="font-size:0.75rem;">${escapeHTML((startupBinding.start_bat || {}).path || '')}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Task Detail</span><span class="config-value" style="font-size:0.75rem;">${escapeHTML(String(autostartTask.stdout_tail || autostartTask.stderr_tail || '').slice(-700)) || 'N/A'}</span></div>
+                    </div>
+                    ${startupLogTail ? `<pre style="margin-top:1rem;background:#050917;padding:1rem;border-radius:6px;overflow:auto;max-height:220px;font-size:0.72rem;color:#cbd5e1;">${escapeHTML(startupLogTail)}</pre>` : ''}
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Scheduler Due Check</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Generated CN</span><span class="config-value" style="font-size:0.75rem;">${due.generated_at_cn || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Session</span><span class="config-value">${due.session_date || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">Tradable</span><span class="config-value">${due.tradable ? t('yes') : t('no')}</span></div>
+                        <div class="config-item"><span class="config-key">Decision</span><span class="config-value">${dueDecision.due ? 'due' : 'waiting'} / ${dueDecision.can_attempt ? 'eligible' : escapeHTML(dueDecision.can_attempt_reason || 'not eligible')}</span></div>
+                        <div class="config-item"><span class="config-key">Execute</span><span class="config-value">${dueExecute.due ? 'due' : 'waiting'} / ${dueExecute.can_attempt ? 'eligible' : escapeHTML(dueExecute.can_attempt_reason || 'not eligible')}</span></div>
+                        <div class="config-item"><span class="config-key">Decision Action</span><span class="config-value">${escapeHTML(dueDecision.action || '')}</span></div>
+                        <div class="config-item"><span class="config-key">Execute Action</span><span class="config-value">${escapeHTML(dueExecute.action || '')}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Execute Target</span><span class="config-value" style="font-size:0.75rem;">${escapeHTML((due.paths || {}).decision_targets_path_resolved || '')}</span></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Scheduler Runtime</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Last Event</span><span class="config-value">${escapeHTML(runtime.event_type || 'N/A')}</span></div>
+                        <div class="config-item"><span class="config-key">Generated CN</span><span class="config-value" style="font-size:0.75rem;">${runtime.generated_at_cn || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">PID</span><span class="config-value">${runtime.pid || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Dashboard PID</span><span class="config-value">${runtime.dashboard_pid || t('notRunning')}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Runtime Detail</span><span class="config-value" style="font-size:0.75rem;">${escapeHTML(JSON.stringify(runtime).slice(0, 600))}</span></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-title">Process Binding</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">Status</span><span class="config-value">${statusBadge(processHealth.status || 'unknown')}</span></div>
+                        <div class="config-item"><span class="config-key">Launcher PID</span><span class="config-value">${processPids.launcher || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Scheduler PID</span><span class="config-value">${processPids.scheduler || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Dashboard PID</span><span class="config-value">${processPids.dashboard || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Port Listener</span><span class="config-value">${processPids.dashboard_port_listener || t('notRunning')}</span></div>
+                        <div class="config-item"><span class="config-key">Stub Chain</span><span class="config-value">${processBindings.stub_chain_detected ? t('yes') : t('no')}</span></div>
+                        <div class="config-item"><span class="config-key">Scheduler Linked</span><span class="config-value">${processBindings.scheduler_bound_to_launcher ? t('yes') : t('no')}</span></div>
+                        <div class="config-item"><span class="config-key">Dashboard Linked</span><span class="config-value">${processBindings.dashboard_bound_to_scheduler ? t('yes') : t('no')}</span></div>
+                        <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Issues</span><span class="config-value" style="font-size:0.75rem;">${processIssues.length ? escapeHTML(processIssues.join(', ')) : 'none'}</span></div>
                     </div>
                 </div>
                 <div class="panel">

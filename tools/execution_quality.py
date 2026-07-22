@@ -59,6 +59,112 @@ def _signed_slippage_bps(side: str, reference_price: float, filled_avg_price: fl
     return raw * 10_000.0
 
 
+def _logical_order_key(rec: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(rec.get("symbol", "?")).upper(),
+        str(rec.get("side", "?")).lower(),
+        str(rec.get("stage", "single_pass")),
+    )
+
+
+def _logical_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for rec in records:
+        if isinstance(rec, dict):
+            grouped.setdefault(_logical_order_key(rec), []).append(rec)
+
+    logical: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        items_sorted = sorted(
+            items,
+            key=lambda item: (
+                int(_safe_float(item.get("release_round"))),
+                int(_safe_float(item.get("attempt_count"))),
+                str(item.get("updated_at") or item.get("submitted_at_utc") or ""),
+            ),
+        )
+        symbol, side, stage = key
+        req_qty = max(abs(_safe_float(item.get("qty"))) for item in items_sorted)
+        fill_qty = sum(abs(_safe_float(item.get("filled_qty"))) for item in items_sorted)
+        latest = items_sorted[-1]
+        filled_items = [item for item in items_sorted if abs(_safe_float(item.get("filled_qty"))) > 0]
+        chosen = filled_items[-1] if filled_items else latest
+
+        order_planned_notional = max(
+            (
+                abs(_safe_float(item.get("qty")))
+                * _safe_float(item.get("reference_price"))
+                if _safe_float(item.get("reference_price")) > 0
+                else abs(_safe_float(item.get("delta_notional")))
+            )
+            for item in items_sorted
+        )
+        filled_notional = sum(
+            abs(_safe_float(item.get("filled_qty")))
+            * (
+                _safe_float(item.get("filled_avg_price"))
+                if _safe_float(item.get("filled_avg_price")) > 0
+                else _safe_float(item.get("reference_price"))
+            )
+            for item in items_sorted
+        )
+        reference_notional = sum(
+            abs(_safe_float(item.get("filled_qty"))) * _safe_float(item.get("reference_price"))
+            for item in items_sorted
+        )
+        weighted_slippage_sum = 0.0
+        weighted_slippage_notional = 0.0
+        for item in items_sorted:
+            item_fill_qty = abs(_safe_float(item.get("filled_qty")))
+            item_fill_px = _safe_float(item.get("filled_avg_price"))
+            item_ref = _safe_float(item.get("reference_price"))
+            item_notional = item_fill_qty * (item_fill_px if item_fill_px > 0 else item_ref)
+            slip = _signed_slippage_bps(side, item_ref, item_fill_px)
+            if slip is not None and item_notional > 0:
+                weighted_slippage_sum += slip * item_notional
+                weighted_slippage_notional += item_notional
+
+        remaining_qty = max(0.0, req_qty - fill_qty)
+        status = str(latest.get("status_latest", "unknown")).lower()
+        if req_qty > 0 and remaining_qty <= max(1e-6, req_qty * 1e-6):
+            status = "filled"
+            remaining_qty = 0.0
+        elif fill_qty > 0:
+            status = "partial_fill"
+
+        raw_status_counts: dict[str, int] = {}
+        for item in items_sorted:
+            raw_status = str(item.get("status_latest") or item.get("status") or "unknown").lower()
+            raw_status_counts[raw_status] = raw_status_counts.get(raw_status, 0) + 1
+
+        logical.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "stage": stage,
+                "status_latest": status,
+                "qty": req_qty,
+                "filled_qty": fill_qty,
+                "remaining_qty": remaining_qty,
+                "filled_avg_price": filled_notional / fill_qty if fill_qty > 0 else 0.0,
+                "reference_price": _safe_float(chosen.get("reference_price") or latest.get("reference_price")),
+                "planned_notional": order_planned_notional,
+                "filled_notional": filled_notional,
+                "reference_filled_notional": reference_notional,
+                "slippage_bps": (
+                    weighted_slippage_sum / weighted_slippage_notional
+                    if weighted_slippage_notional > 0
+                    else None
+                ),
+                "attempt_count": sum(int(_safe_float(item.get("attempt_count"))) for item in items_sorted),
+                "raw_record_count": len(items_sorted),
+                "latest_status_raw": str(latest.get("status_latest", "")),
+                "raw_status_counts": raw_status_counts,
+            }
+        )
+    return logical
+
+
 def analyze_run(run_dir: Path) -> dict[str, Any]:
     """Compute execution-quality metrics for a single execute run directory."""
     records_path = run_dir / "execution_records.json"
@@ -82,7 +188,9 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         except Exception:
             summary = {}
 
-    total_orders = len(records)
+    raw_record_count = len(records)
+    logical_records = _logical_records(records)
+    total_orders = len(logical_records)
     filled_orders = 0
     canceled_orders = 0
     other_orders = 0
@@ -98,7 +206,8 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     cancel_attribution: dict[str, int] = {}     # attempts-count -> how many cancels
     per_order: list[dict[str, Any]] = []
 
-    for rec in records:
+    superseded_canceled_records = 0
+    for rec in logical_records:
         symbol = str(rec.get("symbol", "?"))
         side = str(rec.get("side", "?"))
         status = str(rec.get("status_latest", "unknown")).lower()
@@ -109,8 +218,8 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         fill_px = _safe_float(rec.get("filled_avg_price"))
         attempts = int(rec.get("attempt_count") or len(rec.get("attempts", []) or []))
 
-        order_planned_notional = req_qty * ref if ref > 0 else abs(_safe_float(rec.get("delta_notional")))
-        order_filled_notional = fill_qty * (fill_px if fill_px > 0 else ref)
+        order_planned_notional = _safe_float(rec.get("planned_notional"))
+        order_filled_notional = _safe_float(rec.get("filled_notional"))
 
         planned_notional += order_planned_notional
         filled_notional += order_filled_notional
@@ -127,7 +236,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         if status == "filled":
             filled_orders += 1
             stage_rec["filled"] += 1
-            slip = _signed_slippage_bps(side, ref, fill_px)
+            slip = rec.get("slippage_bps")
             if slip is not None:
                 slippage_samples.append(slip)
                 slippage_notional_weighted_sum += slip * order_filled_notional
@@ -145,12 +254,19 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "stage": stage,
             "status": status,
             "attempts": attempts,
+            "raw_record_count": rec.get("raw_record_count", 1),
+            "latest_status_raw": rec.get("latest_status_raw", status),
+            "raw_status_counts": rec.get("raw_status_counts", {}),
             "planned_notional": round(order_planned_notional, 2),
             "filled_notional": round(order_filled_notional, 2),
             "reference_price": ref,
             "filled_avg_price": fill_px,
             "slippage_bps": round(slip, 2) if slip is not None else None,
         })
+        if status in {"filled", "partial_fill"} and int(rec.get("raw_record_count", 1)) > 1:
+            raw_status_counts = rec.get("raw_status_counts", {})
+            if isinstance(raw_status_counts, dict):
+                superseded_canceled_records += int(raw_status_counts.get("canceled", 0))
 
     fill_rate_count = (filled_orders / total_orders) if total_orders else 0.0
     fill_rate_notional = (filled_notional / planned_notional) if planned_notional > 0 else 0.0
@@ -181,6 +297,9 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "filled": filled_orders,
             "canceled": canceled_orders,
             "other": other_orders,
+            "raw_record_count": raw_record_count,
+            "superseded_record_count": max(0, raw_record_count - total_orders),
+            "superseded_canceled_record_count": superseded_canceled_records,
         },
         "fill_rate_count": round(fill_rate_count, 4),
         "fill_rate_notional": round(fill_rate_notional, 4),

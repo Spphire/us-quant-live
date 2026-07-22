@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import threading
@@ -40,12 +41,36 @@ ICON_PATH = SCRIPT_DIR / "tray_icon.ico"
 SCHEDULER_SCRIPT = PROJECT_ROOT / "tools" / "daily_alpaca_scheduler.py"
 ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts" / "daily_alpaca_scheduler"
 DASHBOARD_LOG = ARTIFACTS_ROOT / "daemon" / "scheduler.out.log"
+SCHEDULER_PID_PATH = ARTIFACTS_ROOT / "daemon" / "scheduler.pid"
+LAUNCHER_LOG = ARTIFACTS_ROOT / "daemon" / "tray_launcher.log"
+LAUNCHER_PID_PATH = ARTIFACTS_ROOT / "daemon" / "tray_launcher.pid"
 
-DASHBOARD_URL = "http://127.0.0.1:8766"
-DASHBOARD_PORT = 8766
-MUTEX_NAME = "us-quant-live-tray-launcher-singleton"
+DASHBOARD_URL = "http://127.0.0.1:18076"
+DASHBOARD_PORT = 18076
+MUTEX_NAME = r"Global\us-quant-live-tray-launcher-singleton"
 # Threshold: scheduler dying before this uptime is considered a hard fail (don't auto-restart)
 EARLY_DEATH_THRESHOLD_SECONDS = 30.0
+_LOG_FP = None
+
+
+def _redirect_std_streams_to_log() -> None:
+    """Make pythonw.exe failures visible in a persistent launcher log."""
+    global _LOG_FP
+    if _LOG_FP is not None:
+        return
+    try:
+        LAUNCHER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _LOG_FP = open(LAUNCHER_LOG, "a", encoding="utf-8", buffering=1)
+        if sys.stdout is None or getattr(sys.stdout, "closed", False):
+            sys.stdout = _LOG_FP
+        if sys.stderr is None or getattr(sys.stderr, "closed", False):
+            sys.stderr = _LOG_FP
+        print(
+            f"\n=== [Launcher] log opened at {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 # === Single-instance protection (Windows named mutex) ===
@@ -66,8 +91,10 @@ class SingleInstance:
             kernel32 = ctypes.windll.kernel32
             ERROR_ALREADY_EXISTS = 183
 
-            # CreateMutex returns a handle. If mutex already exists, GetLastError == ERROR_ALREADY_EXISTS
-            self.mutex = kernel32.CreateMutexW(None, False, self.mutex_name)
+            # CreateMutex returns a handle. Request initial ownership so a fast
+            # restart cannot race two launchers through startup at the same time.
+            # If the mutex already exists, GetLastError == ERROR_ALREADY_EXISTS.
+            self.mutex = kernel32.CreateMutexW(None, True, self.mutex_name)
             last_error = kernel32.GetLastError()
 
             if last_error == ERROR_ALREADY_EXISTS:
@@ -139,6 +166,129 @@ def _is_port_in_use(host: str, port: int) -> bool:
     return False
 
 
+def _command_line_for_pid(pid: int) -> str:
+    if os.name != 'nt':
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\" "
+                    "-ErrorAction SilentlyContinue; if($p){[Console]::Write([string]$p.CommandLine)}"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.stdout or ""
+    except Exception:
+        return ""
+
+
+def _ps_single_quoted(value: str) -> str:
+    """Return a PowerShell single-quoted string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _pid_file_has_live_launcher() -> int | None:
+    try:
+        pid = int(LAUNCHER_PID_PATH.read_text(encoding="ascii").strip())
+    except Exception:
+        return None
+    if pid == os.getpid():
+        return pid
+    cmd = _command_line_for_pid(pid)
+    if not cmd:
+        return None
+    if str(PROJECT_ROOT).lower() in cmd.lower() and "tray_launcher.py" in cmd.lower():
+        return pid
+    return None
+
+
+def _running_project_launcher_pids() -> list[int]:
+    """Find other tray_launcher.py processes for this project root."""
+    if os.name != 'nt':
+        return []
+    try:
+        root_literal = _ps_single_quoted(str(PROJECT_ROOT))
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "$root = [string]" + root_literal + "; "
+                    "  $name=[string]$_.Name; "
+                    "$items = @(Get-CimInstance Win32_Process | Where-Object { "
+                    "  $name=[string]$_.Name; "
+                    "  if($name -notin @('python.exe','pythonw.exe','USQuantLive.exe')){ return $false }; "
+                    "  $cmd=[string]$_.CommandLine; "
+                    "  if(-not $cmd){ return $false }; "
+                    "  ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and "
+                    "  ($cmd.IndexOf('tray_launcher.py',[StringComparison]::OrdinalIgnoreCase) -ge 0) "
+                    "} | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine); "
+                    "$items | ConvertTo-Json -Compress"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return []
+    text = (result.stdout or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    raw_items = parsed if isinstance(parsed, list) else [parsed]
+    processes: dict[int, dict[str, int]] = {}
+    children: dict[int, list[int]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get("ProcessId"))
+            parent = int(item.get("ParentProcessId") or 0)
+        except Exception:
+            continue
+        processes[pid] = {"parent": parent}
+        children.setdefault(parent, []).append(pid)
+
+    # A Windows venv launcher often leaves a short parent process whose command
+    # line is identical to the real Python child.  Ignore the current launcher
+    # family so the first healthy instance does not mistake its own stub for a
+    # duplicate.  Independent launcher trees still remain visible here.
+    ignored: set[int] = {os.getpid()}
+    current = processes.get(os.getpid())
+    parent = current.get("parent") if current else None
+    while parent and parent in processes and parent not in ignored:
+        ignored.add(parent)
+        parent = processes.get(parent, {}).get("parent")
+    stack = list(children.get(os.getpid(), []))
+    while stack:
+        pid = stack.pop()
+        if pid in ignored:
+            continue
+        ignored.add(pid)
+        stack.extend(children.get(pid, []))
+
+    return sorted(pid for pid in processes if pid not in ignored)
+
+
+def _write_launcher_pid_file() -> None:
+    LAUNCHER_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCHER_PID_PATH.write_text(str(os.getpid()), encoding="ascii")
+
+
 # === Scheduler subprocess management ===
 class SchedulerSupervisor:
     """Manages the scheduler subprocess and its lifecycle.
@@ -156,6 +306,7 @@ class SchedulerSupervisor:
 
     def __init__(self):
         self.process: subprocess.Popen | None = None
+        self.attached_pid: int | None = None
         self.log_fp = None  # Open log file handle; must be closed on stop
         self.lock = threading.Lock()
         self.should_run = True
@@ -165,25 +316,72 @@ class SchedulerSupervisor:
 
     def _resolve_python_exe(self) -> str | None:
         """Find the Python interpreter to launch the scheduler with."""
-        if getattr(sys, 'frozen', False):
-            # When running as PyInstaller .exe, find venv python alongside the exe
-            venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
-            if venv_python.exists():
-                return str(venv_python)
-            # Fallback: try system python
-            for candidate in ("python.exe", "python3.exe"):
-                from shutil import which
-                p = which(candidate)
-                if p:
-                    return p
+        # Always prefer console python.exe for child daemons.  When the tray is
+        # launched by pythonw.exe, reusing sys.executable can create confusing
+        # invisible child chains and makes process matching/tray binding brittle.
+        venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
+        if venv_python.exists():
+            return str(venv_python)
+        if not getattr(sys, 'frozen', False) and Path(sys.executable).name.lower() == "python.exe":
+            return sys.executable
+        for candidate in ("python.exe", "python3.exe"):
+            from shutil import which
+            p = which(candidate)
+            if p:
+                return p
+        return None
+
+    def _command_line_for_pid(self, pid: int) -> str:
+        """Return a process command line for pid, or empty string if unavailable."""
+        if os.name != 'nt':
+            return ""
+        try:
+            script = (
+                f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\" "
+                "-ErrorAction SilentlyContinue; "
+                "if ($p) { [Console]::Write([string]$p.CommandLine) }"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return result.stdout or ""
+        except Exception:
+            return ""
+
+    def _scheduler_pid_from_file(self) -> int | None:
+        """Read and validate the scheduler pid file used by the PowerShell launcher."""
+        try:
+            raw = SCHEDULER_PID_PATH.read_text(encoding="ascii").strip()
+            pid = int(raw)
+        except Exception:
             return None
-        return sys.executable
+
+        cmd = self._command_line_for_pid(pid)
+        if not cmd:
+            return None
+        scheduler_needle = str(SCHEDULER_SCRIPT)
+        project_needle = str(PROJECT_ROOT)
+        if (
+            scheduler_needle.lower() in cmd.lower()
+            and project_needle.lower() in cmd.lower()
+        ):
+            return pid
+        return None
 
     def snapshot(self) -> tuple[bool, int | None]:
         """Thread-safe snapshot of running state and PID. Returns (running, pid_or_None)."""
         with self.lock:
             if self.process is not None and self.process.poll() is None:
                 return True, self.process.pid
+            if self.attached_pid is not None:
+                pid = self._scheduler_pid_from_file()
+                if pid == self.attached_pid:
+                    return True, self.attached_pid
+                self.attached_pid = None
             return False, None
 
     def start(self) -> bool:
@@ -200,6 +398,12 @@ class SchedulerSupervisor:
 
             if self.process is not None and self.process.poll() is None:
                 print("[Launcher] scheduler already running", flush=True)
+                return True
+
+            existing_pid = self._scheduler_pid_from_file()
+            if existing_pid is not None:
+                self.attached_pid = existing_pid
+                print(f"[Launcher] attached to existing scheduler (PID {existing_pid})", flush=True)
                 return True
 
             python_exe = self._resolve_python_exe()
@@ -222,6 +426,11 @@ class SchedulerSupervisor:
 
             # Check if dashboard port is already in use (often = stale scheduler from prior run)
             if _is_port_in_use("127.0.0.1", DASHBOARD_PORT):
+                existing_pid = self._scheduler_pid_from_file()
+                if existing_pid is not None:
+                    self.attached_pid = existing_pid
+                    print(f"[Launcher] attached to existing scheduler (PID {existing_pid})", flush=True)
+                    return True
                 show_notification(
                     "US Quant Live - Port In Use",
                     f"Port {DASHBOARD_PORT} is already in use.\n\n"
@@ -267,6 +476,7 @@ class SchedulerSupervisor:
                     cwd=str(PROJECT_ROOT),
                     creationflags=creationflags,
                 )
+                self.attached_pid = None
                 self.start_time = time.time()
                 print(f"[Launcher] scheduler started (PID {self.process.pid})", flush=True)
                 return True
@@ -319,11 +529,23 @@ class SchedulerSupervisor:
         with self.lock:
             self.should_run = False
             proc = self.process
+            attached_pid = self.attached_pid
             log_fp = self.log_fp
             self.process = None
+            self.attached_pid = None
             self.log_fp = None
 
         if proc is None:
+            if attached_pid is not None:
+                print(
+                    f"[Launcher] stopping attached scheduler tree (PID {attached_pid})",
+                    flush=True,
+                )
+                self._kill_process_tree(attached_pid, timeout=timeout)
+                try:
+                    SCHEDULER_PID_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
             # Nothing to terminate, but still close any orphan log handle
             if log_fp is not None:
                 try:
@@ -389,7 +611,11 @@ class SchedulerSupervisor:
     def is_running(self) -> bool:
         """Check if scheduler is currently running."""
         with self.lock:
-            return self.process is not None and self.process.poll() is None
+            if self.process is not None and self.process.poll() is None:
+                return True
+            if self.attached_pid is not None:
+                return self._scheduler_pid_from_file() == self.attached_pid
+            return False
 
     def monitor_loop(self) -> None:
         """Background thread: restart scheduler if it dies unexpectedly.
@@ -415,6 +641,15 @@ class SchedulerSupervisor:
                         # Wait for manual restart to clear the suppression flag
                         # (restart() sets should_run back to True; that's our signal)
                         continue
+                    if self.attached_pid is not None:
+                        pid = self._scheduler_pid_from_file()
+                        if pid == self.attached_pid:
+                            continue
+                        print(
+                            f"[Launcher] detached scheduler missing (PID {self.attached_pid})",
+                            flush=True,
+                        )
+                        self.attached_pid = None
                     if self.process is None:
                         continue
                     exit_code = self.process.poll()
@@ -551,11 +786,13 @@ def make_menu(supervisor: SchedulerSupervisor, on_exit_callback) -> pystray.Menu
 
 # === Main ===
 def main():
+    _redirect_std_streams_to_log()
     print(f"[Launcher] US Quant Live Tray Launcher starting...", flush=True)
     print(f"[Launcher] PROJECT_ROOT: {PROJECT_ROOT}", flush=True)
     print(f"[Launcher] ICON: {ICON_PATH}", flush=True)
 
-    # Single instance check
+    # Single instance check.  Acquire the kernel mutex before touching the pid
+    # file so a second launcher cannot overwrite the live launcher's pid.
     singleton = SingleInstance(MUTEX_NAME)
     if not singleton.acquire():
         show_notification(
@@ -563,6 +800,18 @@ def main():
             "Launcher is already running.\nCheck system tray for the icon (bottom-right).",
         )
         return 1
+
+    live_pid = _pid_file_has_live_launcher()
+    if live_pid is not None:
+        print(f"[Launcher] another launcher already running from pid file (PID {live_pid}); exiting", flush=True)
+        singleton.release()
+        return 1
+    other_pids = _running_project_launcher_pids()
+    if other_pids:
+        print(f"[Launcher] another launcher already running from process scan (PID {other_pids[0]}); exiting", flush=True)
+        singleton.release()
+        return 1
+    _write_launcher_pid_file()
 
     supervisor: SchedulerSupervisor | None = None
     try:
@@ -660,6 +909,11 @@ def main():
                 supervisor.stop()
             except Exception:
                 pass
+        try:
+            if _pid_file_has_live_launcher() == os.getpid():
+                LAUNCHER_PID_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
         singleton.release()
         print("[Launcher] exited", flush=True)
 

@@ -37,7 +37,7 @@ python tools/build_exe.py
 
 启动器会：
 - ✅ 自动启动 scheduler 守护进程
-- ✅ 自动启动 dashboard（http://127.0.0.1:8766）
+- ✅ 自动启动 dashboard（http://127.0.0.1:18076）
 - ✅ 在系统托盘显示 K 线图标，右键菜单可访问所有功能
 - ✅ 单例保护（不会重复启动）
 - ✅ 自动监督（scheduler 崩溃时自动重启）

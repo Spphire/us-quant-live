@@ -3,7 +3,7 @@ param(
     [string]$ProjectRoot = "",
     [string]$AccountsJsonPath = "",
     [string]$AccountName = "ALPACA_US_FULL",
-    [string]$DecisionTimeCn = "12:00",
+    [string]$DecisionTimeCn = "12:30",
     [string]$ExecuteTimeCn = "22:00",
     [string]$TargetNyTime = "10:00",
     [ValidateSet("alpaca_calendar", "weekday", "always")]

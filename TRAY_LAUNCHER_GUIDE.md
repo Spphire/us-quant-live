@@ -31,7 +31,7 @@ python tools/tray_launcher.py
 1. **K 线图标**出现在 Windows 系统托盘（右下角）
 2. **弹窗通知**显示 "US Quant Live - Started"
 3. **scheduler 后台运行**（每日 12:00/22:00 北京时间自动触发）
-4. **dashboard** 自动启动在 `http://127.0.0.1:8766`
+4. **dashboard** 自动启动在 `http://127.0.0.1:18076`
 
 ### 方法 2：构建独立 .exe（推荐用于生产）
 
@@ -53,7 +53,7 @@ python tools/build_exe.py
 
 | 菜单项 | 功能 |
 |--------|------|
-| 📊 **Open Dashboard** | 浏览器打开 http://127.0.0.1:8766 |
+| 📊 **Open Dashboard** | 浏览器打开 http://127.0.0.1:18076 |
 | 📁 **Open Log Folder** | 资源管理器打开日志目录 |
 | 📄 **Open Latest Log** | 用默认程序打开 scheduler.out.log |
 | ℹ️ **Status** | 显示当前 scheduler PID、运行状态、dashboard URL |
@@ -93,7 +93,7 @@ python tools/build_exe.py
 ```
 USQuantLive.exe (托盘启动器)
 └── python.exe (daily_alpaca_scheduler.py)
-    ├── python.exe (dashboard_server.py)      ← HTTP 服务在 :8766
+    ├── python.exe (dashboard_server.py)      ← HTTP 服务在 :18076
     └── python.exe (alpaca_executor.py)        ← 12:00/22:00 触发时启动
 ```
 
@@ -146,7 +146,7 @@ pip install -r requirements.txt  # 或手动安装 pandas numpy scipy requests p
 
 **原因**：scheduler 启动后 30 秒内崩溃，通常是：
 - Alpaca API key 配置错误（检查 `configs/alpaca_acounts/alpaca_accounts.local.json`）
-- 端口 8766 被占用（已有其他程序）
+- 端口 18076 被占用（已有其他程序）
 - Python 依赖缺失
 
 **解决**：查看 `scheduler.out.log` 详细错误，修复后右键托盘图标 → Restart Scheduler。
@@ -230,7 +230,7 @@ python tools/test_tray_launcher.py
 
 1. 启动 launcher：`python tools/tray_launcher.py`
 2. 等待 ~20 秒
-3. 访问 http://127.0.0.1:8766 应返回 200
+3. 访问 http://127.0.0.1:18076 应返回 200
 4. 再次启动 launcher，应被 mutex 阻止
 5. 右键托盘图标 → Exit
 6. 验证 dashboard 不再可访问
@@ -280,5 +280,5 @@ python tools/test_tray_launcher.py
 ---
 
 **完成时间**：2026-06-27
-**Dashboard URL**：http://127.0.0.1:8766
+**Dashboard URL**：http://127.0.0.1:18076
 **项目根目录**：W:\实验室项目\us-quant-live
