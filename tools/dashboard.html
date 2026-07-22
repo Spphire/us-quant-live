@@ -892,10 +892,6 @@
             return `<span class="badge ${badgeClass(token)}">${escapeHTML(token)}</span>`;
         }
 
-        function jsString(value) {
-            return JSON.stringify(String(value ?? ''));
-        }
-
         function historyDateKey(row) {
             const raw = String(row?.session_date || row?.decision_date || row?.run_dir || '').trim();
             const compact = raw.match(/\d{8}/)?.[0];
@@ -2219,7 +2215,7 @@
                                 <th>${t('thActions')}</th>
                             </tr>
                         </thead>
-                        <tbody>${orderedHistory.map(h => {
+                        <tbody>${orderedHistory.map((h, historyIndex) => {
                             const runStatusBadge = h.ok ? 'success' : 'error';
                             const submitted = h.submitted ? t('yes') : t('no');
                             return `<tr>
@@ -2236,7 +2232,7 @@
                                 <td>${statusBadge(h.run_failure_status || 'unknown')}<div class="timeline-sub">${escapeHTML(h.run_failure_class || '')}</div></td>
                                 <td>${formatWeightError(h.strategy_to_actual_weight_error_l1 ?? h.audit?.strategy_to_actual_weight_error_l1)}</td>
                                 <td>${formatCurrency(h.account_equity_post_trade || 0)}</td>
-                                <td><button class="btn secondary" onclick="showHistoryDetail(${jsString(h.run_dir)})">${t('btnDetails')}</button></td>
+                                <td><button class="btn secondary" onclick="showHistoryDetail(${historyIndex})">${t('btnDetails')}</button></td>
                             </tr>`;
                         }).join('')}</tbody>
                     </table>
@@ -2246,9 +2242,10 @@
             window.historyData = orderedHistory;
         }
 
-        function showHistoryDetail(runDir) {
-            const item = window.historyData.find(h => h.run_dir === runDir);
+        function showHistoryDetail(historyIndex) {
+            const item = window.historyData[Number(historyIndex)];
             if (!item) return;
+            const runDir = item.run_dir || '';
             const audit = item.audit || {};
             const body = `
                 <div class="audit-grid" style="margin-bottom:1rem;">
