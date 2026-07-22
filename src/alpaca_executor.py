@@ -15,6 +15,7 @@ import time
 import traceback
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -219,14 +220,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--marketable-limit-requote-steps-bps",
-        default="0,10,20",
-        help="Additional bps steps for re-quote attempts, comma-separated.",
+        default="0,25,75,150",
+        help="Additional bps ladder for bounded re-quote attempts, comma-separated.",
     )
     parser.add_argument(
         "--marketable-limit-requote-wait-seconds",
         type=float,
-        default=20.0,
+        default=6.0,
         help="How long to wait each limit attempt before cancel/requote.",
+    )
+    parser.add_argument(
+        "--marketable-limit-max-attempts",
+        type=int,
+        default=4,
+        help="Maximum distinct marketable-limit submissions per symbol.",
+    )
+    parser.add_argument(
+        "--execution-workers",
+        type=int,
+        default=6,
+        help="Maximum symbols submitted and tracked concurrently within each execution stage.",
     )
     parser.add_argument(
         "--marketable-limit-max-offset-bps",
@@ -841,6 +854,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--short-buying-power-adverse-offset-bps must be non-negative.")
         if marketable_limit_max_offset_bps < 0:
             raise ValueError("--marketable-limit-max-offset-bps must be non-negative.")
+        if int(args.marketable_limit_max_attempts) < 1:
+            raise ValueError("--marketable-limit-max-attempts must be at least 1.")
+        if int(args.execution_workers) < 1:
+            raise ValueError("--execution-workers must be at least 1.")
         if float(args.min_trade_notional) < 0:
             raise ValueError("--min-trade-notional must be non-negative.")
         if float(args.min_trade_weight_bps) < 0:
@@ -1098,6 +1115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "qty_decimals": int(args.qty_decimals),
                     "marketable_limit_requote_steps_bps": marketable_limit_requote_steps_bps,
                     "marketable_limit_requote_wait_seconds": float(args.marketable_limit_requote_wait_seconds),
+                    "marketable_limit_max_attempts": int(args.marketable_limit_max_attempts),
+                    "execution_workers": int(args.execution_workers),
                     "decision_status": decision_status,
                     "decision_skip_reason": decision_skip_reason,
                     "decision_diagnostics": decision_diagnostics,
@@ -1233,6 +1252,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     marketable_limit_max_offset_bps=float(marketable_limit_max_offset_bps),
                     marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
                     marketable_limit_requote_wait_seconds=float(args.marketable_limit_requote_wait_seconds),
+                    marketable_limit_max_attempts=int(args.marketable_limit_max_attempts),
+                    execution_workers=int(args.execution_workers),
                     release_max_rounds=int(args.staged_release_max_rounds),
                     release_round_extra_bps=float(args.staged_release_round_extra_bps),
                     release_round_sleep_seconds=float(args.staged_release_round_sleep_seconds),
@@ -1266,6 +1287,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     marketable_limit_max_offset_bps=float(marketable_limit_max_offset_bps),
                     marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
                     marketable_limit_requote_wait_seconds=float(args.marketable_limit_requote_wait_seconds),
+                    marketable_limit_max_attempts=int(args.marketable_limit_max_attempts),
+                    max_workers=int(args.execution_workers),
+                    execution_price_feed=str(args.execution_price_feed),
                 )
             submit_error_records = [
                 record for record in execution_records if str(record.get("status_latest") or "").lower() == "submit_error"
@@ -1520,6 +1544,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adverse_price_offset_bps": float(adverse_price_offset_bps),
             "marketable_limit_base_offset_bps": float(marketable_limit_base_offset_bps),
             "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
+            "marketable_limit_requote_steps_bps": marketable_limit_requote_steps_bps,
+            "marketable_limit_requote_wait_seconds": float(
+                args.marketable_limit_requote_wait_seconds
+            ),
+            "marketable_limit_max_attempts": int(args.marketable_limit_max_attempts),
+            "execution_workers": int(args.execution_workers),
             "sizing_adverse_offset_bps": float(sizing_adverse_offset_bps),
             "short_buying_power_adverse_offset_bps": float(short_buying_power_adverse_offset_bps),
             "min_trade_notional": float(effective_min_trade_notional),
@@ -3037,7 +3067,6 @@ def _collect_portfolio_history_snapshot(
     return _safe_broker_call(
         f"get_portfolio_history_{label}",
         lambda: client.get_portfolio_history(
-            period="1D",
             timeframe="1Min",
             intraday_reporting="market_hours",
             pnl_reset="no_reset",
@@ -3148,6 +3177,83 @@ def _collect_intraday_bars_snapshot(
     }
 
 
+def _marketable_offset_ladder(
+    *,
+    base_offset_bps: float,
+    max_offset_bps: float,
+    requote_steps_bps: Sequence[float],
+    max_attempts: int,
+) -> list[float]:
+    base = max(0.0, float(base_offset_bps))
+    cap = max(0.0, float(max_offset_bps))
+    offsets: list[float] = []
+    for step in sorted({max(0.0, float(value)) for value in requote_steps_bps} or {0.0}):
+        value = base + step
+        if cap > 0.0:
+            value = min(value, cap)
+        if not offsets or abs(value - offsets[-1]) > 1e-9:
+            offsets.append(float(value))
+    if cap > 0.0 and (not offsets or offsets[-1] < cap - 1e-9):
+        offsets.append(float(cap))
+    return offsets[: max(1, int(max_attempts))]
+
+
+def _live_marketable_reference_price(
+    *,
+    client: AlpacaHttpClient,
+    instruction: OrderInstruction,
+    execution_price_feed: str,
+) -> tuple[float, str, dict[str, Any] | None, str | None]:
+    fallback = max(float(instruction.reference_price), 1e-9)
+    try:
+        quotes = client.get_latest_quotes(
+            symbols=[str(instruction.symbol)],
+            feed=str(execution_price_feed),
+        )
+        quote = quotes.get(str(instruction.symbol).upper(), {})
+        field = "ap" if str(instruction.side).lower() == "buy" else "bp"
+        live_price = _safe_float(quote.get(field)) if isinstance(quote, Mapping) else None
+        if live_price is not None and live_price > EPS:
+            return float(live_price), f"latest_quote.{field}", dict(quote), None
+        return fallback, "instruction_reference_fallback", dict(quote), f"missing_positive_{field}"
+    except Exception as exc:
+        return fallback, "instruction_reference_fallback", None, f"{type(exc).__name__}: {exc}"
+
+
+def _order_batch_summary(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    requested_workers: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    status_counts = Counter(str(item.get("status_latest") or "unknown") for item in records)
+    work_seconds = sum(max(0.0, float(item.get("order_wall_time_seconds") or 0.0)) for item in records)
+    return {
+        "record_count": int(len(records)),
+        "requested_workers": int(max(1, requested_workers)),
+        "effective_workers": int(min(max(1, requested_workers), max(1, len(records)))) if records else 0,
+        "elapsed_seconds": float(max(0.0, elapsed_seconds)),
+        "aggregate_order_work_seconds": float(work_seconds),
+        "parallel_speedup_ratio": (
+            float(work_seconds / elapsed_seconds) if elapsed_seconds > EPS else None
+        ),
+        "max_queue_wait_ms": float(
+            max((float(item.get("queue_wait_ms") or 0.0) for item in records), default=0.0)
+        ),
+        "max_order_wall_time_seconds": float(
+            max((float(item.get("order_wall_time_seconds") or 0.0) for item in records), default=0.0)
+        ),
+        "attempt_count": int(sum(int(item.get("attempt_count") or 0) for item in records)),
+        "filled_record_count": int(
+            sum(float(item.get("filled_qty") or 0.0) > EPS for item in records)
+        ),
+        "unfilled_record_count": int(
+            sum(float(item.get("remaining_qty") or 0.0) > EPS for item in records)
+        ),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
+
+
 def _submit_and_track_orders(
     *,
     client: AlpacaHttpClient,
@@ -3160,9 +3266,69 @@ def _submit_and_track_orders(
     marketable_limit_max_offset_bps: float,
     marketable_limit_requote_steps_bps: Sequence[float],
     marketable_limit_requote_wait_seconds: float,
+    marketable_limit_max_attempts: int = 4,
+    max_workers: int = 1,
+    execution_price_feed: str = "iex",
 ) -> list[dict[str, Any]]:
+    instruction_list = list(instructions)
+    requested_workers = max(1, int(max_workers))
+    effective_workers = min(requested_workers, max(1, len(instruction_list)))
+    batch_started_at_utc = _utc_now()
+    batch_started_monotonic = time.monotonic()
+
+    if len(instruction_list) > 1 and effective_workers > 1:
+        indexed_records: dict[int, dict[str, Any]] = {}
+
+        def run_one(index: int, instruction: OrderInstruction) -> tuple[int, dict[str, Any]]:
+            worker_started = time.monotonic()
+            child_records = _submit_and_track_orders(
+                client=client,
+                instructions=[instruction],
+                session_token=f"{session_token}_i{index:03d}",
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+                execution_order_style=execution_order_style,
+                marketable_limit_base_offset_bps=marketable_limit_base_offset_bps,
+                marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
+                marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
+                marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
+                marketable_limit_max_attempts=marketable_limit_max_attempts,
+                max_workers=1,
+                execution_price_feed=execution_price_feed,
+            )
+            record = dict(child_records[0])
+            record.update(
+                {
+                    "instruction_index": int(index),
+                    "batch_instruction_count": int(len(instruction_list)),
+                    "batch_requested_workers": int(requested_workers),
+                    "batch_effective_workers": int(effective_workers),
+                    "batch_started_at_utc": batch_started_at_utc,
+                    "queue_wait_ms": round(
+                        (worker_started - batch_started_monotonic) * 1000.0,
+                        3,
+                    ),
+                    "order_wall_time_seconds": float(time.monotonic() - worker_started),
+                }
+            )
+            return index, record
+
+        with ThreadPoolExecutor(
+            max_workers=effective_workers,
+            thread_name_prefix="alpaca-order",
+        ) as executor:
+            futures = {
+                executor.submit(run_one, index, instruction): index
+                for index, instruction in enumerate(instruction_list, start=1)
+            }
+            for future in as_completed(futures):
+                index, record = future.result()
+                indexed_records[index] = record
+        return [indexed_records[index] for index in sorted(indexed_records)]
+
     records: list[dict[str, Any]] = []
-    for idx, item in enumerate(instructions, start=1):
+    for idx, item in enumerate(instruction_list, start=1):
+        order_started_monotonic = time.monotonic()
         base_record = {
             "symbol": item.symbol,
             "side": item.side,
@@ -3170,6 +3336,13 @@ def _submit_and_track_orders(
             "delta_notional": float(item.delta_notional),
             "reference_price": float(item.reference_price),
             "submitted_at_utc": _utc_now(),
+            "instruction_index": int(idx),
+            "batch_instruction_count": int(len(instruction_list)),
+            "batch_requested_workers": int(requested_workers),
+            "batch_effective_workers": int(effective_workers),
+            "batch_started_at_utc": batch_started_at_utc,
+            "queue_wait_ms": 0.0,
+            "marketable_limit_max_attempts": int(max(1, marketable_limit_max_attempts)),
         }
         try:
             if str(execution_order_style) == "market":
@@ -3215,6 +3388,9 @@ def _submit_and_track_orders(
                     "poll_events": poll_events,
                     "placed_order_raw": placed_order,
                     "latest_order_raw": latest_order,
+                    "order_wall_time_seconds": float(
+                        time.monotonic() - order_started_monotonic
+                    ),
                 }
                 records.append(record)
                 continue
@@ -3226,32 +3402,39 @@ def _submit_and_track_orders(
             latest_filled_avg_price: float | None = None
             latest_updated_at = ""
             global_deadline = time.monotonic() + max(1.0, float(timeout_seconds))
-            requote_steps = [max(0.0, float(step)) for step in marketable_limit_requote_steps_bps] or [0.0]
-            cycle_increment_bps = max(requote_steps) if requote_steps else 0.0
             max_offset_bps = max(0.0, float(marketable_limit_max_offset_bps))
+            offset_ladder = _marketable_offset_ladder(
+                base_offset_bps=float(marketable_limit_base_offset_bps),
+                max_offset_bps=float(max_offset_bps),
+                requote_steps_bps=marketable_limit_requote_steps_bps,
+                max_attempts=int(marketable_limit_max_attempts),
+            )
 
             attempt_no = 0
-            while remaining_qty > EPS and time.monotonic() < global_deadline:
+            while (
+                remaining_qty > EPS
+                and time.monotonic() < global_deadline
+                and attempt_no < len(offset_ladder)
+            ):
                 attempt_no += 1
-                step_index = (attempt_no - 1) % len(requote_steps)
-                cycle_no = (attempt_no - 1) // len(requote_steps)
-                step_bps = requote_steps[step_index]
+                step_index = attempt_no - 1
+                cycle_no = 0
                 if remaining_qty <= EPS:
                     break
                 if time.monotonic() >= global_deadline:
                     break
 
-                total_offset_bps = max(
-                    0.0,
-                    float(marketable_limit_base_offset_bps)
-                    + float(step_bps)
-                    + (float(cycle_increment_bps) * float(cycle_no)),
+                total_offset_bps = float(offset_ladder[step_index])
+                live_reference_price, reference_source, live_quote, quote_error = (
+                    _live_marketable_reference_price(
+                        client=client,
+                        instruction=item,
+                        execution_price_feed=execution_price_feed,
+                    )
                 )
-                if max_offset_bps > 0:
-                    total_offset_bps = min(float(total_offset_bps), float(max_offset_bps))
                 limit_price = _marketable_limit_price(
                     side=item.side,
-                    reference_price=item.reference_price,
+                    reference_price=live_reference_price,
                     offset_bps=total_offset_bps,
                 )
                 client_order_id = _client_order_id(
@@ -3290,6 +3473,9 @@ def _submit_and_track_orders(
                         "global_seconds_to_deadline": round(float(global_deadline - time.monotonic()), 3),
                         "poll_seconds": float(poll_seconds),
                         "max_offset_bps": float(max_offset_bps),
+                        "live_reference_price": float(live_reference_price),
+                        "reference_price_source": str(reference_source),
+                        "quote_refresh_error": quote_error,
                     },
                 )
                 if order_id:
@@ -3357,6 +3543,11 @@ def _submit_and_track_orders(
                         ),
                         "limit_price": float(limit_price),
                         "offset_bps": float(total_offset_bps),
+                        "max_offset_bps": float(max_offset_bps),
+                        "live_reference_price": float(live_reference_price),
+                        "reference_price_source": str(reference_source),
+                        "live_quote": live_quote,
+                        "quote_refresh_error": quote_error,
                         "status_latest": latest_status,
                         "filled_qty": float(filled_qty_this_attempt),
                         "filled_avg_price": latest_filled_avg_price,
@@ -3379,8 +3570,10 @@ def _submit_and_track_orders(
                 "filled_avg_price": latest_filled_avg_price,
                 "updated_at": latest_updated_at,
                 "attempt_count": int(len(attempts)),
+                "offset_ladder_bps": [float(value) for value in offset_ladder],
                 "attempts": attempts,
             }
+            record["order_wall_time_seconds"] = float(time.monotonic() - order_started_monotonic)
             records.append(record)
         except AlpacaRequestError as exc:
             error_payload = _alpaca_error_payload(exc)
@@ -3407,11 +3600,17 @@ def _submit_and_track_orders(
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "abort_remaining_orders": abort_remaining,
+                    "order_wall_time_seconds": float(time.monotonic() - order_started_monotonic),
                 }
             )
             if abort_remaining:
                 break
 
+    for record in records:
+        record.setdefault(
+            "order_wall_time_seconds",
+            float(time.monotonic() - order_started_monotonic),
+        )
     return records
 
 
@@ -3457,6 +3656,8 @@ def _submit_staged_regt_orders(
     marketable_limit_max_offset_bps: float,
     marketable_limit_requote_steps_bps: Sequence[float],
     marketable_limit_requote_wait_seconds: float,
+    marketable_limit_max_attempts: int,
+    execution_workers: int,
     release_max_rounds: int,
     release_round_extra_bps: float,
     release_round_sleep_seconds: float,
@@ -3474,6 +3675,8 @@ def _submit_staged_regt_orders(
         "release_buy_to_cover_count": int(len(release_buy_to_cover)),
         "release_max_rounds": int(max(1, release_max_rounds)),
         "release_round_extra_bps": float(max(0.0, release_round_extra_bps)),
+        "execution_workers": int(max(1, execution_workers)),
+        "marketable_limit_max_attempts": int(max(1, marketable_limit_max_attempts)),
         "release_records": 0,
         "release_substages": [],
         "release_fully_filled": True,
@@ -3505,6 +3708,7 @@ def _submit_staged_regt_orders(
                 break
             round_offset_bps = float(marketable_limit_base_offset_bps) + max(0.0, float(release_round_extra_bps)) * float(round_no - 1)
             round_input_instructions = list(current_stage_instructions)
+            release_batch_started = time.monotonic()
             release_records = _submit_and_track_orders(
                 client=client,
                 instructions=round_input_instructions,
@@ -3516,6 +3720,14 @@ def _submit_staged_regt_orders(
                 marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
                 marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
                 marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
+                marketable_limit_max_attempts=int(marketable_limit_max_attempts),
+                max_workers=int(execution_workers),
+                execution_price_feed=str(execution_price_feed),
+            )
+            release_batch_summary = _order_batch_summary(
+                release_records,
+                requested_workers=int(execution_workers),
+                elapsed_seconds=float(time.monotonic() - release_batch_started),
             )
             for record in release_records:
                 record["stage"] = stage_name
@@ -3583,6 +3795,9 @@ def _submit_staged_regt_orders(
                         float(value) for value in marketable_limit_requote_steps_bps
                     ],
                     "marketable_limit_requote_wait_seconds": float(marketable_limit_requote_wait_seconds),
+                    "marketable_limit_max_attempts": int(marketable_limit_max_attempts),
+                    "execution_workers": int(execution_workers),
+                    "execution_batch_summary": release_batch_summary,
                     "input_instructions": _instruction_payloads(round_input_instructions),
                     "submitted_records": release_records,
                     "refreshed_positions_raw": _raw_dict_list(refreshed_substage_positions),
@@ -3621,6 +3836,7 @@ def _submit_staged_regt_orders(
                     "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
                     "buying_power_after_stage": float(refreshed_substage_buying_power),
                     "buying_power_source": str(refreshed_substage_buying_power_source),
+                    "execution_batch_summary": release_batch_summary,
                 }
             )
             if round_fully_filled:
@@ -3790,6 +4006,7 @@ def _submit_staged_regt_orders(
     snapshots.append(entry_snapshot)
 
     if entry_instructions:
+        entry_batch_started = time.monotonic()
         entry_records = _submit_and_track_orders(
             client=client,
             instructions=entry_instructions,
@@ -3801,13 +4018,23 @@ def _submit_staged_regt_orders(
             marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
             marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
             marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
+            marketable_limit_max_attempts=int(marketable_limit_max_attempts),
+            max_workers=int(execution_workers),
+            execution_price_feed=str(execution_price_feed),
+        )
+        entry_batch_summary = _order_batch_summary(
+            entry_records,
+            requested_workers=int(execution_workers),
+            elapsed_seconds=float(time.monotonic() - entry_batch_started),
         )
         for record in entry_records:
             record["stage"] = "entry"
         records.extend(entry_records)
         diagnostics["entry_records"] = int(len(entry_records))
+        diagnostics["entry_execution_batch_summary"] = entry_batch_summary
         entry_snapshot["submitted_records"] = entry_records
         entry_snapshot["submitted_record_count"] = int(len(entry_records))
+        entry_snapshot["execution_batch_summary"] = entry_batch_summary
     else:
         entry_snapshot["entry_submission_skipped_reason"] = "no_entry_instructions_after_rebuild_or_buying_power_cap"
         entry_snapshot["submitted_record_count"] = 0

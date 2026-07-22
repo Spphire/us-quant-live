@@ -141,6 +141,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adverse-price-offset-bps", type=float, default=12.0)
     parser.add_argument("--marketable-limit-base-offset-bps", type=float, default=None)
     parser.add_argument("--marketable-limit-max-offset-bps", type=float, default=150.0)
+    parser.add_argument("--marketable-limit-requote-steps-bps", default="0,25,75,150")
+    parser.add_argument("--marketable-limit-requote-wait-seconds", type=float, default=6.0)
+    parser.add_argument("--marketable-limit-max-attempts", type=int, default=4)
+    parser.add_argument("--execution-workers", type=int, default=6)
     parser.add_argument("--sizing-adverse-offset-bps", type=float, default=None)
     parser.add_argument("--short-buying-power-adverse-offset-bps", type=float, default=300.0)
     parser.add_argument(
@@ -155,8 +159,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-trade-weight-bps", type=float, default=1.0)
     parser.add_argument("--order-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--order-poll-seconds", type=float, default=2.0)
-    parser.add_argument("--staged-release-timeout-seconds", type=float, default=None)
-    parser.add_argument("--staged-entry-timeout-seconds", type=float, default=None)
+    parser.add_argument("--staged-release-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--staged-entry-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--cancel-open-orders-before-submit", action="store_true")
     parser.add_argument("--no-submit", action="store_true", help="Pass --no-submit to the execution phase.")
 
@@ -1254,6 +1258,18 @@ def _build_command(
     ]
     _append_optional_float(command, "--marketable-limit-base-offset-bps", args.marketable_limit_base_offset_bps)
     _append_optional_float(command, "--marketable-limit-max-offset-bps", args.marketable_limit_max_offset_bps)
+    command.extend(
+        [
+            "--marketable-limit-requote-steps-bps",
+            str(args.marketable_limit_requote_steps_bps),
+            "--marketable-limit-requote-wait-seconds",
+            _num(args.marketable_limit_requote_wait_seconds),
+            "--marketable-limit-max-attempts",
+            str(int(args.marketable_limit_max_attempts)),
+            "--execution-workers",
+            str(int(args.execution_workers)),
+        ]
+    )
     _append_optional_float(command, "--sizing-adverse-offset-bps", args.sizing_adverse_offset_bps)
     _append_optional_float(command, "--staged-release-timeout-seconds", args.staged_release_timeout_seconds)
     _append_optional_float(command, "--staged-entry-timeout-seconds", args.staged_entry_timeout_seconds)

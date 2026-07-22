@@ -266,6 +266,21 @@ def _fill_stats_by_order(fill_rows: list[dict[str, Any]]) -> dict[str, dict[str,
     return stats
 
 
+def _attempt_max_offset_bps(attempt: Mapping[str, Any]) -> float | None:
+    configured = _optional_float(attempt.get("max_offset_bps"))
+    if configured is not None:
+        return configured
+    poll_events = attempt.get("poll_events")
+    events = poll_events if isinstance(poll_events, list) else []
+    event_offsets = [
+        value
+        for event in events if isinstance(event, Mapping)
+        for value in [_optional_float(event.get("max_offset_bps"))]
+        if value is not None
+    ]
+    return max(event_offsets) if event_offsets else None
+
+
 def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fill_stats = _fill_stats_by_order(fill_rows)
     rows: list[dict[str, Any]] = []
@@ -288,6 +303,16 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
             "record_submitted_at_utc": record.get("submitted_at_utc", ""),
             "record_updated_at": record.get("updated_at", ""),
             "record_attempt_count": _safe_int(record.get("attempt_count")),
+            "instruction_index": _safe_int(record.get("instruction_index")),
+            "batch_instruction_count": _safe_int(record.get("batch_instruction_count")),
+            "batch_requested_workers": _safe_int(record.get("batch_requested_workers")),
+            "batch_effective_workers": _safe_int(record.get("batch_effective_workers")),
+            "batch_started_at_utc": record.get("batch_started_at_utc", ""),
+            "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
+            "order_wall_time_seconds": _safe_float(record.get("order_wall_time_seconds")),
+            "marketable_limit_max_attempts": _safe_int(
+                record.get("marketable_limit_max_attempts")
+            ),
         }
         attempts = record.get("attempts")
         if isinstance(attempts, list) and attempts:
@@ -307,13 +332,20 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
                         "qty_submitted": _safe_float(attempt.get("qty_submitted")),
                         "limit_price": _safe_float(attempt.get("limit_price")),
                         "offset_bps": _safe_float(attempt.get("offset_bps")),
+                        "live_reference_price": _optional_float(
+                            attempt.get("live_reference_price")
+                        ),
+                        "reference_price_source": str(
+                            attempt.get("reference_price_source") or ""
+                        ),
+                        "quote_refresh_error": str(attempt.get("quote_refresh_error") or ""),
                         "requote_step_index": _safe_int(attempt.get("requote_step_index"), default="")
                         if not _is_missing(attempt.get("requote_step_index"))
                         else "",
                         "requote_cycle": _safe_int(attempt.get("requote_cycle"), default="")
                         if not _is_missing(attempt.get("requote_cycle"))
                         else "",
-                        "max_offset_bps": _optional_float(attempt.get("max_offset_bps")),
+                        "max_offset_bps": _attempt_max_offset_bps(attempt),
                         "status_latest": str(attempt.get("status_latest") or ""),
                         "filled_qty": _safe_float(attempt.get("filled_qty")),
                         "remaining_qty_estimate": max(
@@ -1511,6 +1543,11 @@ def _build_staged_rebuild_outputs(run_dir: Path, staged_raw: dict[str, Any]) -> 
             snapshot.get("entry_skipped_orders")
         )
         cap_diag = snapshot.get("entry_buying_power_cap") if isinstance(snapshot.get("entry_buying_power_cap"), dict) else {}
+        batch_diag = (
+            snapshot.get("execution_batch_summary")
+            if isinstance(snapshot.get("execution_batch_summary"), dict)
+            else {}
+        )
         status_counts = _record_status_counts(submitted_records)
         filled_qty = sum(_safe_float(record.get("filled_qty")) for record in submitted_records)
         filled_notional = sum(
@@ -1570,6 +1607,20 @@ def _build_staged_rebuild_outputs(run_dir: Path, staged_raw: dict[str, Any]) -> 
                 "fully_filled": snapshot.get("fully_filled", ""),
                 "entry_abort_reason": snapshot.get("entry_abort_reason", ""),
                 "entry_submission_skipped_reason": snapshot.get("entry_submission_skipped_reason", ""),
+                "execution_batch_workers": _safe_int(batch_diag.get("effective_workers")),
+                "execution_batch_elapsed_seconds": _safe_float(
+                    batch_diag.get("elapsed_seconds")
+                ),
+                "execution_batch_parallel_speedup_ratio": _safe_float(
+                    batch_diag.get("parallel_speedup_ratio")
+                ),
+                "execution_batch_max_queue_wait_ms": _safe_float(
+                    batch_diag.get("max_queue_wait_ms")
+                ),
+                "execution_batch_attempt_count": _safe_int(batch_diag.get("attempt_count")),
+                "execution_batch_unfilled_count": _safe_int(
+                    batch_diag.get("unfilled_record_count")
+                ),
             }
         )
 
@@ -1593,6 +1644,17 @@ def _build_staged_rebuild_outputs(run_dir: Path, staged_raw: dict[str, Any]) -> 
         "total_rebuilt_skipped_orders": sum(_safe_int(row.get("rebuilt_skipped_count")) for row in rows),
         "total_cap_scaled_orders": sum(_safe_int(row.get("cap_scaled_count")) for row in rows),
         "total_cap_skipped_orders": sum(_safe_int(row.get("cap_skipped_count")) for row in rows),
+        "max_execution_batch_workers": max(
+            (_safe_int(row.get("execution_batch_workers")) for row in rows),
+            default=0,
+        ),
+        "total_execution_batch_elapsed_seconds": sum(
+            _safe_float(row.get("execution_batch_elapsed_seconds")) for row in rows
+        ),
+        "max_execution_batch_parallel_speedup_ratio": max(
+            (_safe_float(row.get("execution_batch_parallel_speedup_ratio")) for row in rows),
+            default=0.0,
+        ),
         "latest_final_entry_order_count": next(
             (
                 _safe_int(row.get("final_entry_order_count"))
@@ -1657,9 +1719,10 @@ def _build_execution_attribution_outputs(
             if not _is_missing(attempt.get("requote_cycle"))
         ]
         configured_max_offsets = [
-            _safe_float(attempt.get("max_offset_bps"))
+            configured
             for attempt in attempts
-            if not _is_missing(attempt.get("max_offset_bps"))
+            for configured in [_attempt_max_offset_bps(attempt)]
+            if configured is not None
         ]
         max_attempt_offset = max(attempt_offsets, default=0.0)
         max_configured_offset = max(configured_max_offsets, default=0.0)
@@ -1684,6 +1747,12 @@ def _build_execution_attribution_outputs(
                 "reference_price": _safe_float(record.get("reference_price")),
                 "remaining_notional_at_reference": record_remaining_qty * _safe_float(record.get("reference_price")),
                 "record_delta_notional": _safe_float(record.get("delta_notional")),
+                "batch_effective_workers": _safe_int(record.get("batch_effective_workers")),
+                "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
+                "order_wall_time_seconds": _safe_float(record.get("order_wall_time_seconds")),
+                "marketable_limit_max_attempts": _safe_int(
+                    record.get("marketable_limit_max_attempts")
+                ),
             }
         )
         for attempt_index, attempt in enumerate(attempts, start=1):
@@ -1737,13 +1806,31 @@ def _build_execution_attribution_outputs(
                     "limit_price": limit_price,
                     "limit_aggressiveness_bps": limit_aggressiveness_bps,
                     "attempt_offset_bps": _safe_float(attempt.get("offset_bps")),
+                    "live_reference_price": _optional_float(
+                        attempt.get("live_reference_price")
+                    ),
+                    "reference_price_source": str(
+                        attempt.get("reference_price_source") or ""
+                    ),
+                    "quote_refresh_error": str(attempt.get("quote_refresh_error") or ""),
+                    "instruction_index": _safe_int(record.get("instruction_index")),
+                    "batch_instruction_count": _safe_int(
+                        record.get("batch_instruction_count")
+                    ),
+                    "batch_effective_workers": _safe_int(
+                        record.get("batch_effective_workers")
+                    ),
+                    "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
+                    "order_wall_time_seconds": _safe_float(
+                        record.get("order_wall_time_seconds")
+                    ),
                     "requote_step_index": _safe_int(attempt.get("requote_step_index"), default="")
                     if not _is_missing(attempt.get("requote_step_index"))
                     else "",
                     "requote_cycle": _safe_int(attempt.get("requote_cycle"), default="")
                     if not _is_missing(attempt.get("requote_cycle"))
                     else "",
-                    "max_offset_bps": _optional_float(attempt.get("max_offset_bps")),
+                    "max_offset_bps": _attempt_max_offset_bps(attempt),
                     "submitted_qty": submitted_qty,
                     "filled_qty": fill_qty,
                     "filled_avg_price": fill_price,
@@ -1842,6 +1929,28 @@ def _build_execution_attribution_outputs(
         "record_count": len(records if isinstance(records, list) else []),
         "multi_attempt_record_count": sum(1 for row in record_attempt_summaries if _safe_int(row.get("attempt_count")) > 1),
         "max_attempt_count": max((_safe_int(row.get("attempt_count")) for row in record_attempt_summaries), default=0),
+        "max_configured_attempt_count": max(
+            (_safe_int(record.get("marketable_limit_max_attempts")) for record in records),
+            default=0,
+        ),
+        "max_batch_effective_workers": max(
+            (_safe_int(record.get("batch_effective_workers")) for record in records),
+            default=0,
+        ),
+        "max_batch_queue_wait_ms": max(
+            (_safe_float(record.get("queue_wait_ms")) for record in records),
+            default=0.0,
+        ),
+        "aggregate_order_wall_time_seconds": sum(
+            _safe_float(record.get("order_wall_time_seconds")) for record in records
+        ),
+        "live_quote_attempt_count": sum(
+            str(row.get("reference_price_source") or "").startswith("latest_quote.")
+            for row in rows
+        ),
+        "quote_refresh_error_attempt_count": sum(
+            bool(str(row.get("quote_refresh_error") or "")) for row in rows
+        ),
         "max_attempt_offset_bps": max(attempt_offsets_all, default=0.0),
         "max_configured_offset_bps": max(configured_offsets_all, default=0.0),
         "max_requote_cycle": max(requote_cycles_all, default=0),
@@ -10692,6 +10801,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "final_entry_order_count", "rebuilt_skipped_count", "cap_scaled_count", "cap_skipped_count",
         "cap_estimated_used", "cap", "remaining_order_count", "remaining_symbols", "fully_filled",
         "entry_abort_reason", "entry_submission_skipped_reason",
+        "execution_batch_workers", "execution_batch_elapsed_seconds",
+        "execution_batch_parallel_speedup_ratio", "execution_batch_max_queue_wait_ms",
+        "execution_batch_attempt_count", "execution_batch_unfilled_count",
     ]
     _write_csv(audit_dir / "25_staged_rebuild_trace.csv", staged_rebuild_rows, staged_rebuild_fields)
     _write_json(audit_dir / "26_staged_rebuild_summary.json", staged_rebuild_summary)
@@ -10699,6 +10811,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "record_index", "attempt_index", "symbol", "side", "stage", "release_round",
         "client_order_id", "order_id", "status_latest", "outcome", "reference_price",
         "sizing_price", "limit_price", "limit_aggressiveness_bps", "attempt_offset_bps",
+        "live_reference_price", "reference_price_source", "quote_refresh_error",
+        "instruction_index", "batch_instruction_count", "batch_effective_workers",
+        "queue_wait_ms", "order_wall_time_seconds",
         "requote_step_index", "requote_cycle", "max_offset_bps", "submitted_qty", "filled_qty",
         "filled_avg_price", "broker_fill_count",
         "filled_notional_at_reference", "filled_notional_actual", "implementation_shortfall_bps",
@@ -11931,6 +12046,36 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "execution_max_attempt_count": _safe_int(exec_attr.get("max_attempt_count"))
                 if isinstance(exec_attr, dict)
                 else 0,
+                "execution_max_configured_attempt_count": _safe_int(
+                    exec_attr.get("max_configured_attempt_count")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
+                "execution_max_batch_effective_workers": _safe_int(
+                    exec_attr.get("max_batch_effective_workers")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
+                "execution_max_batch_queue_wait_ms": _safe_float(
+                    exec_attr.get("max_batch_queue_wait_ms")
+                )
+                if isinstance(exec_attr, dict)
+                else 0.0,
+                "execution_aggregate_order_wall_time_seconds": _safe_float(
+                    exec_attr.get("aggregate_order_wall_time_seconds")
+                )
+                if isinstance(exec_attr, dict)
+                else 0.0,
+                "execution_live_quote_attempt_count": _safe_int(
+                    exec_attr.get("live_quote_attempt_count")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
+                "execution_quote_refresh_error_attempt_count": _safe_int(
+                    exec_attr.get("quote_refresh_error_attempt_count")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
                 "execution_max_attempt_offset_bps": _safe_float(exec_attr.get("max_attempt_offset_bps"))
                 if isinstance(exec_attr, dict)
                 else 0.0,
@@ -12650,6 +12795,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "order_plan_count", "staged_rebuild_snapshot_count", "execution_attempt_rows",
             "fill_attempt_rows", "implementation_shortfall_bps_weighted",
             "execution_multi_attempt_records", "execution_max_attempt_count",
+            "execution_max_configured_attempt_count", "execution_max_batch_effective_workers",
+            "execution_max_batch_queue_wait_ms", "execution_aggregate_order_wall_time_seconds",
+            "execution_live_quote_attempt_count", "execution_quote_refresh_error_attempt_count",
             "execution_max_attempt_offset_bps", "execution_max_configured_offset_bps",
             "execution_records_hitting_max_offset", "execution_unfilled_records_hitting_max_offset",
             "execution_unfilled_at_max_offset_remaining_notional", "target_symbols_missing_alpha",

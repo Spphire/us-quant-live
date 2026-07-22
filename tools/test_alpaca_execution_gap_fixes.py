@@ -1,14 +1,17 @@
 """Regression tests for live Alpaca execution gap fixes.
 
-These tests do not call Alpaca. They lock in two local behaviors that directly
-affect ideal-vs-actual gaps: whole-share short order sizing and repeated
-marketable-limit requotes within the configured order timeout.
+These tests do not call Alpaca. They lock in local behaviors that directly
+affect ideal-vs-actual gaps, including short-share sizing, bounded live-quote
+requotes, stage-level concurrency, and audit propagation.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
+from datetime import date
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -17,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.alpaca_executor import (  # noqa: E402
     OrderInstruction,
     _build_order_instructions,
+    _collect_portfolio_history_snapshot,
     _effective_min_trade_notional,
     _is_insufficient_buying_power_error,
     _is_insufficient_qty_available_error,
+    _marketable_offset_ladder,
     _submit_and_track_orders,
     _total_regt_buying_power_capacity,
 )
@@ -66,6 +71,61 @@ class _NeverFillClient:
         self.cancel_count += 1
         self.orders[order_id]["status"] = "canceled"
         return {}
+
+
+class _ImmediateFillConcurrencyClient:
+    def __init__(self, submit_delay_seconds: float = 0.12) -> None:
+        self.submit_delay_seconds = float(submit_delay_seconds)
+        self.lock = threading.Lock()
+        self.active_submits = 0
+        self.max_active_submits = 0
+        self.orders: dict[str, dict[str, object]] = {}
+
+    def submit_order(self, **kwargs):
+        with self.lock:
+            self.active_submits += 1
+            self.max_active_submits = max(self.max_active_submits, self.active_submits)
+        try:
+            time.sleep(self.submit_delay_seconds)
+            order_id = str(kwargs.get("client_order_id"))
+            order = {
+                "id": order_id,
+                "client_order_id": order_id,
+                "symbol": kwargs.get("symbol"),
+                "side": kwargs.get("side"),
+                "type": kwargs.get("type"),
+                "time_in_force": kwargs.get("time_in_force"),
+                "qty": str(kwargs.get("qty")),
+                "status": "filled",
+                "filled_qty": str(kwargs.get("qty")),
+                "filled_avg_price": "100",
+            }
+            with self.lock:
+                self.orders[order_id] = dict(order)
+            return dict(order)
+        finally:
+            with self.lock:
+                self.active_submits -= 1
+
+    def get_order(self, order_id):
+        return dict(self.orders[order_id])
+
+
+class _QuoteNeverFillClient(_NeverFillClient):
+    def get_latest_quotes(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {"bp": 90.0, "ap": 91.0, "feed": str(feed)}
+            for symbol in symbols
+        }
+
+
+class _PortfolioHistoryClient:
+    def __init__(self) -> None:
+        self.kwargs = None
+
+    def get_portfolio_history(self, **kwargs):
+        self.kwargs = dict(kwargs)
+        return {"timestamp": [], "equity": []}
 
 
 def _instructions_for_case(*, target_notional: float, current_notional: float, current_qty: float, price: float):
@@ -320,6 +380,21 @@ def test_total_regt_capacity_reconstruction():
     print("  [OK] total RegT capacity uses gross position plus remaining RegT buying power")
 
 
+def test_portfolio_history_uses_explicit_range_without_period():
+    client = _PortfolioHistoryClient()
+    result = _collect_portfolio_history_snapshot(
+        client=client,
+        session_date=date(2026, 7, 22),
+        label="test",
+    )
+    assert result["ok"] is True, result
+    assert client.kwargs is not None
+    assert "period" not in client.kwargs, client.kwargs
+    assert client.kwargs["start"] == "2026-07-22T00:00:00Z"
+    assert client.kwargs["end"] == "2026-07-23T00:00:00Z"
+    print("  [OK] portfolio history avoids conflicting period plus start/end parameters")
+
+
 def test_projection_audit_prefers_staged_entry_snapshot():
     initial = {
         "solver": {"success": True},
@@ -458,6 +533,103 @@ def test_marketable_limit_requotes_until_timeout():
     print(f"  [OK] repeated requotes: attempts={len(attempts)}, offsets={offsets}")
 
 
+def test_marketable_limit_ladder_is_bounded_and_unique():
+    ladder = _marketable_offset_ladder(
+        base_offset_bps=12.0,
+        max_offset_bps=150.0,
+        requote_steps_bps=[0.0, 25.0, 75.0, 150.0],
+        max_attempts=4,
+    )
+    assert ladder == [12.0, 37.0, 87.0, 150.0], ladder
+    assert len(ladder) == len(set(ladder)) == 4
+    print(f"  [OK] bounded distinct quote ladder: {ladder}")
+
+
+def test_marketable_limit_uses_live_quote_side():
+    client = _QuoteNeverFillClient()
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=[
+            OrderInstruction(
+                symbol="X",
+                side="sell",
+                qty=1.0,
+                reference_price=100.0,
+                sizing_price=99.0,
+                current_notional=100.0,
+                target_notional=0.0,
+                delta_notional=-100.0,
+                opening_short=False,
+            )
+        ],
+        session_token="quote",
+        timeout_seconds=1.2,
+        poll_seconds=0.1,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=1,
+        execution_price_feed="iex",
+    )
+    attempt = records[0]["attempts"][0]
+    assert attempt["reference_price_source"] == "latest_quote.bp", attempt
+    assert attempt["live_reference_price"] == 90.0, attempt
+    assert attempt["limit_price"] == 89.89, attempt
+    assert attempt["max_offset_bps"] == 150.0, attempt
+    assert records[0]["attempt_count"] == 1, records[0]
+    audit_row = _build_order_attempt_rows(records, [])[0]
+    assert audit_row["live_reference_price"] == 90.0, audit_row
+    assert audit_row["reference_price_source"] == "latest_quote.bp", audit_row
+    assert audit_row["marketable_limit_max_attempts"] == 1, audit_row
+    assert audit_row["max_offset_bps"] == 150.0, audit_row
+    print("  [OK] sell limit refreshes from live bid and obeys one-attempt cap")
+
+
+def test_order_batch_runs_symbols_concurrently():
+    client = _ImmediateFillConcurrencyClient(submit_delay_seconds=0.12)
+    instructions = [
+        OrderInstruction(
+            symbol=f"X{index}",
+            side="buy",
+            qty=1.0,
+            reference_price=100.0,
+            sizing_price=101.0,
+            current_notional=0.0,
+            target_notional=100.0,
+            delta_notional=100.0,
+            opening_short=False,
+        )
+        for index in range(6)
+    ]
+    started = time.monotonic()
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=instructions,
+        session_token="parallel",
+        timeout_seconds=5.0,
+        poll_seconds=0.1,
+        execution_order_style="market",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=1,
+        max_workers=3,
+    )
+    elapsed = time.monotonic() - started
+    assert client.max_active_submits == 3, client.max_active_submits
+    assert elapsed < 0.60, elapsed
+    assert [row["symbol"] for row in records] == [f"X{index}" for index in range(6)]
+    assert all(row["batch_effective_workers"] == 3 for row in records)
+    assert max(float(row["queue_wait_ms"]) for row in records) >= 80.0
+    print(
+        f"  [OK] six symbols completed with max_concurrency={client.max_active_submits} "
+        f"elapsed={elapsed:.3f}s"
+    )
+
+
 def test_audit_keeps_requote_fields():
     records = [
         {
@@ -481,9 +653,9 @@ def test_audit_keeps_requote_fields():
                     "offset_bps": 10.0,
                     "requote_step_index": 1,
                     "requote_cycle": 1,
-                    "max_offset_bps": 50.0,
                     "status_latest": "canceled",
                     "filled_qty": 0.0,
+                    "poll_events": [{"event": "submitted", "max_offset_bps": 50.0}],
                 },
                 {
                     "attempt_no": 2,
@@ -679,11 +851,15 @@ def main() -> int:
         ("Lexicographic weight-error priority", test_projector_uses_buying_power_only_as_secondary_objective),
         ("Final gross capacity target", test_projector_enforces_final_gross_capacity_target),
         ("Total RegT capacity reconstruction", test_total_regt_capacity_reconstruction),
+        ("Portfolio-history request parameters", test_portfolio_history_uses_explicit_range_without_period),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
         ("Min-trade short carry safety", test_min_trade_short_carry_cannot_emit_residual_order),
         ("Weight-based min-trade threshold", test_min_trade_threshold_scales_with_weight_error_budget),
         ("Insufficient-qty error classification", test_insufficient_qty_error_is_not_buying_power_abort),
         ("Marketable-limit repeated requotes", test_marketable_limit_requotes_until_timeout),
+        ("Bounded marketable-limit ladder", test_marketable_limit_ladder_is_bounded_and_unique),
+        ("Live quote marketable-limit reference", test_marketable_limit_uses_live_quote_side),
+        ("Concurrent symbol execution", test_order_batch_runs_symbols_concurrently),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),
         ("Audit submit-error payload parsing", test_audit_parses_submit_error_payload),
         ("Audit not-submitted reason", test_audit_marks_not_submitted_reason),
