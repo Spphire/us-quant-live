@@ -313,6 +313,16 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
             "marketable_limit_max_attempts": _safe_int(
                 record.get("marketable_limit_max_attempts")
             ),
+            "stage_symbol_attempt_cap": _safe_int(record.get("stage_symbol_attempt_cap")),
+            "stage_symbol_attempt_count_before": _safe_int(
+                record.get("stage_symbol_attempt_count_before")
+            ),
+            "stage_symbol_attempt_count_after": _safe_int(
+                record.get("stage_symbol_attempt_count_after")
+            ),
+            "stage_symbol_attempts_remaining": _safe_int(
+                record.get("stage_symbol_attempts_remaining")
+            ),
         }
         attempts = record.get("attempts")
         if isinstance(attempts, list) and attempts:
@@ -1621,6 +1631,21 @@ def _build_staged_rebuild_outputs(run_dir: Path, staged_raw: dict[str, Any]) -> 
                 "execution_batch_unfilled_count": _safe_int(
                     batch_diag.get("unfilled_record_count")
                 ),
+                "stage_symbol_attempt_cap": _safe_int(
+                    snapshot.get("stage_symbol_attempt_cap")
+                ),
+                "stage_symbol_attempt_counts": _json_cell(
+                    snapshot.get("stage_symbol_attempt_counts")
+                ),
+                "stage_symbol_attempt_budget_before": _json_cell(
+                    snapshot.get("stage_symbol_attempt_budget_before")
+                ),
+                "stage_attempt_budget_exhausted_symbols": _json_cell(
+                    snapshot.get("stage_attempt_budget_exhausted_symbols")
+                ),
+                "attempt_budget_eligible_order_count": _safe_int(
+                    snapshot.get("attempt_budget_eligible_order_count")
+                ),
             }
         )
 
@@ -1750,9 +1775,21 @@ def _build_execution_attribution_outputs(
                 "batch_effective_workers": _safe_int(record.get("batch_effective_workers")),
                 "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
                 "order_wall_time_seconds": _safe_float(record.get("order_wall_time_seconds")),
-                "marketable_limit_max_attempts": _safe_int(
-                    record.get("marketable_limit_max_attempts")
-                ),
+                    "marketable_limit_max_attempts": _safe_int(
+                        record.get("marketable_limit_max_attempts")
+                    ),
+                    "stage_symbol_attempt_cap": _safe_int(
+                        record.get("stage_symbol_attempt_cap")
+                    ),
+                    "stage_symbol_attempt_count_before": _safe_int(
+                        record.get("stage_symbol_attempt_count_before")
+                    ),
+                    "stage_symbol_attempt_count_after": _safe_int(
+                        record.get("stage_symbol_attempt_count_after")
+                    ),
+                    "stage_symbol_attempts_remaining": _safe_int(
+                        record.get("stage_symbol_attempts_remaining")
+                    ),
             }
         )
         for attempt_index, attempt in enumerate(attempts, start=1):
@@ -1932,6 +1969,21 @@ def _build_execution_attribution_outputs(
         "max_configured_attempt_count": max(
             (_safe_int(record.get("marketable_limit_max_attempts")) for record in records),
             default=0,
+        ),
+        "max_stage_symbol_attempt_cap": max(
+            (_safe_int(record.get("stage_symbol_attempt_cap")) for record in records),
+            default=0,
+        ),
+        "max_stage_symbol_attempt_count_after": max(
+            (_safe_int(record.get("stage_symbol_attempt_count_after")) for record in records),
+            default=0,
+        ),
+        "attempt_budget_exhausted_record_count": sum(
+            _safe_int(record.get("stage_symbol_attempt_cap")) > 0
+            and _safe_int(record.get("stage_symbol_attempt_count_after"))
+            >= _safe_int(record.get("stage_symbol_attempt_cap"))
+            and _safe_float(record.get("remaining_qty")) > 0
+            for record in records
         ),
         "max_batch_effective_workers": max(
             (_safe_int(record.get("batch_effective_workers")) for record in records),
@@ -9693,6 +9745,7 @@ def _write_review(
         "\n## Execution Attempt Diagnostics\n",
         f"- Attempt rows / filled attempts / records: `{execution_attr.get('attempt_row_count')}` / `{execution_attr.get('filled_attempt_row_count')}` / `{execution_attr.get('record_count')}`\n",
         f"- Multi-attempt records: `{execution_attr.get('multi_attempt_record_count')}`; max attempt count `{execution_attr.get('max_attempt_count')}`\n",
+        f"- Stage per-symbol attempt count/cap: `{execution_attr.get('max_stage_symbol_attempt_count_after')}` / `{execution_attr.get('max_stage_symbol_attempt_cap')}`; exhausted records `{execution_attr.get('attempt_budget_exhausted_record_count')}`\n",
         f"- Max actual/configured offset bps: `{execution_attr.get('max_attempt_offset_bps')}` / `{execution_attr.get('max_configured_offset_bps')}`; max requote cycle `{execution_attr.get('max_requote_cycle')}`\n",
         f"- Records hitting max offset: `{execution_attr.get('records_hitting_max_offset_count')}`; unfilled at max offset `{execution_attr.get('unfilled_records_hitting_max_offset_count')}`; remaining notional `{execution_attr.get('unfilled_records_hitting_max_offset_remaining_notional')}`\n",
         "\n### Top Requoted Orders\n",
@@ -10756,6 +10809,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "record_client_order_id", "record_order_id", "record_status_latest", "record_qty",
         "record_filled_qty", "record_remaining_qty", "record_reference_price", "record_delta_notional",
         "record_submitted_at_utc", "record_updated_at", "record_attempt_count", "attempt_index",
+        "stage_symbol_attempt_cap", "stage_symbol_attempt_count_before",
+        "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
         "attempt_no", "attempt_client_order_id", "attempt_order_id", "qty_submitted", "limit_price",
         "offset_bps", "requote_step_index", "requote_cycle", "max_offset_bps", "status_latest",
         "filled_qty", "remaining_qty_estimate", "filled_avg_price", "updated_at", "broker_fill_count",
@@ -10804,6 +10859,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "execution_batch_workers", "execution_batch_elapsed_seconds",
         "execution_batch_parallel_speedup_ratio", "execution_batch_max_queue_wait_ms",
         "execution_batch_attempt_count", "execution_batch_unfilled_count",
+        "stage_symbol_attempt_cap", "stage_symbol_attempt_counts",
+        "stage_symbol_attempt_budget_before", "stage_attempt_budget_exhausted_symbols",
+        "attempt_budget_eligible_order_count",
     ]
     _write_csv(audit_dir / "25_staged_rebuild_trace.csv", staged_rebuild_rows, staged_rebuild_fields)
     _write_json(audit_dir / "26_staged_rebuild_summary.json", staged_rebuild_summary)
@@ -10814,6 +10872,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "live_reference_price", "reference_price_source", "quote_refresh_error",
         "instruction_index", "batch_instruction_count", "batch_effective_workers",
         "queue_wait_ms", "order_wall_time_seconds",
+        "stage_symbol_attempt_cap", "stage_symbol_attempt_count_before",
+        "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
         "requote_step_index", "requote_cycle", "max_offset_bps", "submitted_qty", "filled_qty",
         "filled_avg_price", "broker_fill_count",
         "filled_notional_at_reference", "filled_notional_actual", "implementation_shortfall_bps",
@@ -12051,6 +12111,21 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(exec_attr, dict)
                 else 0,
+                "execution_max_stage_symbol_attempt_cap": _safe_int(
+                    exec_attr.get("max_stage_symbol_attempt_cap")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
+                "execution_max_stage_symbol_attempt_count_after": _safe_int(
+                    exec_attr.get("max_stage_symbol_attempt_count_after")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
+                "execution_attempt_budget_exhausted_records": _safe_int(
+                    exec_attr.get("attempt_budget_exhausted_record_count")
+                )
+                if isinstance(exec_attr, dict)
+                else 0,
                 "execution_max_batch_effective_workers": _safe_int(
                     exec_attr.get("max_batch_effective_workers")
                 )
@@ -12795,7 +12870,10 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "order_plan_count", "staged_rebuild_snapshot_count", "execution_attempt_rows",
             "fill_attempt_rows", "implementation_shortfall_bps_weighted",
             "execution_multi_attempt_records", "execution_max_attempt_count",
-            "execution_max_configured_attempt_count", "execution_max_batch_effective_workers",
+            "execution_max_configured_attempt_count", "execution_max_stage_symbol_attempt_cap",
+            "execution_max_stage_symbol_attempt_count_after",
+            "execution_attempt_budget_exhausted_records",
+            "execution_max_batch_effective_workers",
             "execution_max_batch_queue_wait_ms", "execution_aggregate_order_wall_time_seconds",
             "execution_live_quote_attempt_count", "execution_quote_refresh_error_attempt_count",
             "execution_max_attempt_offset_bps", "execution_max_configured_offset_bps",

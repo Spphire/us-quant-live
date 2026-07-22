@@ -26,6 +26,7 @@ from src.alpaca_executor import (  # noqa: E402
     _is_insufficient_qty_available_error,
     _marketable_offset_ladder,
     _submit_and_track_orders,
+    _submit_staged_regt_orders,
     _total_regt_buying_power_capacity,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
@@ -115,6 +116,32 @@ class _QuoteNeverFillClient(_NeverFillClient):
     def get_latest_quotes(self, *, symbols, feed):
         return {
             str(symbol).upper(): {"bp": 90.0, "ap": 91.0, "feed": str(feed)}
+            for symbol in symbols
+        }
+
+
+class _StagedNeverFillClient(_QuoteNeverFillClient):
+    def list_positions(self):
+        return [
+            {
+                "symbol": "X",
+                "side": "long",
+                "qty": "10",
+                "market_value": "1000",
+                "current_price": "100",
+            }
+        ]
+
+    def get_account(self):
+        return {
+            "equity": "10000",
+            "buying_power": "19000",
+            "regt_buying_power": "19000",
+        }
+
+    def get_latest_trades(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {"p": 100.0, "feed": str(feed)}
             for symbol in symbols
         }
 
@@ -630,6 +657,119 @@ def test_order_batch_runs_symbols_concurrently():
     )
 
 
+def test_per_symbol_attempt_budget_bounds_requotes():
+    client = _QuoteNeverFillClient()
+    instructions = [
+        OrderInstruction(
+            symbol=symbol,
+            side="buy",
+            qty=1.0,
+            reference_price=100.0,
+            sizing_price=101.0,
+            current_notional=0.0,
+            target_notional=100.0,
+            delta_notional=100.0,
+            opening_short=False,
+        )
+        for symbol in ("X", "Y")
+    ]
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=instructions,
+        session_token="budget",
+        timeout_seconds=2.0,
+        poll_seconds=0.05,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0, 25.0, 75.0, 150.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=4,
+        max_workers=1,
+        execution_price_feed="iex",
+        max_attempts_by_symbol={"X": 1, "Y": 2},
+    )
+    by_symbol = {str(record["symbol"]): record for record in records}
+    assert by_symbol["X"]["attempt_count"] == 1, by_symbol["X"]
+    assert by_symbol["X"]["marketable_limit_max_attempts"] == 1, by_symbol["X"]
+    assert by_symbol["Y"]["attempt_count"] == 2, by_symbol["Y"]
+    assert by_symbol["Y"]["marketable_limit_max_attempts"] == 2, by_symbol["Y"]
+    print("  [OK] per-symbol remaining attempt budgets cap cross-round requotes")
+
+
+def test_staged_release_attempt_budget_is_global_across_rounds():
+    client = _StagedNeverFillClient()
+    snapshots: list[dict[str, object]] = []
+    records, diagnostics = _submit_staged_regt_orders(
+        client=client,
+        initial_instructions=[
+            OrderInstruction(
+                symbol="X",
+                side="sell",
+                qty=5.0,
+                reference_price=100.0,
+                sizing_price=99.0,
+                current_notional=1000.0,
+                target_notional=500.0,
+                delta_notional=-500.0,
+                opening_short=False,
+            )
+        ],
+        target_signed_weights={"X": 0.05},
+        raw_target_signed_weights={"X": 0.05},
+        assets_by_symbol={
+            "X": {
+                "symbol": "X",
+                "tradable": True,
+                "fractionable": True,
+                "shortable": True,
+            }
+        },
+        fallback_prices={"X": 100.0},
+        session_token="stage-budget",
+        execution_price_feed="iex",
+        account_equity=10000.0,
+        min_trade_notional_floor=1.0,
+        min_trade_weight_bps=0.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        buying_power_buffer=0.95,
+        gross_capacity_target_ratio=0.95,
+        short_buying_power_adverse_offset_bps=300.0,
+        release_timeout_seconds=10.0,
+        entry_timeout_seconds=1.0,
+        poll_seconds=0.01,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0, 25.0, 75.0, 150.0],
+        marketable_limit_requote_wait_seconds=0.02,
+        marketable_limit_max_attempts=4,
+        execution_workers=2,
+        release_max_rounds=3,
+        release_round_extra_bps=10.0,
+        release_round_sleep_seconds=0.0,
+        stage_snapshots=snapshots,
+    )
+    assert client.submit_count == 4, client.submit_count
+    assert len(records) == 1, records
+    assert records[0]["attempt_count"] == 4, records[0]
+    assert records[0]["stage_symbol_attempt_count_after"] == 4, records[0]
+    assert records[0]["stage_symbol_attempts_remaining"] == 0, records[0]
+    assert diagnostics["entry_aborted"] is True, diagnostics
+    assert diagnostics["entry_abort_reason"] == "release_sell_long_attempt_budget_exhausted", diagnostics
+    assert diagnostics["release_attempt_counts_by_symbol"] == {"X": 4}, diagnostics
+    assert diagnostics["release_attempt_budget_exhausted_symbols"] == ["X"], diagnostics
+    release_snapshots = [item for item in snapshots if item.get("snapshot_type") == "release_round"]
+    assert len(release_snapshots) == 1, release_snapshots
+    assert release_snapshots[0]["stage_symbol_attempt_counts"] == {"X": 4}
+    print("  [OK] three release rounds share one four-attempt per-symbol budget")
+
+
 def test_audit_keeps_requote_fields():
     records = [
         {
@@ -643,6 +783,10 @@ def test_audit_keeps_requote_fields():
             "reference_price": 100.0,
             "delta_notional": 100.0,
             "attempt_count": 2,
+            "stage_symbol_attempt_cap": 4,
+            "stage_symbol_attempt_count_before": 2,
+            "stage_symbol_attempt_count_after": 4,
+            "stage_symbol_attempts_remaining": 0,
             "attempts": [
                 {
                     "attempt_no": 1,
@@ -686,6 +830,9 @@ def test_audit_keeps_requote_fields():
     assert summary["records_hitting_max_offset_count"] == 1
     assert summary["unfilled_records_hitting_max_offset_count"] == 1
     assert summary["unfilled_records_hitting_max_offset_remaining_notional"] == 100.0
+    assert summary["max_stage_symbol_attempt_cap"] == 4
+    assert summary["max_stage_symbol_attempt_count_after"] == 4
+    assert summary["attempt_budget_exhausted_record_count"] == 1
     print("  [OK] audit preserves requote fields and max-offset summary")
 
 
@@ -860,6 +1007,8 @@ def main() -> int:
         ("Bounded marketable-limit ladder", test_marketable_limit_ladder_is_bounded_and_unique),
         ("Live quote marketable-limit reference", test_marketable_limit_uses_live_quote_side),
         ("Concurrent symbol execution", test_order_batch_runs_symbols_concurrently),
+        ("Per-symbol attempt budget", test_per_symbol_attempt_budget_bounds_requotes),
+        ("Cross-round staged attempt budget", test_staged_release_attempt_budget_is_global_across_rounds),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),
         ("Audit submit-error payload parsing", test_audit_parses_submit_error_payload),
         ("Audit not-submitted reason", test_audit_marks_not_submitted_reason),

@@ -3269,10 +3269,15 @@ def _submit_and_track_orders(
     marketable_limit_max_attempts: int = 4,
     max_workers: int = 1,
     execution_price_feed: str = "iex",
+    max_attempts_by_symbol: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     instruction_list = list(instructions)
     requested_workers = max(1, int(max_workers))
     effective_workers = min(requested_workers, max(1, len(instruction_list)))
+    symbol_attempt_limits = {
+        str(symbol).upper(): max(1, int(limit))
+        for symbol, limit in (max_attempts_by_symbol or {}).items()
+    }
     batch_started_at_utc = _utc_now()
     batch_started_monotonic = time.monotonic()
 
@@ -3295,6 +3300,7 @@ def _submit_and_track_orders(
                 marketable_limit_max_attempts=marketable_limit_max_attempts,
                 max_workers=1,
                 execution_price_feed=execution_price_feed,
+                max_attempts_by_symbol=symbol_attempt_limits,
             )
             record = dict(child_records[0])
             record.update(
@@ -3329,6 +3335,10 @@ def _submit_and_track_orders(
     records: list[dict[str, Any]] = []
     for idx, item in enumerate(instruction_list, start=1):
         order_started_monotonic = time.monotonic()
+        item_max_attempts = symbol_attempt_limits.get(
+            str(item.symbol).upper(),
+            max(1, int(marketable_limit_max_attempts)),
+        )
         base_record = {
             "symbol": item.symbol,
             "side": item.side,
@@ -3342,7 +3352,7 @@ def _submit_and_track_orders(
             "batch_effective_workers": int(effective_workers),
             "batch_started_at_utc": batch_started_at_utc,
             "queue_wait_ms": 0.0,
-            "marketable_limit_max_attempts": int(max(1, marketable_limit_max_attempts)),
+            "marketable_limit_max_attempts": int(item_max_attempts),
         }
         try:
             if str(execution_order_style) == "market":
@@ -3407,7 +3417,7 @@ def _submit_and_track_orders(
                 base_offset_bps=float(marketable_limit_base_offset_bps),
                 max_offset_bps=float(max_offset_bps),
                 requote_steps_bps=marketable_limit_requote_steps_bps,
-                max_attempts=int(marketable_limit_max_attempts),
+                max_attempts=int(item_max_attempts),
             )
 
             attempt_no = 0
@@ -3701,13 +3711,31 @@ def _submit_staged_regt_orders(
         stage_fully_filled = False
         stage_remaining_symbols: list[str] = list(stage_symbols)
         current_stage_instructions = list(stage_instructions)
+        stage_attempt_cap = max(1, int(marketable_limit_max_attempts))
+        stage_attempt_counts: Counter[str] = Counter()
+        stage_budget_exhausted_symbols: list[str] = []
 
         for round_no in range(1, max(1, int(release_max_rounds)) + 1):
             if not current_stage_instructions:
-                stage_fully_filled = True
+                break
+            round_attempt_budget_before = {
+                str(item.symbol).upper(): max(
+                    0,
+                    stage_attempt_cap - int(stage_attempt_counts[str(item.symbol).upper()]),
+                )
+                for item in current_stage_instructions
+            }
+            round_input_instructions = [
+                item
+                for item in current_stage_instructions
+                if round_attempt_budget_before.get(str(item.symbol).upper(), 0) > 0
+            ]
+            if not round_input_instructions:
+                stage_budget_exhausted_symbols = sorted(
+                    {str(item.symbol).upper() for item in current_stage_instructions}
+                )
                 break
             round_offset_bps = float(marketable_limit_base_offset_bps) + max(0.0, float(release_round_extra_bps)) * float(round_no - 1)
-            round_input_instructions = list(current_stage_instructions)
             release_batch_started = time.monotonic()
             release_records = _submit_and_track_orders(
                 client=client,
@@ -3723,6 +3751,7 @@ def _submit_staged_regt_orders(
                 marketable_limit_max_attempts=int(marketable_limit_max_attempts),
                 max_workers=int(execution_workers),
                 execution_price_feed=str(execution_price_feed),
+                max_attempts_by_symbol=round_attempt_budget_before,
             )
             release_batch_summary = _order_batch_summary(
                 release_records,
@@ -3730,8 +3759,25 @@ def _submit_staged_regt_orders(
                 elapsed_seconds=float(time.monotonic() - release_batch_started),
             )
             for record in release_records:
+                record_symbol = str(record.get("symbol") or "").upper()
+                attempts_used = int(record.get("attempt_count") or 0)
+                if attempts_used <= 0 and str(record.get("status_latest") or ""):
+                    attempts_used = 1
+                attempts_before = int(stage_attempt_counts[record_symbol])
+                stage_attempt_counts[record_symbol] = min(
+                    stage_attempt_cap,
+                    attempts_before + attempts_used,
+                )
                 record["stage"] = stage_name
                 record["release_round"] = int(round_no)
+                record["stage_symbol_attempt_cap"] = int(stage_attempt_cap)
+                record["stage_symbol_attempt_count_before"] = int(attempts_before)
+                record["stage_symbol_attempt_count_after"] = int(
+                    stage_attempt_counts[record_symbol]
+                )
+                record["stage_symbol_attempts_remaining"] = int(
+                    max(0, stage_attempt_cap - stage_attempt_counts[record_symbol])
+                )
             records.extend(release_records)
             stage_records_total.extend(release_records)
             diagnostics["release_records"] = int(diagnostics["release_records"]) + int(len(release_records))
@@ -3776,10 +3822,26 @@ def _submit_staged_regt_orders(
             )
             rebuilt_release, _ = _split_release_entry_instructions(rebuilt_instructions)
             rebuilt_sell_long, rebuilt_buy_to_cover = _split_release_substages(rebuilt_release)
-            current_stage_instructions = rebuilt_sell_long if stage_name == "release_sell_long" else rebuilt_buy_to_cover
-            current_stage_instructions = [item for item in current_stage_instructions if item.symbol in set(stage_symbols)]
-            stage_remaining_symbols = [item.symbol for item in current_stage_instructions]
-            round_fully_filled = not current_stage_instructions
+            rebuilt_stage_instructions = (
+                rebuilt_sell_long if stage_name == "release_sell_long" else rebuilt_buy_to_cover
+            )
+            rebuilt_stage_instructions = [
+                item for item in rebuilt_stage_instructions if item.symbol in set(stage_symbols)
+            ]
+            stage_remaining_symbols = [item.symbol for item in rebuilt_stage_instructions]
+            stage_budget_exhausted_symbols = sorted(
+                {
+                    str(item.symbol).upper()
+                    for item in rebuilt_stage_instructions
+                    if int(stage_attempt_counts[str(item.symbol).upper()]) >= stage_attempt_cap
+                }
+            )
+            current_stage_instructions = [
+                item
+                for item in rebuilt_stage_instructions
+                if int(stage_attempt_counts[str(item.symbol).upper()]) < stage_attempt_cap
+            ]
+            round_fully_filled = not rebuilt_stage_instructions
             snapshots.append(
                 {
                     "schema_version": "1.0",
@@ -3796,6 +3858,14 @@ def _submit_staged_regt_orders(
                     ],
                     "marketable_limit_requote_wait_seconds": float(marketable_limit_requote_wait_seconds),
                     "marketable_limit_max_attempts": int(marketable_limit_max_attempts),
+                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
+                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
+                    "stage_symbol_attempt_budget_before": dict(
+                        sorted(round_attempt_budget_before.items())
+                    ),
+                    "stage_attempt_budget_exhausted_symbols": list(
+                        stage_budget_exhausted_symbols
+                    ),
                     "execution_workers": int(execution_workers),
                     "execution_batch_summary": release_batch_summary,
                     "input_instructions": _instruction_payloads(round_input_instructions),
@@ -3815,9 +3885,17 @@ def _submit_staged_regt_orders(
                     "reference_prices": dict(sorted(release_reference_prices.items())),
                     "rebuilt_all_instructions": _instruction_payloads(rebuilt_instructions),
                     "rebuilt_release_instructions": _instruction_payloads(rebuilt_release),
-                    "rebuilt_stage_instructions": _instruction_payloads(current_stage_instructions),
+                    "rebuilt_stage_instructions": _instruction_payloads(
+                        rebuilt_stage_instructions
+                    ),
+                    "attempt_budget_eligible_stage_instructions": _instruction_payloads(
+                        current_stage_instructions
+                    ),
                     "rebuilt_skipped_orders": rebuilt_skipped,
-                    "remaining_order_count": int(len(current_stage_instructions)),
+                    "remaining_order_count": int(len(rebuilt_stage_instructions)),
+                    "attempt_budget_eligible_order_count": int(
+                        len(current_stage_instructions)
+                    ),
                     "remaining_symbols": list(stage_remaining_symbols),
                     "fully_filled": bool(round_fully_filled),
                 }
@@ -3829,11 +3907,19 @@ def _submit_staged_regt_orders(
                     "order_count": int(len(release_records)),
                     "record_count": int(len(release_records)),
                     "fully_filled": bool(round_fully_filled),
-                    "remaining_order_count": int(len(current_stage_instructions)),
+                    "remaining_order_count": int(len(rebuilt_stage_instructions)),
+                    "attempt_budget_eligible_order_count": int(
+                        len(current_stage_instructions)
+                    ),
                     "remaining_symbols": list(stage_remaining_symbols),
                     "rebuilt_skipped_orders": rebuilt_skipped,
                     "limit_base_offset_bps": float(round_offset_bps),
                     "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
+                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
+                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
+                    "stage_attempt_budget_exhausted_symbols": list(
+                        stage_budget_exhausted_symbols
+                    ),
                     "buying_power_after_stage": float(refreshed_substage_buying_power),
                     "buying_power_source": str(refreshed_substage_buying_power_source),
                     "execution_batch_summary": release_batch_summary,
@@ -3842,15 +3928,28 @@ def _submit_staged_regt_orders(
             if round_fully_filled:
                 stage_fully_filled = True
                 break
+            if not current_stage_instructions:
+                break
             if round_no < max(1, int(release_max_rounds)) and float(release_round_sleep_seconds) > 0:
                 time.sleep(float(release_round_sleep_seconds))
 
         if not stage_fully_filled:
             diagnostics["release_fully_filled"] = False
             diagnostics["entry_aborted"] = True
-            diagnostics["entry_abort_reason"] = f"{stage_name}_not_fully_filled_after_{int(max(1, release_max_rounds))}_rounds"
+            diagnostics["entry_abort_reason"] = (
+                f"{stage_name}_attempt_budget_exhausted"
+                if stage_budget_exhausted_symbols
+                else f"{stage_name}_not_fully_filled_after_{int(max(1, release_max_rounds))}_rounds"
+            )
             diagnostics["release_unfilled_stage"] = stage_name
             diagnostics["release_unfilled_symbols"] = list(stage_remaining_symbols)
+            diagnostics["release_attempt_cap_per_symbol"] = int(stage_attempt_cap)
+            diagnostics["release_attempt_counts_by_symbol"] = dict(
+                sorted(stage_attempt_counts.items())
+            )
+            diagnostics["release_attempt_budget_exhausted_symbols"] = list(
+                stage_budget_exhausted_symbols
+            )
             diagnostics["release_stage_records"] = int(len(stage_records_total))
             snapshots.append(
                 {
@@ -3860,6 +3959,11 @@ def _submit_staged_regt_orders(
                     "stage": stage_name,
                     "entry_abort_reason": diagnostics["entry_abort_reason"],
                     "remaining_symbols": list(stage_remaining_symbols),
+                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
+                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
+                    "stage_attempt_budget_exhausted_symbols": list(
+                        stage_budget_exhausted_symbols
+                    ),
                     "release_stage_record_count": int(len(stage_records_total)),
                     "release_fully_filled": False,
                 }
