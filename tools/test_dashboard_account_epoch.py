@@ -100,6 +100,8 @@ def test_reset_boundary_before_new_run() -> None:
         assert overview["session_date"] == "2026-07-23", overview
         assert overview["account_epoch"]["capital_epoch"] == 2, overview
         assert overview["account_epoch"]["reset_pending"] is True, overview
+        assert overview["last_decision"] == {}, overview
+        assert overview["last_execute"] == {}, overview
         assert aggregator.get_positions() == []
         history = aggregator.get_history(limit=10)
         assert history[0]["run_type"] == "account_reset", history

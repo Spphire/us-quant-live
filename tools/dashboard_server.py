@@ -65,6 +65,9 @@ class DataAggregator:
             # Extract the latest session's decision/execute status from the
             # scheduler's sessions-keyed state.json.
             latest_date, decision_task, execute_task = self._latest_session_tasks(state)
+            if reset_pending and str(latest_date or "") < str(account_epoch.get("effective_session") or ""):
+                decision_task = {}
+                execute_task = {}
 
             display_session_date = (
                 str(account_epoch.get("effective_session") or latest_date)
