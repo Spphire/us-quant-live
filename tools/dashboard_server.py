@@ -46,13 +46,19 @@ class DataAggregator:
             state = self._read_scheduler_state()
             latest_summary = self._get_latest_execution_summary()
             lot_ledger = self._read_lot_ledger()
+            account_epoch = self._account_epoch(lot_ledger)
+            reset_pending = self._account_reset_pending(account_epoch, latest_summary)
             audit_rollup = self._read_audit_rollup()
             latest_audit = self._latest_audit_row(audit_rollup)
 
-            equity = latest_summary.get("account_equity_post_trade", 0.0)
+            equity = (
+                account_epoch.get("initial_equity", 0.0)
+                if reset_pending
+                else latest_summary.get("account_equity_post_trade", 0.0)
+            )
             session_idx = lot_ledger.get("meta", {}).get("last_session_idx", 0)
 
-            positions_data = self._read_latest_positions()
+            positions_data = [] if reset_pending else self._read_latest_positions()
             long_count = sum(1 for p in positions_data if p.get("side") == "long")
             short_count = sum(1 for p in positions_data if p.get("side") == "short")
 
@@ -60,11 +66,17 @@ class DataAggregator:
             # scheduler's sessions-keyed state.json.
             latest_date, decision_task, execute_task = self._latest_session_tasks(state)
 
+            display_session_date = (
+                str(account_epoch.get("effective_session") or latest_date)
+                if reset_pending
+                else latest_date
+            )
             return {
                 "equity": equity,
                 "session_idx": session_idx,
                 "positions_count": {"long": long_count, "short": short_count, "total": len(positions_data)},
-                "session_date": latest_date,
+                "session_date": display_session_date,
+                "account_epoch": {**account_epoch, "reset_pending": reset_pending},
                 "last_decision": decision_task,
                 "last_execute": execute_task,
                 "audit": {
@@ -89,6 +101,9 @@ class DataAggregator:
     def get_positions(self) -> list[dict[str, Any]]:
         """Get current positions."""
         with self.cache_lock:
+            account_epoch = self._account_epoch(self._read_lot_ledger())
+            if self._account_reset_pending(account_epoch, self._get_latest_execution_summary()):
+                return []
             return self._read_latest_positions()
 
     def get_lots(self) -> dict[str, Any]:
@@ -122,9 +137,34 @@ class DataAggregator:
     def get_history(self, limit: int = 30) -> list[dict[str, Any]]:
         """Get execution history across all run directories."""
         with self.cache_lock:
+            lot_ledger = self._read_lot_ledger()
+            account_epoch = self._account_epoch(lot_ledger)
             summaries = []
+            if account_epoch.get("effective_session"):
+                summaries.append(
+                    {
+                        "run_dir": f"account_reset_{str(account_epoch.get('effective_session')).replace('-', '')}",
+                        "run_type": "account_reset",
+                        "session_date": account_epoch.get("effective_session"),
+                        "decision_date": account_epoch.get("effective_session"),
+                        "decision_status": "account_reset",
+                        "ok": True,
+                        "submitted": False,
+                        "dynamic_symbols": 0,
+                        "order_plan_count": 0,
+                        "account_equity_post_trade": account_epoch.get("initial_equity", 0.0),
+                        "capital_epoch": account_epoch.get("capital_epoch", 1),
+                        "audit_status": "not_applicable",
+                        "strict_attribution_status": "not_applicable",
+                        "startup_binding_status": "not_applicable",
+                        "run_failure_status": "pass",
+                        "run_failure_class": "account_reset_boundary",
+                    }
+                )
             audit_rows = self._audit_rows_by_session_date()
             for run_dir in self._iter_run_dirs():
+                if len(summaries) >= limit:
+                    break
                 summary_file = run_dir / "execution_summary.json"
                 if not summary_file.exists():
                     continue
@@ -136,6 +176,10 @@ class DataAggregator:
                     session_date = self._run_dir_session_date(run_dir, summary)
                     summary["session_date"] = session_date
                     summary["decision_date"] = session_date or summary.get("decision_date") or run_dir.name[:8]
+                    summary["capital_epoch"] = self._capital_epoch_for_session(
+                        account_epoch,
+                        session_date,
+                    )
                     if run_type == "execute":
                         audit = audit_rows.get(session_date) or audit_rows.get(self._compact_date_to_iso(session_date)) or {}
                     else:
@@ -983,13 +1027,56 @@ class DataAggregator:
         except Exception:
             return {"ledger": {"long": [], "short": []}, "meta": {}}
 
+    @staticmethod
+    def _account_epoch(lot_ledger: dict[str, Any]) -> dict[str, Any]:
+        meta = lot_ledger.get("meta", {}) if isinstance(lot_ledger, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        effective_session = str(meta.get("account_reset_effective_session") or "").strip()
+        return {
+            "capital_epoch": max(1, int(meta.get("lifecycle_epoch") or 1)),
+            "effective_session": effective_session,
+            "initial_equity": float(meta.get("initial_equity") or 0.0),
+            "initial_cash": float(meta.get("initial_cash") or 0.0),
+            "reset_at_utc": str(meta.get("account_reset_at_utc") or ""),
+        }
+
+    @staticmethod
+    def _account_reset_pending(account_epoch: dict[str, Any], latest_summary: dict[str, Any]) -> bool:
+        effective_session = str(account_epoch.get("effective_session") or "")
+        if not effective_session:
+            return False
+        latest_session = str(
+            latest_summary.get("_dashboard_session_date")
+            or latest_summary.get("decision_date")
+            or latest_summary.get("session_date")
+            or ""
+        )
+        latest_session = DataAggregator._compact_date_to_iso(latest_session)
+        return not latest_session or latest_session < effective_session
+
+    @staticmethod
+    def _capital_epoch_for_session(account_epoch: dict[str, Any], session_date: str) -> int:
+        active_epoch = max(1, int(account_epoch.get("capital_epoch") or 1))
+        effective_session = str(account_epoch.get("effective_session") or "")
+        normalized_session = DataAggregator._compact_date_to_iso(str(session_date or ""))
+        if effective_session and normalized_session and normalized_session < effective_session:
+            return max(1, active_epoch - 1)
+        return active_epoch
+
     def _get_latest_execution_summary(self) -> dict[str, Any]:
         """Get most recent execution_summary.json across all run directories."""
         for run_dir in self._iter_run_dirs():
             summary_file = run_dir / "execution_summary.json"
             if summary_file.exists():
                 try:
-                    return json.loads(summary_file.read_text(encoding="utf-8"))
+                    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+                    if isinstance(summary, dict):
+                        summary["_dashboard_session_date"] = self._run_dir_session_date(
+                            run_dir,
+                            summary,
+                        )
+                        return summary
                 except Exception:
                     continue
         return {}

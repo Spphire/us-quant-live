@@ -921,8 +921,18 @@
 
         function buildEquitySeries(history) {
             const rows = Array.isArray(history) ? history : [];
-            const numericRows = rows.filter(row => Number.isFinite(Number(row.account_equity_post_trade)));
-            const executeRows = numericRows.filter(row => String(row.run_type || '').toLowerCase() === 'execute');
+            const epochs = rows
+                .map(row => Number(row.capital_epoch || 1))
+                .filter(value => Number.isFinite(value));
+            const activeEpoch = epochs.length ? Math.max(...epochs) : 1;
+            const numericRows = rows.filter(row =>
+                Number(row.capital_epoch || 1) === activeEpoch
+                && Number.isFinite(Number(row.account_equity_post_trade))
+            );
+            const executeRows = numericRows.filter(row => {
+                const type = String(row.run_type || '').toLowerCase();
+                return type === 'execute' || type === 'account_reset';
+            });
             const sourceRows = executeRows.length ? executeRows : numericRows;
             const byDate = new Map();
             for (const row of sourceRows) {
@@ -1265,13 +1275,17 @@
             const equity = data.equity || 0;
             const pos = data.positions_count || {};
             const sessionIdx = data.session_idx || 0;
+            const epoch = data.account_epoch || {};
+            const equityContext = epoch.effective_session
+                ? `资金周期 ${epoch.capital_epoch || 1} · ${escapeHTML(epoch.effective_session)}`
+                : `${t('metricSession')} ${sessionIdx}`;
 
             const html = `
                 <div class="metrics-grid">
                     <div class="metric-card">
                         <div class="metric-label">${t('metricEquity')}</div>
                         <div class="metric-value">${formatCurrency(equity)}</div>
-                        <div class="metric-change neutral">${t('metricSession')} ${sessionIdx}</div>
+                        <div class="metric-change neutral">${equityContext}</div>
                     </div>
                     <div class="metric-card">
                         <div class="metric-label">${t('metricPositions')}</div>
