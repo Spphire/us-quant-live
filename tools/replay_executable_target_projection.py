@@ -126,7 +126,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         short_sales_whole_shares_only=bool(order_plan.get("short_sales_whole_shares_only", True)),
         shorting_enabled=bool(account_snapshot.get("shorting_enabled", True)),
     )
-    release_instructions, entry_instructions = _split_release_entry_instructions(instructions)
+    release_instructions, entry_instructions = _split_release_entry_instructions(
+        instructions,
+        current_signed_qty=current_qty,
+    )
     guarded_entry_instructions, terminal_cap = _scale_entry_instructions_to_buying_power(
         entry_instructions,
         buying_power=buying_power,

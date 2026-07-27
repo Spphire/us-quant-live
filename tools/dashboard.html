@@ -902,6 +902,7 @@
 
         function runTypeOrder(row) {
             const type = String(row?.run_type || '').toLowerCase();
+            if (type === 'remediation') return 3;
             if (type === 'execute') return 2;
             if (type === 'decision') return 1;
             return 0;
@@ -931,7 +932,7 @@
             );
             const executeRows = numericRows.filter(row => {
                 const type = String(row.run_type || '').toLowerCase();
-                return type === 'execute' || type === 'account_reset';
+                return type === 'execute' || type === 'remediation' || type === 'account_reset';
             });
             const sourceRows = executeRows.length ? executeRows : numericRows;
             const byDate = new Map();

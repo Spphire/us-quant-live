@@ -174,7 +174,15 @@ class DataAggregator:
                 try:
                     summary = json.loads(summary_file.read_text(encoding="utf-8"))
                     summary["run_dir"] = run_dir.name
-                    run_type = "execute" if run_dir.name.endswith("_execute") else "decision" if run_dir.name.endswith("_decision") else ""
+                    run_type = (
+                        "execute"
+                        if run_dir.name.endswith("_execute")
+                        else "decision"
+                        if run_dir.name.endswith("_decision")
+                        else "remediation"
+                        if run_dir.name.endswith("_emergency_flatten")
+                        else ""
+                    )
                     summary["run_type"] = run_type
                     session_date = self._run_dir_session_date(run_dir, summary)
                     summary["session_date"] = session_date
@@ -850,6 +858,7 @@ class DataAggregator:
         The scheduler writes per-session output to:
             artifacts/daily_alpaca_scheduler/<YYYYMMDD>_decision/
             artifacts/daily_alpaca_scheduler/<YYYYMMDD>_execute/
+            artifacts/daily_alpaca_scheduler/<YYYYMMDD>_emergency_flatten/
         Older/test data may also live under:
             artifacts/daily_alpaca_scheduler/output/<run>/
         We collect both so the dashboard works regardless of layout. Sorting by
@@ -857,10 +866,14 @@ class DataAggregator:
         use the trading date encoded in the run instead.
         """
         run_dirs: list[Path] = []
-        # New layout: <date>_decision / <date>_execute directly under artifacts_root
+        # New layout: daily runs and explicit post-run remediation events.
         if self.artifacts_root.exists():
             for d in self.artifacts_root.iterdir():
-                if d.is_dir() and (d.name.endswith("_decision") or d.name.endswith("_execute")):
+                if d.is_dir() and (
+                    d.name.endswith("_decision")
+                    or d.name.endswith("_execute")
+                    or d.name.endswith("_emergency_flatten")
+                ):
                     run_dirs.append(d)
         # Legacy layout: output/<run>/
         output_root = self.artifacts_root / "output"
@@ -881,9 +894,11 @@ class DataAggregator:
                 if run_dir.name.endswith("_execute")
                 else "decision"
                 if run_dir.name.endswith("_decision")
+                else "remediation"
+                if run_dir.name.endswith("_emergency_flatten")
                 else ""
             )
-        run_type_order = {"decision": 1, "execute": 2}.get(run_type, 0)
+        run_type_order = {"decision": 1, "execute": 2, "remediation": 3}.get(run_type, 0)
         try:
             mtime = run_dir.stat().st_mtime
         except Exception:

@@ -1,0 +1,6 @@
+{
+  "app_key": "replace-with-longbridge-app-key",
+  "app_secret": "replace-with-longbridge-app-secret",
+  "access_token": "replace-with-longbridge-access-token",
+  "enable_overnight": false
+}

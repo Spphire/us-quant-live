@@ -304,9 +304,13 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
             "record_updated_at": record.get("updated_at", ""),
             "record_attempt_count": _safe_int(record.get("attempt_count")),
             "instruction_index": _safe_int(record.get("instruction_index")),
+            "dispatch_rank": _safe_int(record.get("dispatch_rank")),
             "batch_instruction_count": _safe_int(record.get("batch_instruction_count")),
             "batch_requested_workers": _safe_int(record.get("batch_requested_workers")),
             "batch_effective_workers": _safe_int(record.get("batch_effective_workers")),
+            "batch_wave_index": _safe_int(record.get("batch_wave_index")),
+            "batch_wave_count": _safe_int(record.get("batch_wave_count")),
+            "dispatch_policy": str(record.get("dispatch_policy") or ""),
             "batch_started_at_utc": record.get("batch_started_at_utc", ""),
             "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
             "order_wall_time_seconds": _safe_float(record.get("order_wall_time_seconds")),
@@ -349,6 +353,22 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
                             attempt.get("reference_price_source") or ""
                         ),
                         "quote_refresh_error": str(attempt.get("quote_refresh_error") or ""),
+                        "quote_observed_at_utc": str(attempt.get("quote_observed_at_utc") or ""),
+                        "quote_timestamp_utc": str(attempt.get("quote_timestamp_utc") or ""),
+                        "quote_age_ms": _optional_float(attempt.get("quote_age_ms")),
+                        "live_bid_price": _optional_float(attempt.get("live_bid_price")),
+                        "live_ask_price": _optional_float(attempt.get("live_ask_price")),
+                        "live_mid_price": _optional_float(attempt.get("live_mid_price")),
+                        "live_spread": _optional_float(attempt.get("live_spread")),
+                        "live_spread_bps": _optional_float(attempt.get("live_spread_bps")),
+                        "live_bid_size": _optional_float(attempt.get("live_bid_size")),
+                        "live_ask_size": _optional_float(attempt.get("live_ask_size")),
+                        "live_bid_exchange": str(attempt.get("live_bid_exchange") or ""),
+                        "live_ask_exchange": str(attempt.get("live_ask_exchange") or ""),
+                        "live_tape": str(attempt.get("live_tape") or ""),
+                        "marketable_reference_field": str(
+                            attempt.get("marketable_reference_field") or ""
+                        ),
                         "requote_step_index": _safe_int(attempt.get("requote_step_index"), default="")
                         if not _is_missing(attempt.get("requote_step_index"))
                         else "",
@@ -733,6 +753,7 @@ def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]
         "execution_summary.json",
         "run_context.json",
         "run_events.jsonl",
+        "decision_phase_timings.json",
         "runtime_environment_snapshot.json",
         "order_plan.json",
         "execution_records.json",
@@ -766,11 +787,33 @@ def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]
     ]
     new_replay_files = {
         "run_events.jsonl",
+        "decision_phase_timings.json",
         "runtime_environment_snapshot.json",
         "file_hash_manifest.json",
         "artifact_completeness_snapshot.json",
     }
     new_replay_enabled = any((run_dir / name).exists() for name in new_replay_files)
+    enhanced_execution_evidence_files = {
+        "target_capability_snapshot.json",
+        "target_capability_snapshot.csv",
+        "target_capability_drift.json",
+        "target_capability_drift.csv",
+        "execution_latest_quotes_snapshot_post_submission.json",
+    }
+    enhanced_execution_evidence_enabled = any(
+        (run_dir / name).exists() for name in enhanced_execution_evidence_files
+    )
+    if enhanced_execution_evidence_enabled:
+        expected_files.extend(sorted(enhanced_execution_evidence_files))
+    symbol_universe_evidence_files = {
+        "symbol_universe_intersection.json",
+        "symbol_universe_intersection.csv",
+    }
+    symbol_universe_evidence_enabled = any(
+        (run_dir / name).exists() for name in symbol_universe_evidence_files
+    )
+    if symbol_universe_evidence_enabled:
+        expected_files.extend(sorted(symbol_universe_evidence_files))
     scheduler_evidence_files = {
         "scheduler_task_context.json",
         "scheduler_task_result.json",
@@ -799,6 +842,10 @@ def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]
     }
     if new_replay_enabled:
         strict_files.update(new_replay_files)
+    if enhanced_execution_evidence_enabled:
+        strict_files.update(enhanced_execution_evidence_files)
+    if symbol_universe_evidence_enabled:
+        strict_files.update(symbol_universe_evidence_files)
     if scheduler_evidence_enabled:
         strict_files.update(scheduler_evidence_files)
     file_statuses = digest.get("file_statuses") if isinstance(digest.get("file_statuses"), dict) else {}
@@ -1772,7 +1819,11 @@ def _build_execution_attribution_outputs(
                 "reference_price": _safe_float(record.get("reference_price")),
                 "remaining_notional_at_reference": record_remaining_qty * _safe_float(record.get("reference_price")),
                 "record_delta_notional": _safe_float(record.get("delta_notional")),
+                "dispatch_rank": _safe_int(record.get("dispatch_rank")),
                 "batch_effective_workers": _safe_int(record.get("batch_effective_workers")),
+                "batch_wave_index": _safe_int(record.get("batch_wave_index")),
+                "batch_wave_count": _safe_int(record.get("batch_wave_count")),
+                "dispatch_policy": str(record.get("dispatch_policy") or ""),
                 "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
                 "order_wall_time_seconds": _safe_float(record.get("order_wall_time_seconds")),
                     "marketable_limit_max_attempts": _safe_int(
@@ -1851,11 +1902,31 @@ def _build_execution_attribution_outputs(
                     ),
                     "quote_refresh_error": str(attempt.get("quote_refresh_error") or ""),
                     "instruction_index": _safe_int(record.get("instruction_index")),
+                    "dispatch_rank": _safe_int(record.get("dispatch_rank")),
                     "batch_instruction_count": _safe_int(
                         record.get("batch_instruction_count")
                     ),
                     "batch_effective_workers": _safe_int(
                         record.get("batch_effective_workers")
+                    ),
+                    "batch_wave_index": _safe_int(record.get("batch_wave_index")),
+                    "batch_wave_count": _safe_int(record.get("batch_wave_count")),
+                    "dispatch_policy": str(record.get("dispatch_policy") or ""),
+                    "quote_observed_at_utc": str(attempt.get("quote_observed_at_utc") or ""),
+                    "quote_timestamp_utc": str(attempt.get("quote_timestamp_utc") or ""),
+                    "quote_age_ms": _optional_float(attempt.get("quote_age_ms")),
+                    "live_bid_price": _optional_float(attempt.get("live_bid_price")),
+                    "live_ask_price": _optional_float(attempt.get("live_ask_price")),
+                    "live_mid_price": _optional_float(attempt.get("live_mid_price")),
+                    "live_spread": _optional_float(attempt.get("live_spread")),
+                    "live_spread_bps": _optional_float(attempt.get("live_spread_bps")),
+                    "live_bid_size": _optional_float(attempt.get("live_bid_size")),
+                    "live_ask_size": _optional_float(attempt.get("live_ask_size")),
+                    "live_bid_exchange": str(attempt.get("live_bid_exchange") or ""),
+                    "live_ask_exchange": str(attempt.get("live_ask_exchange") or ""),
+                    "live_tape": str(attempt.get("live_tape") or ""),
+                    "marketable_reference_field": str(
+                        attempt.get("marketable_reference_field") or ""
                     ),
                     "queue_wait_ms": _safe_float(record.get("queue_wait_ms")),
                     "order_wall_time_seconds": _safe_float(
@@ -4032,6 +4103,16 @@ def _bar_stats(source: str, symbol: str, bars: list[dict[str, Any]]) -> dict[str
         vwap = sum(nonzero_closes) / len(nonzero_closes) if nonzero_closes else 0.0
     high_price = max([value for value in highs if value > 0], default=0.0)
     low_price = min([value for value in lows if value > 0], default=0.0)
+    capture_feeds = sorted(
+        {str(row.get("capture_feed") or "").strip() for row in sorted_bars if str(row.get("capture_feed") or "").strip()}
+    )
+    capture_sources = sorted(
+        {
+            str(row.get("capture_source") or "").strip()
+            for row in sorted_bars
+            if str(row.get("capture_source") or "").strip()
+        }
+    )
     return {
         "source": source,
         "symbol": symbol,
@@ -4047,6 +4128,9 @@ def _bar_stats(source: str, symbol: str, bars: list[dict[str, Any]]) -> dict[str
         "trade_count": sum(_safe_float(row.get("n") or row.get("trade_count")) for row in sorted_bars),
         "range_bps": _bps_change(high_price, low_price),
         "close_vs_open_bps": _bps_change(close_price, open_price),
+        "capture_feeds": ";".join(capture_feeds),
+        "capture_sources": ";".join(capture_sources),
+        "fallback_capture_used": "fallback_for_primary_missing" in capture_sources,
     }
 
 
@@ -5446,6 +5530,15 @@ def _build_intraday_bar_evidence(
             "collected_at_utc": payload.get("collected_at_utc", ""),
             "label": payload.get("label") or source,
             "feed": payload.get("feed", ""),
+            "primary_feed": payload.get("primary_feed") or payload.get("feed", ""),
+            "fallback_feed": payload.get("fallback_feed", ""),
+            "fallback_attempted": bool(payload.get("fallback_attempted")),
+            "fallback_requested_symbol_count": _safe_int(
+                payload.get("fallback_requested_symbol_count")
+            ),
+            "fallback_bar_symbol_count": _safe_int(payload.get("fallback_bar_symbol_count")),
+            "fallback_bar_symbols": payload.get("fallback_bar_symbols") or [],
+            "source_counts": payload.get("source_counts") or {},
         }
 
     market_by_symbol = {
@@ -5518,6 +5611,9 @@ def _build_intraday_bar_evidence(
                 "symbol": symbol,
                 "status": status,
                 "source_used": chosen.get("source", ""),
+                "capture_feeds": chosen.get("capture_feeds", ""),
+                "capture_sources": chosen.get("capture_sources", ""),
+                "fallback_capture_used": bool(chosen.get("fallback_capture_used")),
                 "before_bar_count": _safe_int(before.get("bar_count")),
                 "after_bar_count": _safe_int(after.get("bar_count")),
                 "bar_count": _safe_int(chosen.get("bar_count")),
@@ -5580,6 +5676,10 @@ def _build_intraday_bar_evidence(
         "filled_symbol_count": len(filled_rows),
         "filled_symbols_missing_bars": [row.get("symbol") for row in filled_missing][:100],
         "filled_symbols_missing_bars_count": len(filled_missing),
+        "fallback_capture_symbol_count": sum(bool(row.get("fallback_capture_used")) for row in rows),
+        "fallback_capture_symbols": [
+            row.get("symbol") for row in rows if row.get("fallback_capture_used")
+        ],
         "error_count": len(total_errors),
         "errors": total_errors[:20],
         "max_intraday_range_bps": max((_safe_float(row.get("range_bps")) for row in rows), default=0.0),
@@ -5616,9 +5716,11 @@ def _build_quote_evidence(
     fill_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     before_path = run_dir / "execution_latest_quotes_snapshot.json"
+    post_submission_path = run_dir / "execution_latest_quotes_snapshot_post_submission.json"
     after_path = run_dir / "execution_latest_quotes_snapshot_after.json"
     source_defs = [
         ("before_submit", before_path, _read_json(before_path, {})),
+        ("post_submission", post_submission_path, _read_json(post_submission_path, {})),
         ("after_execution", after_path, _read_json(after_path, {})),
     ]
     quotes_by_source: dict[str, dict[str, dict[str, Any]]] = {}
@@ -5629,9 +5731,22 @@ def _build_quote_evidence(
     for source, path, raw in source_defs:
         quotes = _latest_quote_payload(raw)
         payload = _snapshot_payload(raw)
-        requested = payload.get("requested_symbols") if isinstance(payload.get("requested_symbols"), list) else []
+        metadata = raw if isinstance(raw, dict) else {}
+        requested = (
+            metadata.get("requested_symbols")
+            if isinstance(metadata.get("requested_symbols"), list)
+            else payload.get("requested_symbols")
+            if isinstance(payload.get("requested_symbols"), list)
+            else []
+        )
         requested_set = {str(symbol or "").upper().strip() for symbol in requested if str(symbol or "").strip()}
-        errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+        errors = (
+            metadata.get("errors")
+            if isinstance(metadata.get("errors"), list)
+            else payload.get("errors")
+            if isinstance(payload.get("errors"), list)
+            else []
+        )
         requested_symbols.update(requested_set)
         all_quote_symbols.update(quotes)
         all_errors.extend({"source": source, **error} for error in errors if isinstance(error, dict))
@@ -5644,8 +5759,9 @@ def _build_quote_evidence(
             "quote_symbol_count": len(quotes),
             "missing_quote_symbol_count": len(requested_set - set(quotes)),
             "error_count": len(errors),
-            "collected_at_utc": payload.get("collected_at_utc", "") or (raw.get("collected_at_utc", "") if isinstance(raw, dict) else ""),
-            "feed": payload.get("feed", ""),
+            "collected_at_utc": metadata.get("collected_at_utc", "") or payload.get("collected_at_utc", ""),
+            "provider": metadata.get("provider", "") or payload.get("provider", ""),
+            "feed": metadata.get("feed", "") or payload.get("feed", ""),
         }
     market_by_symbol = {
         str(row.get("symbol") or "").upper().strip(): row
@@ -5654,13 +5770,22 @@ def _build_quote_evidence(
     }
     fills = _fill_by_symbol(fill_rows)
     symbols = sorted(set(market_by_symbol) | set(fills) | all_quote_symbols | requested_symbols)
-    any_raw_exists = before_path.exists() or after_path.exists()
+    any_raw_exists = before_path.exists() or post_submission_path.exists() or after_path.exists()
     rows: list[dict[str, Any]] = []
     for symbol in symbols:
         before_quote = quotes_by_source.get("before_submit", {}).get(symbol, {})
+        post_submission_quote = quotes_by_source.get("post_submission", {}).get(symbol, {})
         after_quote = quotes_by_source.get("after_execution", {}).get(symbol, {})
-        quote = after_quote or before_quote
-        source_used = "after_execution" if after_quote else "before_submit" if before_quote else ""
+        quote = post_submission_quote or after_quote or before_quote
+        source_used = (
+            "post_submission"
+            if post_submission_quote
+            else "after_execution"
+            if after_quote
+            else "before_submit"
+            if before_quote
+            else ""
+        )
         market = market_by_symbol.get(symbol, {})
         fill = fills.get(symbol, {})
         before_bid = _safe_float(before_quote.get("bp") or before_quote.get("bid_price"))
@@ -5671,6 +5796,22 @@ def _build_quote_evidence(
         after_ask = _safe_float(after_quote.get("ap") or after_quote.get("ask_price"))
         after_mid = (after_bid + after_ask) / 2.0 if after_bid > 0 and after_ask > 0 else 0.0
         after_spread_bps = (after_ask - after_bid) / after_mid * 10000.0 if after_mid > 0 and after_ask >= after_bid else 0.0
+        post_submission_bid = _safe_float(
+            post_submission_quote.get("bp") or post_submission_quote.get("bid_price")
+        )
+        post_submission_ask = _safe_float(
+            post_submission_quote.get("ap") or post_submission_quote.get("ask_price")
+        )
+        post_submission_mid = (
+            (post_submission_bid + post_submission_ask) / 2.0
+            if post_submission_bid > 0 and post_submission_ask > 0
+            else 0.0
+        )
+        post_submission_spread_bps = (
+            (post_submission_ask - post_submission_bid) / post_submission_mid * 10000.0
+            if post_submission_mid > 0 and post_submission_ask >= post_submission_bid
+            else 0.0
+        )
         bid = _safe_float(quote.get("bp") or quote.get("bid_price"))
         ask = _safe_float(quote.get("ap") or quote.get("ask_price"))
         bid_size = _safe_float(quote.get("bs") or quote.get("bid_size"))
@@ -5686,6 +5827,8 @@ def _build_quote_evidence(
             status = "historical_limited"
         elif not quote:
             status = "missing_quote"
+        elif quote.get("validation_error"):
+            status = "invalid_quote"
         elif bid <= 0 or ask <= 0 or ask < bid:
             status = "invalid_quote"
         elif spread_bps > 100.0:
@@ -5706,12 +5849,23 @@ def _build_quote_evidence(
                 "symbol": symbol,
                 "status": status,
                 "source_used": source_used,
+                "quote_provider": quote.get("provider", ""),
+                "quote_feed": quote.get("feed", ""),
                 "quote_time": quote.get("t", ""),
+                "depth_received_at_utc": quote.get("depth_received_at_utc", ""),
+                "depth_local_age_ms": _safe_float(quote.get("depth_local_age_ms")),
+                "last_trade_timestamp_utc": quote.get("last_trade_timestamp_utc", ""),
+                "trade_status": quote.get("trade_status", ""),
+                "trade_session": quote.get("trade_session", ""),
+                "quote_validation_error": quote.get("validation_error", ""),
                 "before_quote_time": before_quote.get("t", ""),
+                "post_submission_quote_time": post_submission_quote.get("t", ""),
                 "after_quote_time": after_quote.get("t", ""),
                 "before_mid_price": before_mid,
+                "post_submission_mid_price": post_submission_mid,
                 "after_mid_price": after_mid,
                 "before_spread_bps": before_spread_bps,
+                "post_submission_spread_bps": post_submission_spread_bps,
                 "after_spread_bps": after_spread_bps,
                 "bid_price": bid,
                 "ask_price": ask,
@@ -10369,6 +10523,16 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             "decision_execution_price_snapshot": (decision_dir / "execution_price_snapshot.json").as_posix()
             if decision_dir and (decision_dir / "execution_price_snapshot.json").exists()
             else None,
+            "decision_target_capability_snapshot": (
+                decision_dir / "target_capability_snapshot.json"
+            ).as_posix()
+            if decision_dir and (decision_dir / "target_capability_snapshot.json").exists()
+            else None,
+            "decision_symbol_universe_intersection": (
+                decision_dir / "symbol_universe_intersection.json"
+            ).as_posix()
+            if decision_dir and (decision_dir / "symbol_universe_intersection.json").exists()
+            else None,
             "decision_execution_latest_trades_snapshot": (
                 decision_dir / "execution_latest_trades_snapshot.json"
             ).as_posix()
@@ -10453,11 +10617,21 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             "execution_price_snapshot": (run_dir / "execution_price_snapshot.json").as_posix()
             if (run_dir / "execution_price_snapshot.json").exists()
             else None,
+            "symbol_universe_intersection": (
+                run_dir / "symbol_universe_intersection.json"
+            ).as_posix()
+            if (run_dir / "symbol_universe_intersection.json").exists()
+            else None,
             "execution_latest_trades_snapshot": (run_dir / "execution_latest_trades_snapshot.json").as_posix()
             if (run_dir / "execution_latest_trades_snapshot.json").exists()
             else None,
             "execution_latest_quotes_snapshot": (run_dir / "execution_latest_quotes_snapshot.json").as_posix()
             if (run_dir / "execution_latest_quotes_snapshot.json").exists()
+            else None,
+            "execution_latest_quotes_snapshot_post_submission": (
+                run_dir / "execution_latest_quotes_snapshot_post_submission.json"
+            ).as_posix()
+            if (run_dir / "execution_latest_quotes_snapshot_post_submission.json").exists()
             else None,
             "execution_latest_quotes_snapshot_after": (run_dir / "execution_latest_quotes_snapshot_after.json").as_posix()
             if (run_dir / "execution_latest_quotes_snapshot_after.json").exists()
@@ -10473,6 +10647,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             else None,
             "executable_target_projection": (run_dir / "executable_target_projection.json").as_posix()
             if (run_dir / "executable_target_projection.json").exists()
+            else None,
+            "target_capability_snapshot": (run_dir / "target_capability_snapshot.json").as_posix()
+            if (run_dir / "target_capability_snapshot.json").exists()
+            else None,
+            "target_capability_drift": (run_dir / "target_capability_drift.json").as_posix()
+            if (run_dir / "target_capability_drift.json").exists()
             else None,
             "portfolio_weights_snapshot": (run_dir / "portfolio_weights_snapshot.json").as_posix()
             if (run_dir / "portfolio_weights_snapshot.json").exists()
@@ -10808,11 +10988,19 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "record_index", "symbol", "side", "stage", "release_round", "execution_order_style",
         "record_client_order_id", "record_order_id", "record_status_latest", "record_qty",
         "record_filled_qty", "record_remaining_qty", "record_reference_price", "record_delta_notional",
-        "record_submitted_at_utc", "record_updated_at", "record_attempt_count", "attempt_index",
+        "record_submitted_at_utc", "record_updated_at", "record_attempt_count",
+        "instruction_index", "dispatch_rank", "batch_instruction_count", "batch_requested_workers",
+        "batch_effective_workers", "batch_wave_index", "batch_wave_count", "dispatch_policy",
+        "batch_started_at_utc", "queue_wait_ms", "order_wall_time_seconds", "attempt_index",
         "stage_symbol_attempt_cap", "stage_symbol_attempt_count_before",
         "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
         "attempt_no", "attempt_client_order_id", "attempt_order_id", "qty_submitted", "limit_price",
         "offset_bps", "requote_step_index", "requote_cycle", "max_offset_bps", "status_latest",
+        "live_reference_price", "reference_price_source", "quote_refresh_error",
+        "quote_observed_at_utc", "quote_timestamp_utc", "quote_age_ms",
+        "live_bid_price", "live_ask_price", "live_mid_price", "live_spread", "live_spread_bps",
+        "live_bid_size", "live_ask_size", "live_bid_exchange", "live_ask_exchange", "live_tape",
+        "marketable_reference_field",
         "filled_qty", "remaining_qty_estimate", "filled_avg_price", "updated_at", "broker_fill_count",
         "broker_fill_qty", "broker_fill_vwap", "broker_fill_notional", "poll_event_count",
         "requested_qty", "submit_error_class", "broker_error_code", "broker_error_message",
@@ -10870,7 +11058,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "client_order_id", "order_id", "status_latest", "outcome", "reference_price",
         "sizing_price", "limit_price", "limit_aggressiveness_bps", "attempt_offset_bps",
         "live_reference_price", "reference_price_source", "quote_refresh_error",
-        "instruction_index", "batch_instruction_count", "batch_effective_workers",
+        "quote_observed_at_utc", "quote_timestamp_utc", "quote_age_ms",
+        "live_bid_price", "live_ask_price", "live_mid_price", "live_spread", "live_spread_bps",
+        "live_bid_size", "live_ask_size", "live_bid_exchange", "live_ask_exchange", "live_tape",
+        "marketable_reference_field",
+        "instruction_index", "dispatch_rank", "batch_instruction_count", "batch_effective_workers",
+        "batch_wave_index", "batch_wave_count", "dispatch_policy",
         "queue_wait_ms", "order_wall_time_seconds",
         "stage_symbol_attempt_cap", "stage_symbol_attempt_count_before",
         "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
@@ -11097,7 +11290,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     )
     _write_json(audit_dir / "82_position_capacity_summary.json", position_capacity_summary)
     intraday_bar_fields = [
-        "symbol", "status", "source_used", "before_bar_count", "after_bar_count", "bar_count",
+        "symbol", "status", "source_used", "capture_feeds", "capture_sources",
+        "fallback_capture_used", "before_bar_count", "after_bar_count", "bar_count",
         "first_bar_time", "last_bar_time", "open", "high", "low", "close", "vwap",
         "volume", "trade_count", "range_bps", "close_vs_open_bps",
         "execute_reference_price", "reference_vs_open_bps", "reference_vs_vwap_bps",
@@ -11112,8 +11306,10 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_csv(audit_dir / "58_intraday_bar_evidence.csv", intraday_bar_rows, intraday_bar_fields)
     _write_json(audit_dir / "59_intraday_bar_summary.json", intraday_bar_summary)
     quote_fields = [
-        "symbol", "status", "source_used", "quote_time", "before_quote_time", "after_quote_time",
-        "before_mid_price", "after_mid_price", "before_spread_bps", "after_spread_bps",
+        "symbol", "status", "source_used", "quote_time", "before_quote_time",
+        "post_submission_quote_time", "after_quote_time", "before_mid_price",
+        "post_submission_mid_price", "after_mid_price", "before_spread_bps",
+        "post_submission_spread_bps", "after_spread_bps",
         "bid_price", "ask_price", "bid_size", "ask_size",
         "mid_price", "spread", "spread_bps", "conditions", "tape",
         "execute_reference_price", "reference_vs_mid_bps", "latest_trade_price",
@@ -11406,6 +11602,11 @@ def generate_task_health_audit(task_dir: Path) -> dict[str, Any]:
             else None,
             "decision_targets": (task_dir / "decision_targets.csv").as_posix()
             if (task_dir / "decision_targets.csv").exists()
+            else None,
+            "symbol_universe_intersection": (
+                task_dir / "symbol_universe_intersection.json"
+            ).as_posix()
+            if (task_dir / "symbol_universe_intersection.json").exists()
             else None,
             "run_context": (task_dir / "run_context.json").as_posix()
             if (task_dir / "run_context.json").exists()

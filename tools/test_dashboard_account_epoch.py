@@ -147,10 +147,36 @@ def test_first_new_account_run_supersedes_reset_baseline() -> None:
         assert new_rows and new_rows[0]["capital_epoch"] == 2, history
 
 
+def test_emergency_flatten_supersedes_stale_execute_positions() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        artifacts_root, aggregator = _build_fixture(root)
+        remediation = artifacts_root / "20260723_emergency_flatten"
+        _write_json(
+            remediation / "execution_summary.json",
+            {
+                "decision_date": "2026-07-23",
+                "run_type": "remediation",
+                "ok": True,
+                "submitted": True,
+                "account_equity_post_trade": 99677.89,
+            },
+        )
+        _write_positions(remediation / "broker_positions_after.csv", [])
+
+        overview = aggregator.get_overview()
+        assert overview["equity"] == 99677.89, overview
+        assert overview["positions_count"]["total"] == 0, overview
+        history = aggregator.get_history(limit=10)
+        rows = [row for row in history if row.get("run_type") == "remediation"]
+        assert rows and rows[0]["capital_epoch"] == 2, history
+
+
 def main() -> int:
     tests = [
         ("Reset boundary before first run", test_reset_boundary_before_new_run),
         ("First new-account run", test_first_new_account_run_supersedes_reset_baseline),
+        ("Emergency flatten supersedes stale execute", test_emergency_flatten_supersedes_stale_execute_positions),
     ]
     for name, test in tests:
         print(f"[TEST] {name}")

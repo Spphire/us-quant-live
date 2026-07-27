@@ -41,16 +41,25 @@ from decision_engine import DecisionConfig, DecisionEngine  # noqa: E402
 from dynamic_symbol_pool import (  # noqa: E402
     DEFAULT_CANDIDATE_SYMBOLS_PATH,
     DynamicSymbolPool,
+    _build_runtime_clean_core_symbol_set,
+    _build_tradable_symbol_set,
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
 from executable_target_projector import project_executable_targets  # noqa: E402
 from lot_manager import DEFAULT_FACTOR_MIN_HOLDS, LotManager  # noqa: E402
-from vendors import AlpacaHttpClient, AlpacaRequestError  # noqa: E402
+from vendors import (  # noqa: E402
+    AlpacaHttpClient,
+    AlpacaRequestError,
+    LongbridgeCredentials,
+    LongbridgeQuoteClient,
+    LongbridgeQuoteError,
+)
 
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "artifacts" / "alpaca_executor"
 DEFAULT_LEDGER_PATH = PROJECT_ROOT / "artifacts" / "alpaca_executor" / "lot_ledger.json"
+DEFAULT_LONGBRIDGE_CONFIG_PATH = PROJECT_ROOT / "configs" / "longbridge.local.json"
 EPS = 1e-10
 TERMINAL_ORDER_STATUSES = {
     "filled",
@@ -76,6 +85,323 @@ class OrderInstruction:
     target_notional: float
     delta_notional: float
     opening_short: bool
+    current_signed_qty: float | None = None
+    target_signed_qty: float | None = None
+
+
+class _DecisionPhaseTimingRecorder:
+    """Persist sequential executor phase timings while a run is in progress."""
+
+    DECISION_COMPUTE_PHASES = {
+        "dynamic_symbol_pool",
+        "sec_industry_map",
+        "alpha_core_build",
+        "portfolio_decision",
+    }
+
+    def __init__(
+        self,
+        *,
+        output_root: Path,
+        run_started_at_utc: str,
+        run_started_monotonic: float,
+        clock: Any | None = None,
+        utc_now: Any | None = None,
+    ) -> None:
+        self.path = Path(output_root) / "decision_phase_timings.json"
+        self.run_started_at_utc = str(run_started_at_utc)
+        self.run_started_monotonic = float(run_started_monotonic)
+        self._clock = clock or time.monotonic
+        self._utc_now = utc_now or _utc_now
+        self._phases: list[dict[str, Any]] = []
+        self._active_phase: str | None = None
+        self._status = "running"
+        self._final_elapsed_seconds: float | None = None
+        self._final_context: dict[str, Any] = {}
+
+    def start(self, phase: str, context: Mapping[str, Any] | None = None) -> None:
+        name = str(phase)
+        if self._active_phase is not None:
+            raise RuntimeError(f"Cannot start phase {name!r}; {self._active_phase!r} is still running.")
+        if any(item.get("phase") == name for item in self._phases):
+            raise RuntimeError(f"Decision timing phase already recorded: {name}")
+        now = float(self._clock())
+        self._phases.append(
+            {
+                "phase": name,
+                "status": "running",
+                "started_at_utc": str(self._utc_now()),
+                "finished_at_utc": None,
+                "elapsed_seconds": 0.0,
+                "run_elapsed_start_seconds": max(0.0, now - self.run_started_monotonic),
+                "run_elapsed_end_seconds": None,
+                "context": dict(context or {}),
+            }
+        )
+        self._active_phase = name
+        self._persist(now=now)
+        print(f"[DecisionTiming] phase={name} status=started", flush=True)
+
+    def finish(self, phase: str, context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        name = str(phase)
+        if self._active_phase != name:
+            raise RuntimeError(f"Cannot finish phase {name!r}; active phase is {self._active_phase!r}.")
+        now = float(self._clock())
+        row = self._phases[-1]
+        row["status"] = "completed"
+        row["finished_at_utc"] = str(self._utc_now())
+        row["elapsed_seconds"] = max(
+            0.0,
+            now - self.run_started_monotonic - float(row["run_elapsed_start_seconds"]),
+        )
+        row["run_elapsed_end_seconds"] = max(0.0, now - self.run_started_monotonic)
+        if context:
+            row["context"].update(dict(context))
+        self._active_phase = None
+        payload = self._persist(now=now)
+        print(
+            f"[DecisionTiming] phase={name} status=completed elapsed={float(row['elapsed_seconds']):.3f}s",
+            flush=True,
+        )
+        return dict(payload)
+
+    def skip(self, phase: str, context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        name = str(phase)
+        if self._active_phase is not None:
+            raise RuntimeError(f"Cannot skip phase {name!r}; {self._active_phase!r} is still running.")
+        if any(item.get("phase") == name for item in self._phases):
+            raise RuntimeError(f"Decision timing phase already recorded: {name}")
+        now = float(self._clock())
+        at_utc = str(self._utc_now())
+        run_elapsed = max(0.0, now - self.run_started_monotonic)
+        self._phases.append(
+            {
+                "phase": name,
+                "status": "skipped",
+                "started_at_utc": at_utc,
+                "finished_at_utc": at_utc,
+                "elapsed_seconds": 0.0,
+                "run_elapsed_start_seconds": run_elapsed,
+                "run_elapsed_end_seconds": run_elapsed,
+                "context": dict(context or {}),
+            }
+        )
+        payload = self._persist(now=now)
+        print(f"[DecisionTiming] phase={name} status=skipped", flush=True)
+        return payload
+
+    def fail(self, exc: BaseException) -> dict[str, Any]:
+        now = float(self._clock())
+        failed_at_utc = str(self._utc_now())
+        if self._active_phase is not None:
+            row = self._phases[-1]
+            row["status"] = "failed"
+            row["finished_at_utc"] = failed_at_utc
+            row["elapsed_seconds"] = max(
+                0.0,
+                now - self.run_started_monotonic - float(row["run_elapsed_start_seconds"]),
+            )
+            row["run_elapsed_end_seconds"] = max(0.0, now - self.run_started_monotonic)
+            row["context"].update(
+                {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            self._active_phase = None
+        self._status = "failed"
+        self._final_elapsed_seconds = max(0.0, now - self.run_started_monotonic)
+        self._final_context = {
+            "failed_at_utc": failed_at_utc,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        payload = self._persist(now=now)
+        print(
+            f"[DecisionTiming] status=failed elapsed={self._final_elapsed_seconds:.3f}s",
+            flush=True,
+        )
+        return payload
+
+    def finalize(self, *, status: str, context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if self._active_phase is not None:
+            raise RuntimeError(f"Cannot finalize timings while phase {self._active_phase!r} is running.")
+        now = float(self._clock())
+        self._status = str(status)
+        self._final_elapsed_seconds = max(0.0, now - self.run_started_monotonic)
+        self._final_context = dict(context or {})
+        payload = self._persist(now=now)
+        print(
+            f"[DecisionTiming] status={self._status} elapsed={self._final_elapsed_seconds:.3f}s "
+            f"decision_compute={float(payload['decision_compute_elapsed_seconds']):.3f}s",
+            flush=True,
+        )
+        return payload
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._build_snapshot(now=float(self._clock()))
+
+    def _persist(self, *, now: float) -> dict[str, Any]:
+        payload = self._build_snapshot(now=now)
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        _write_json_file(temporary_path, payload)
+        os.replace(temporary_path, self.path)
+        return payload
+
+    def _build_snapshot(self, *, now: float) -> dict[str, Any]:
+        total_elapsed = (
+            float(self._final_elapsed_seconds)
+            if self._final_elapsed_seconds is not None
+            else max(0.0, float(now) - self.run_started_monotonic)
+        )
+        rows = [dict(item) for item in self._phases]
+        if self._active_phase is not None and rows:
+            row = rows[-1]
+            row["elapsed_seconds"] = max(
+                0.0,
+                float(now) - self.run_started_monotonic - float(row["run_elapsed_start_seconds"]),
+            )
+            row["run_elapsed_end_seconds"] = max(0.0, float(now) - self.run_started_monotonic)
+
+        timed_elapsed = sum(float(row.get("elapsed_seconds") or 0.0) for row in rows)
+        for row in rows:
+            row["elapsed_seconds"] = round(float(row.get("elapsed_seconds") or 0.0), 6)
+            row["run_elapsed_start_seconds"] = round(float(row.get("run_elapsed_start_seconds") or 0.0), 6)
+            if row.get("run_elapsed_end_seconds") is not None:
+                row["run_elapsed_end_seconds"] = round(float(row["run_elapsed_end_seconds"]), 6)
+            row["share_of_run_pct"] = (
+                round(100.0 * float(row["elapsed_seconds"]) / total_elapsed, 3)
+                if total_elapsed > EPS
+                else 0.0
+            )
+
+        ranked = sorted(
+            (row for row in rows if float(row.get("elapsed_seconds") or 0.0) > 0.0),
+            key=lambda row: float(row.get("elapsed_seconds") or 0.0),
+            reverse=True,
+        )
+        slowest = (
+            {
+                "phase": str(ranked[0]["phase"]),
+                "elapsed_seconds": float(ranked[0]["elapsed_seconds"]),
+                "share_of_run_pct": float(ranked[0]["share_of_run_pct"]),
+            }
+            if ranked
+            else None
+        )
+        decision_compute_elapsed = sum(
+            float(row.get("elapsed_seconds") or 0.0)
+            for row in rows
+            if row.get("phase") in self.DECISION_COMPUTE_PHASES
+        )
+        return {
+            "schema_version": "1.0",
+            "artifact_type": "decision_phase_timings",
+            "measurement_scope": (
+                "executor_start_through_execution_summary_preparation; "
+                "final evidence-manifest and scheduler overhead are excluded"
+            ),
+            "run_started_at_utc": self.run_started_at_utc,
+            "updated_at_utc": str(self._utc_now()),
+            "status": self._status,
+            "current_phase": self._active_phase,
+            "elapsed_seconds": round(total_elapsed, 6),
+            "timed_phase_elapsed_seconds": round(timed_elapsed, 6),
+            "unattributed_elapsed_seconds": round(max(0.0, total_elapsed - timed_elapsed), 6),
+            "decision_compute_elapsed_seconds": round(decision_compute_elapsed, 6),
+            "completed_phase_count": sum(row.get("status") == "completed" for row in rows),
+            "skipped_phase_count": sum(row.get("status") == "skipped" for row in rows),
+            "slowest_phase": slowest,
+            "optimization_candidates": [
+                {
+                    "phase": str(row["phase"]),
+                    "elapsed_seconds": float(row["elapsed_seconds"]),
+                    "share_of_run_pct": float(row["share_of_run_pct"]),
+                }
+                for row in ranked[:3]
+            ],
+            "final_context": dict(self._final_context),
+            "phases": rows,
+        }
+
+
+class _PersistentRunEvents(list[dict[str, Any]]):
+    def __init__(self, *, path: Path, run_started_monotonic: float) -> None:
+        super().__init__()
+        self.path = Path(path)
+        self.run_started_monotonic = float(run_started_monotonic)
+
+    def persist(self) -> None:
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        _write_jsonl_file(temporary_path, self)
+        os.replace(temporary_path, self.path)
+
+
+def _build_submission_capability_guard(
+    *,
+    raw_target_signed_weights: Mapping[str, float],
+    capacity_adjusted_target_signed_weights: Mapping[str, float],
+    executable_expected_signed_weights: Mapping[str, float],
+    current_signed_notional: Mapping[str, float],
+    account_equity: float,
+    shorting_enabled: bool,
+    material_notional_tolerance: float = 1.0,
+) -> dict[str, Any]:
+    equity = max(float(account_equity), 1e-9)
+    tolerance = max(float(material_notional_tolerance), 0.0)
+
+    intended_long_weight = sum(
+        max(0.0, float(weight))
+        for weight in capacity_adjusted_target_signed_weights.values()
+    )
+    intended_short_weight = sum(
+        max(0.0, -float(weight))
+        for weight in capacity_adjusted_target_signed_weights.values()
+    )
+    executable_long_weight = sum(
+        max(0.0, float(weight)) for weight in executable_expected_signed_weights.values()
+    )
+    executable_short_weight = sum(
+        max(0.0, -float(weight)) for weight in executable_expected_signed_weights.values()
+    )
+
+    short_increase_symbols: list[str] = []
+    for symbol, target_weight in capacity_adjusted_target_signed_weights.items():
+        target_weight = float(target_weight)
+        if target_weight >= -EPS:
+            continue
+        intended_short_notional = -target_weight * equity
+        current_short_notional = max(
+            0.0,
+            -float(current_signed_notional.get(str(symbol).upper(), 0.0)),
+        )
+        if intended_short_notional > current_short_notional + tolerance:
+            short_increase_symbols.append(str(symbol).upper())
+
+    reasons: list[str] = []
+    if short_increase_symbols and not bool(shorting_enabled):
+        reasons.append("account_shorting_disabled_for_required_short_increase")
+    if intended_long_weight > EPS and intended_short_weight > EPS:
+        if executable_long_weight <= EPS or executable_short_weight <= EPS:
+            reasons.append("long_short_side_missing_after_projection")
+
+    return {
+        "status": "blocked" if reasons else "pass",
+        "blocking_reasons": reasons,
+        "broker_shorting_enabled": bool(shorting_enabled),
+        "raw_long_symbol_count": int(
+            sum(float(weight) > EPS for weight in raw_target_signed_weights.values())
+        ),
+        "raw_short_symbol_count": int(
+            sum(float(weight) < -EPS for weight in raw_target_signed_weights.values())
+        ),
+        "required_short_increase_symbol_count": int(len(short_increase_symbols)),
+        "required_short_increase_symbols": sorted(short_increase_symbols),
+        "intended_long_gross_weight": float(intended_long_weight),
+        "intended_short_gross_weight": float(intended_short_weight),
+        "executable_long_gross_weight": float(executable_long_weight),
+        "executable_short_gross_weight": float(executable_short_weight),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -176,7 +502,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="marketable_limit",
         help="Order style for live submission.",
     )
-    parser.add_argument("--execution-price-feed", default="sip", help="Feed for execution price reference. MUST be 'sip' for accurate market-wide pricing.")
+    parser.add_argument(
+        "--execution-quote-provider",
+        choices=("alpaca", "longbridge"),
+        default="longbridge",
+        help="Real-time quote provider used for sizing and order prices.",
+    )
+    parser.add_argument(
+        "--execution-price-feed",
+        default="iex",
+        help="Alpaca feed used for intraday bar evidence and when provider=alpaca.",
+    )
+    parser.add_argument(
+        "--longbridge-config-path",
+        default=str(DEFAULT_LONGBRIDGE_CONFIG_PATH),
+        help="Ignored local JSON containing Longbridge OpenAPI credentials.",
+    )
+    parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=30.0)
+    parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
+    parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
+    parser.add_argument(
+        "--longbridge-coverage-chunk-size",
+        type=int,
+        default=500,
+        help="Batch size for non-streaming Longbridge candidate-universe coverage checks.",
+    )
     parser.add_argument(
         "--audit-benchmark-symbols",
         default="SPY,QQQ,IWM,DIA",
@@ -383,6 +734,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
+    execution_quote_client: Any | None = None
+    symbol_universe_quote_client: LongbridgeQuoteClient | None = None
     try:
         decision_date = _normalize_date(args.date)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -395,8 +748,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         should_submit = not bool(args.no_submit) and str(args.trigger_mode) != "plan_only"
         ledger_write_enabled = bool(should_submit)
         run_started_at_utc = _utc_now()
-        run_events: list[dict[str, Any]] = []
+        run_started_monotonic = time.monotonic()
+        run_events = _PersistentRunEvents(
+            path=output_root / "run_events.jsonl",
+            run_started_monotonic=run_started_monotonic,
+        )
         run_context_path = output_root / "run_context.json"
+        phase_timings = _DecisionPhaseTimingRecorder(
+            output_root=output_root,
+            run_started_at_utc=run_started_at_utc,
+            run_started_monotonic=run_started_monotonic,
+        )
+        phase_timings.start(
+            "startup_evidence",
+            {
+                "submit_enabled": bool(should_submit),
+                "trigger_mode": str(args.trigger_mode),
+            },
+        )
         _mark_event(
             run_events,
             "executor_started",
@@ -420,6 +789,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(output_root / "python_environment.json", _python_environment_snapshot())
         _write_runtime_environment_snapshot(output_root)
         _write_run_events(output_root, run_events)
+        phase_timings.finish("startup_evidence")
+        phase_timings.start(
+            "broker_preflight_and_lot_sync",
+            {"account_name": str(args.account_name)},
+        )
 
         credentials = _resolve_alpaca_credentials(
             accounts_json_path=str(args.accounts_json_path),
@@ -575,6 +949,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if ledger_write_enabled:
             lot_manager.to_json(ledger_path)
+        phase_timings.finish(
+            "broker_preflight_and_lot_sync",
+            {
+                "position_count": len(positions_before),
+                "shorting_enabled": bool(shorting_enabled),
+                "lot_sync_applied": bool(lot_sync_applied),
+                "session_idx": int(resolved_session_idx),
+            },
+        )
         alpha_panel = pd.DataFrame()
         alpha_path: Path | None = None
         decision_targets_path: Path | None = None
@@ -585,13 +968,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         sec_cache_source = "runtime"
         symbols: list[str] = []
         target_signed_weights: dict[str, float] = {}
+        symbol_universe_snapshot: dict[str, Any] = {}
+        symbol_universe_json_path = output_root / "symbol_universe_intersection.json"
+        symbol_universe_csv_path = output_root / "symbol_universe_intersection.csv"
+        source_universe_input_path: Path | None = None
 
         if args.order_plan_input_path and args.decision_targets_input_path:
             raise ValueError("Provide only one of --order-plan-input-path or --decision-targets-input-path.")
 
         if args.order_plan_input_path:
+            phase_timings.skip("dynamic_symbol_pool", {"reason": "order_plan_input"})
+            phase_timings.skip("sec_industry_map", {"reason": "order_plan_input"})
+            phase_timings.skip("alpha_core_build", {"reason": "order_plan_input"})
+            phase_timings.start("portfolio_decision", {"source": "order_plan_input"})
             loaded_plan = _load_json_dict(Path(str(args.order_plan_input_path)).resolve())
             plan_input_path = str(Path(str(args.order_plan_input_path)).resolve().as_posix())
+            source_universe_input_path = Path(str(args.order_plan_input_path)).resolve()
             target_signed_weights = _extract_target_signed_weights_from_plan(loaded_plan)
             if not target_signed_weights:
                 raise ValueError(
@@ -606,8 +998,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             sec_cache_source = str(loaded_plan.get("sec_cache_source") or "from_order_plan")
             decision_targets_path = output_root / "decision_targets.csv"
             _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
+            phase_timings.finish(
+                "portfolio_decision",
+                {
+                    "decision_status": decision_status,
+                    "target_symbol_count": len(target_signed_weights),
+                },
+            )
         elif args.decision_targets_input_path:
+            phase_timings.skip("dynamic_symbol_pool", {"reason": "decision_targets_input"})
+            phase_timings.skip("sec_industry_map", {"reason": "decision_targets_input"})
+            phase_timings.skip("alpha_core_build", {"reason": "decision_targets_input"})
+            phase_timings.start("portfolio_decision", {"source": "decision_targets_input"})
             source_path = Path(str(args.decision_targets_input_path)).resolve()
+            source_universe_input_path = source_path
             target_signed_weights = _load_target_signed_weights_from_csv(source_path)
             if not target_signed_weights:
                 raise ValueError(
@@ -625,11 +1029,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             sec_cache_source = "from_decision_targets"
             decision_targets_path = output_root / "decision_targets.csv"
             _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
+            phase_timings.finish(
+                "portfolio_decision",
+                {
+                    "decision_status": decision_status,
+                    "target_symbol_count": len(target_signed_weights),
+                },
+            )
         else:
-            candidate_symbols = _load_candidate_symbols(Path(args.candidate_symbols_path))
+            phase_timings.start(
+                "dynamic_symbol_pool",
+                {
+                    "pool_size": int(args.pool_size),
+                    "feed": str(args.dynamic_feed),
+                    "workers": int(args.dynamic_bars_workers),
+                },
+            )
+            candidate_symbols_path = Path(args.candidate_symbols_path).resolve()
+            candidate_symbols = _load_candidate_symbols(candidate_symbols_path)
+            alpaca_universe_assets = client.list_assets(status="active", asset_class="us_equity")
+            symbol_universe_quote_client = _new_longbridge_quote_client(args)
+            longbridge_coverage = symbol_universe_quote_client.check_symbol_coverage(
+                candidate_symbols,
+                chunk_size=int(args.longbridge_coverage_chunk_size),
+            )
+            symbol_universe_quote_client.close()
+            symbol_universe_quote_client = None
+            symbol_universe_snapshot = _build_decision_symbol_universe_snapshot(
+                candidate_symbols_path=candidate_symbols_path,
+                candidate_symbols=candidate_symbols,
+                alpaca_assets=alpaca_universe_assets,
+                longbridge_coverage=longbridge_coverage,
+                decision_date=decision_date,
+            )
+            _write_symbol_universe_artifacts(output_root, symbol_universe_snapshot)
+            if symbol_universe_snapshot.get("status") != "pass":
+                raise LongbridgeQuoteError(
+                    "Unable to build a complete non-empty Alpaca/Longbridge symbol-universe "
+                    f"intersection: status={symbol_universe_snapshot.get('status')}"
+                )
+            intersection_candidates = list(
+                symbol_universe_snapshot.get("final_intersection_symbols") or []
+            )
             pool = DynamicSymbolPool(
                 client=client,
-                candidate_symbols=candidate_symbols,
+                candidate_symbols=intersection_candidates,
                 pool_size=int(args.pool_size),
                 lookback_sessions=int(args.lookback_sessions),
                 min_observations=int(args.min_observations),
@@ -640,10 +1084,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 feed=str(args.dynamic_feed),
                 beta_full_observations=int(args.dynamic_beta_full_observations),
             )
-            symbols = sorted(pool.fresh(decision_date.isoformat()))
+            symbols = sorted(
+                pool.fresh(decision_date.isoformat(), assets=alpaca_universe_assets)
+            )
             if not symbols:
                 raise ValueError("DynamicSymbolPool returned empty symbol list.")
+            symbol_universe_snapshot.update(
+                {
+                    "dynamic_pool_diagnostics": asdict(pool.last_diagnostics)
+                    if pool.last_diagnostics is not None
+                    else None,
+                    "dynamic_selected_count": len(symbols),
+                    "dynamic_selected_symbols": symbols,
+                }
+            )
+            _write_symbol_universe_artifacts(output_root, symbol_universe_snapshot)
+            phase_timings.finish(
+                "dynamic_symbol_pool",
+                {
+                    "candidate_symbol_count": len(candidate_symbols),
+                    "intersection_candidate_symbol_count": len(intersection_candidates),
+                    "selected_symbol_count": len(symbols),
+                },
+            )
 
+            phase_timings.start("sec_industry_map", {"symbol_count": len(symbols)})
             sec_cache_mode = str(args.sec_cache_mode).strip().lower()
             if sec_cache_mode == "auto":
                 sec_cache_mode = "prefer" if str(args.sec_cache_profile) == "backtest" else "network"
@@ -677,6 +1142,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 industry_cache_output_path=output_root / "industry_map_dynamic.csv",
                 submissions_workers=int(args.sec_submissions_workers),
             )
+            phase_timings.finish(
+                "sec_industry_map",
+                {
+                    "symbol_count": len(symbols),
+                    "industry_record_count": len(industry_map),
+                    "cache_mode": sec_cache_mode,
+                    "cache_source": sec_cache_source,
+                    "submissions_workers": int(args.sec_submissions_workers),
+                },
+            )
+            phase_timings.start(
+                "alpha_core_build",
+                {
+                    "symbol_count": len(symbols),
+                    "feed": str(args.feed),
+                    "companyfacts_workers": int(args.sec_companyfacts_workers),
+                    "sec_cache_mode": sec_cache_mode,
+                },
+            )
             alpha_core = AlphaCore(
                 alpaca_client=client,
                 sec_client=sec_client,
@@ -701,7 +1185,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             alpha_panel = alpha_core.build_for_date(as_of_date=decision_date.isoformat(), symbols=symbols)
             alpha_path = output_root / f"alpha_core_panel_{decision_date.strftime('%Y%m%d')}.csv"
             alpha_panel.to_csv(alpha_path, index=False)
+            phase_timings.finish(
+                "alpha_core_build",
+                {
+                    "alpha_row_count": len(alpha_panel),
+                    "alpha_column_count": len(alpha_panel.columns),
+                    "sec_cache_source": sec_cache_source,
+                },
+            )
 
+            phase_timings.start(
+                "portfolio_decision",
+                {
+                    "source": "decision_engine",
+                    "alpha_row_count": len(alpha_panel),
+                },
+            )
             decision_config = DecisionConfig(
                 factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
                 factor_min_holds=dict(DEFAULT_FACTOR_MIN_HOLDS),
@@ -744,6 +1243,74 @@ def main(argv: Sequence[str] | None = None) -> int:
             decision_targets_path = output_root / "decision_targets.csv"
             target_signed_weights = _signed_weights_from_lot(lot_manager)
             _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
+            phase_timings.finish(
+                "portfolio_decision",
+                {
+                    "decision_status": decision_status,
+                    "decision_skip_reason": decision_skip_reason,
+                    "target_symbol_count": len(target_signed_weights),
+                },
+            )
+
+        if source_universe_input_path is not None:
+            decision_universe_path = (
+                source_universe_input_path.parent / "symbol_universe_intersection.json"
+            )
+            decision_universe = _load_json_dict(decision_universe_path)
+            decision_final_symbols = [
+                str(symbol).strip().upper()
+                for symbol in (decision_universe.get("final_intersection_symbols") or [])
+                if str(symbol).strip()
+            ]
+            coverage_symbols = sorted(
+                set(decision_final_symbols)
+                | set(target_signed_weights)
+                | set(broker_signed_notional_before)
+            )
+            symbol_universe_quote_client = _new_longbridge_quote_client(args)
+            current_longbridge_coverage = symbol_universe_quote_client.check_symbol_coverage(
+                coverage_symbols,
+                chunk_size=int(args.longbridge_coverage_chunk_size),
+            )
+            symbol_universe_snapshot = _build_execution_symbol_universe_snapshot(
+                decision_snapshot_path=decision_universe_path,
+                target_signed_weights=target_signed_weights,
+                broker_weights=broker_weights_before,
+                current_longbridge_coverage=current_longbridge_coverage,
+                decision_date=decision_date,
+            )
+            _write_symbol_universe_artifacts(output_root, symbol_universe_snapshot)
+            if symbol_universe_snapshot.get("status") != "pass":
+                raise LongbridgeQuoteError(
+                    "Decision/execute symbol-universe validation failed: "
+                    f"blocking_symbols={symbol_universe_snapshot.get('blocking_symbols')}, "
+                    f"coverage_errors={current_longbridge_coverage.get('errors')}"
+                )
+            if str(args.execution_quote_provider).lower() == "longbridge":
+                execution_quote_client = symbol_universe_quote_client
+                symbol_universe_quote_client = None
+            else:
+                symbol_universe_quote_client.close()
+                symbol_universe_quote_client = None
+        elif symbol_universe_snapshot:
+            target_scope = _target_scope_assessment(
+                target_signed_weights=target_signed_weights,
+                broker_weights=broker_weights_before,
+                strategy_symbols=symbol_universe_snapshot.get("final_intersection_symbols") or [],
+            )
+            symbol_universe_snapshot["target_scope"] = target_scope
+            symbol_universe_snapshot["status"] = (
+                "error" if target_scope.get("status") != "pass" else symbol_universe_snapshot.get("status")
+            )
+            _write_symbol_universe_artifacts(output_root, symbol_universe_snapshot)
+            if target_scope.get("status") != "pass":
+                raise ValueError(
+                    "Decision produced out-of-intersection target exposure: "
+                    f"{target_scope.get('invalid_target_scope_symbols')}"
+                )
+            if symbol_universe_quote_client is not None:
+                symbol_universe_quote_client.close()
+                symbol_universe_quote_client = None
         _mark_event(
             run_events,
             "decision_targets_resolved",
@@ -752,6 +1319,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "target_symbol_count": len(target_signed_weights),
                 "decision_targets_path": decision_targets_path.as_posix() if decision_targets_path else None,
             },
+        )
+        phase_timings.start(
+            "market_and_price_evidence",
+            {"target_symbol_count": len(target_signed_weights)},
         )
         assets = client.list_assets(status="active", asset_class="us_equity")
         _write_json_file(
@@ -772,13 +1343,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             alpha_panel=alpha_panel,
             broker_positions=broker_frame_before,
         )
-        reference_prices = _resolve_reference_prices(
-            client=client,
-            symbols=sorted(set(target_signed_weights) | set(broker_signed_notional_before)),
-            fallback_prices=fallback_prices,
-            feed=str(args.execution_price_feed),
-            prefer_live=True,
-        )
         reference_price_symbols = sorted(set(target_signed_weights) | set(broker_signed_notional_before))
         benchmark_symbols = sorted(
             {
@@ -788,18 +1352,101 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         audit_price_symbols = sorted(set(reference_price_symbols) | set(benchmark_symbols))
+        configured_quote_provider = str(args.execution_quote_provider).lower()
+        execution_input_run = bool(str(args.decision_targets_input_path or "").strip())
+        active_quote_provider = (
+            configured_quote_provider if should_submit or execution_input_run else "alpaca"
+        )
+        if active_quote_provider == "longbridge":
+            if not isinstance(execution_quote_client, LongbridgeQuoteClient):
+                execution_quote_client = _new_longbridge_quote_client(args)
+            quote_provider_health = execution_quote_client.start(audit_price_symbols)
+        else:
+            execution_quote_client = client
+            quote_provider_health = {
+                "schema_version": "1.0",
+                "collected_at_utc": _utc_now(),
+                "provider": "alpaca",
+                "feed": str(args.execution_price_feed),
+                "configured_provider": configured_quote_provider,
+                "active_provider_reason": (
+                    "submission_disabled" if configured_quote_provider != "alpaca" else "configured"
+                ),
+                "requested_symbol_count": len(audit_price_symbols),
+                "status": "pass",
+            }
+        quote_provider_health.update(
+            {
+                "configured_provider": configured_quote_provider,
+                "active_provider": active_quote_provider,
+                "submission_enabled": bool(should_submit),
+                "execution_input_run": bool(execution_input_run),
+            }
+        )
+        _write_json_file(output_root / "execution_quote_provider_health.json", quote_provider_health)
+        _mark_event(
+            run_events,
+            "execution_quote_provider_ready",
+            {
+                "configured_provider": configured_quote_provider,
+                "active_provider": active_quote_provider,
+                "feed": quote_provider_health.get("feed"),
+                "status": quote_provider_health.get("status"),
+                "requested_symbol_count": len(audit_price_symbols),
+            },
+        )
+        execution_quote_feed = str(
+            getattr(execution_quote_client, "feed_name", None) or args.execution_price_feed
+        )
+        reference_prices = _resolve_reference_prices(
+            client=execution_quote_client,
+            symbols=reference_price_symbols,
+            fallback_prices=fallback_prices,
+            feed=execution_quote_feed,
+            prefer_live=True,
+            allow_fallback=active_quote_provider != "longbridge",
+            require_fresh=active_quote_provider == "longbridge",
+        )
+        missing_live_reference_symbols = sorted(set(reference_price_symbols) - set(reference_prices))
+        if active_quote_provider == "longbridge" and missing_live_reference_symbols:
+            raise LongbridgeQuoteError(
+                "Longbridge is missing execution reference prices for: "
+                + ", ".join(missing_live_reference_symbols)
+            )
         latest_trades_snapshot = _safe_broker_call(
             "get_latest_trades_for_reference_symbols",
-            lambda: client.get_latest_trades(symbols=audit_price_symbols, feed=str(args.execution_price_feed))
+            lambda: execution_quote_client.get_latest_trades(
+                symbols=audit_price_symbols,
+                feed=execution_quote_feed,
+            )
             if audit_price_symbols
             else {},
+        )
+        latest_trades_snapshot.update(
+            {
+                "provider": active_quote_provider,
+                "feed": execution_quote_feed,
+                "requested_symbols": audit_price_symbols,
+                "requested_symbol_count": len(audit_price_symbols),
+            }
         )
         _write_json_file(output_root / "execution_latest_trades_snapshot.json", latest_trades_snapshot)
         latest_quotes_snapshot = _safe_broker_call(
             "get_latest_quotes_for_reference_symbols",
-            lambda: client.get_latest_quotes(symbols=audit_price_symbols, feed=str(args.execution_price_feed))
+            lambda: execution_quote_client.get_latest_quotes(
+                symbols=audit_price_symbols,
+                feed=execution_quote_feed,
+            )
             if audit_price_symbols
             else {},
+        )
+        latest_quotes_snapshot.update(
+            {
+                "provider": active_quote_provider,
+                "feed": execution_quote_feed,
+                "requested_symbols": audit_price_symbols,
+                "requested_symbol_count": len(audit_price_symbols),
+            }
         )
         _write_json_file(output_root / "execution_latest_quotes_snapshot.json", latest_quotes_snapshot)
         _write_json_file(
@@ -816,7 +1463,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root / "execution_price_snapshot.json",
             {
                 "collected_at_utc": _utc_now(),
-                "feed": str(args.execution_price_feed),
+                "provider": active_quote_provider,
+                "feed": execution_quote_feed,
+                "alpaca_intraday_bar_feed": str(args.execution_price_feed),
                 "target_symbols": sorted(target_signed_weights),
                 "broker_position_symbols_before": sorted(broker_signed_notional_before),
                 "audit_benchmark_symbols": benchmark_symbols,
@@ -829,6 +1478,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if symbol not in reference_prices
                 ),
             },
+        )
+        phase_timings.finish(
+            "market_and_price_evidence",
+            {
+                "active_asset_count": len(assets),
+                "audit_price_symbol_count": len(audit_price_symbols),
+                "reference_price_count": len(reference_prices),
+                "missing_reference_price_count": len(
+                    (set(target_signed_weights) | set(broker_signed_notional_before)) - set(reference_prices)
+                ),
+            },
+        )
+        phase_timings.start(
+            "account_sizing_and_projection",
+            {"gross_capacity_target_ratio": float(args.gross_capacity_target_ratio)},
         )
 
         adverse_price_offset_bps = float(args.adverse_price_offset_bps)
@@ -915,6 +1579,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         capacity_adjusted_target_signed_weights = dict(
             executable_projection_diag.get("capacity_adjusted_target_signed_weights") or {}
         )
+        submission_capability_guard = _build_submission_capability_guard(
+            raw_target_signed_weights=raw_target_signed_weights,
+            capacity_adjusted_target_signed_weights=capacity_adjusted_target_signed_weights,
+            executable_expected_signed_weights=executable_expected_signed_weights,
+            current_signed_notional=broker_signed_notional_before,
+            account_equity=sizing_equity,
+            shorting_enabled=shorting_enabled,
+            material_notional_tolerance=float(effective_min_trade_notional),
+        )
+        executable_projection_diag["submission_capability_guard"] = submission_capability_guard
         final_executable_projection_diag = executable_projection_diag
         target_short_floor_diag = {
             "legacy_projection_replaced": True,
@@ -966,6 +1640,76 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "min_trade_weight_bps": float(args.min_trade_weight_bps),
             },
         )
+        input_target_path = None
+        if args.decision_targets_input_path:
+            input_target_path = Path(str(args.decision_targets_input_path)).resolve().as_posix()
+        elif args.order_plan_input_path:
+            input_target_path = Path(str(args.order_plan_input_path)).resolve().as_posix()
+        target_capability_snapshot = _build_target_capability_snapshot(
+            raw_target_signed_weights=raw_target_signed_weights,
+            projection=executable_projection_diag,
+            assets_by_symbol=assets_by_symbol,
+            account_shorting_enabled=shorting_enabled,
+            run_role="execute" if should_submit else "decision",
+            input_target_path=input_target_path,
+        )
+        target_capability_snapshot_path = output_root / "target_capability_snapshot.json"
+        target_capability_snapshot_csv_path = output_root / "target_capability_snapshot.csv"
+        _write_json_file(target_capability_snapshot_path, target_capability_snapshot)
+        pd.DataFrame(target_capability_snapshot.get("rows") or []).to_csv(
+            target_capability_snapshot_csv_path,
+            index=False,
+        )
+        prior_target_capability_path = (
+            Path(input_target_path).parent / "target_capability_snapshot.json"
+            if input_target_path
+            else None
+        )
+        prior_target_capability = (
+            _read_json_artifact(prior_target_capability_path, {})
+            if prior_target_capability_path and prior_target_capability_path.exists()
+            else None
+        )
+        target_capability_drift = _build_target_capability_drift(
+            current_snapshot=target_capability_snapshot,
+            prior_snapshot=prior_target_capability
+            if isinstance(prior_target_capability, Mapping)
+            else None,
+            prior_snapshot_path=prior_target_capability_path,
+        )
+        target_capability_drift_path = output_root / "target_capability_drift.json"
+        target_capability_drift_csv_path = output_root / "target_capability_drift.csv"
+        _write_json_file(target_capability_drift_path, target_capability_drift)
+        pd.DataFrame(target_capability_drift.get("rows") or []).to_csv(
+            target_capability_drift_csv_path,
+            index=False,
+        )
+        _mark_event(
+            run_events,
+            "target_capability_evidence_ready",
+            {
+                "blocked_target_count": target_capability_snapshot.get("blocked_target_count"),
+                "nonshortable_short_target_symbols": target_capability_snapshot.get(
+                    "nonshortable_short_target_symbols"
+                ),
+                "drift_status": target_capability_drift.get("status"),
+                "execution_blocking_change_symbols": target_capability_drift.get(
+                    "execution_blocking_change_symbols"
+                ),
+            },
+        )
+
+        if should_submit and submission_capability_guard["status"] == "blocked":
+            _mark_event(
+                run_events,
+                "submission_capability_blocked",
+                submission_capability_guard,
+            )
+            reasons = ", ".join(submission_capability_guard["blocking_reasons"])
+            raise RuntimeError(
+                "Execution blocked before order creation: projected portfolio cannot preserve "
+                f"the required long/short structure ({reasons})."
+            )
 
         instructions, skipped_orders = _build_order_instructions(
             target_signed_weights=target_signed_weights,
@@ -1101,6 +1845,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "floor_short_targets_to_whole_shares": bool(args.floor_short_targets_to_whole_shares),
                     "target_short_floor_diagnostics": target_short_floor_diag,
                     "executable_target_projection": executable_projection_diag,
+                    "target_capability_summary": {
+                        key: target_capability_snapshot.get(key)
+                        for key in (
+                            "blocked_target_count",
+                            "blocked_target_symbols",
+                            "nonshortable_short_target_count",
+                            "nonshortable_short_target_symbols",
+                            "projected_to_zero_count",
+                            "projected_to_zero_symbols",
+                        )
+                    },
+                    "target_capability_drift_summary": {
+                        key: target_capability_drift.get(key)
+                        for key in (
+                            "status",
+                            "changed_symbol_count",
+                            "execution_blocking_change_count",
+                            "execution_blocking_change_symbols",
+                            "became_nonshortable_symbols",
+                            "projected_to_zero_now_symbols",
+                        )
+                    },
                     "adverse_price_offset_bps": float(adverse_price_offset_bps),
                     "marketable_limit_base_offset_bps": float(marketable_limit_base_offset_bps),
                     "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
@@ -1139,6 +1905,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ensure_ascii=False,
             ),
             encoding="utf-8",
+        )
+        phase_timings.finish(
+            "account_sizing_and_projection",
+            {
+                "account_equity": float(sizing_equity),
+                "total_regt_buying_power_capacity": float(sizing_total_regt_capacity),
+                "raw_target_symbol_count": len(raw_target_signed_weights),
+                "projected_target_symbol_count": len(target_signed_weights),
+                "order_count": len(instructions),
+                "projection_solver_success": bool(executable_projection_diag.get("solver", {}).get("success")),
+                "tracking_error_l1_weight": executable_projection_diag.get("tracking_error_l1_weight"),
+            },
+        )
+        phase_timings.start(
+            "order_submission_and_tracking",
+            {
+                "submit_enabled": bool(should_submit),
+                "order_count": len(instructions),
+                "execution_mode": str(args.execution_mode),
+            },
         )
 
         execution_records: list[dict[str, Any]] = []
@@ -1225,6 +2011,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 execution_records, staged_diagnostics = _submit_staged_regt_orders(
                     client=client,
+                    execution_quote_client=(
+                        execution_quote_client if active_quote_provider == "longbridge" else None
+                    ),
                     initial_instructions=instructions,
                     target_signed_weights=target_signed_weights,
                     raw_target_signed_weights=raw_target_signed_weights,
@@ -1258,6 +2047,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     release_round_extra_bps=float(args.staged_release_round_extra_bps),
                     release_round_sleep_seconds=float(args.staged_release_round_sleep_seconds),
                     stage_snapshots=staged_rebuild_snapshots,
+                    initial_current_signed_qty=broker_signed_qty_before,
                 )
                 staged_expected_weights = (
                     staged_diagnostics.get("entry_projection", {}).get("executable_expected_signed_weights")
@@ -1290,9 +2080,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     marketable_limit_max_attempts=int(args.marketable_limit_max_attempts),
                     max_workers=int(args.execution_workers),
                     execution_price_feed=str(args.execution_price_feed),
+                    execution_quote_client=(
+                        execution_quote_client if active_quote_provider == "longbridge" else None
+                    ),
                 )
             submit_error_records = [
-                record for record in execution_records if str(record.get("status_latest") or "").lower() == "submit_error"
+                record
+                for record in execution_records
+                if str(record.get("status_latest") or "").lower()
+                in {"submit_error", "quote_unavailable"}
             ]
             submit_error_count = int(len(submit_error_records))
             if submit_error_records:
@@ -1314,6 +2110,62 @@ def main(argv: Sequence[str] | None = None) -> int:
             _mark_event(run_events, "order_submission_skipped_no_instructions", {})
         else:
             _mark_event(run_events, "order_submission_disabled", {"trigger_mode": str(args.trigger_mode)})
+        post_submission_quotes_path = output_root / "execution_latest_quotes_snapshot_post_submission.json"
+        if should_submit:
+            post_submission_quotes = _safe_broker_call(
+                "get_latest_quotes_post_submission",
+                lambda: execution_quote_client.get_latest_quotes(
+                    symbols=audit_price_symbols,
+                    feed=execution_quote_feed,
+                )
+                if audit_price_symbols
+                else {},
+            )
+            post_submission_quotes.update(
+                {
+                    "provider": active_quote_provider,
+                    "feed": execution_quote_feed,
+                    "requested_symbols": audit_price_symbols,
+                    "requested_symbol_count": len(audit_price_symbols),
+                }
+            )
+        else:
+            post_submission_quotes = {
+                "ok": True,
+                "name": "get_latest_quotes_post_submission",
+                "collected_at_utc": _utc_now(),
+                "provider": active_quote_provider,
+                "feed": execution_quote_feed,
+                "requested_symbols": [],
+                "requested_symbol_count": 0,
+                "payload": {},
+                "skipped": True,
+                "skip_reason": "submission_disabled",
+            }
+        _write_json_file(post_submission_quotes_path, post_submission_quotes)
+        _mark_event(
+            run_events,
+            "post_submission_quotes_collected",
+            {
+                "ok": bool(post_submission_quotes.get("ok")),
+                "requested_symbol_count": post_submission_quotes.get("requested_symbol_count"),
+                "path": post_submission_quotes_path.as_posix(),
+            },
+        )
+        phase_timings.finish(
+            "order_submission_and_tracking",
+            {
+                "execution_record_count": len(execution_records),
+                "submit_error_count": int(submit_error_count),
+                "skip_reason": None
+                if should_submit and instructions
+                else ("no_instructions" if should_submit else "submission_disabled"),
+            },
+        )
+        phase_timings.start(
+            "post_run_audit_and_finalize",
+            {"execution_record_count": len(execution_records)},
+        )
 
         if str(args.execution_mode) == "staged_regt":
             _write_json_file(
@@ -1404,11 +2256,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         latest_quotes_after_snapshot = _safe_broker_call(
             "get_latest_quotes_for_after_symbols",
-            lambda: client.get_latest_quotes(symbols=intraday_bar_symbols_after, feed=str(args.execution_price_feed))
+            lambda: execution_quote_client.get_latest_quotes(
+                symbols=intraday_bar_symbols_after,
+                feed=execution_quote_feed,
+            )
             if intraday_bar_symbols_after
             else {},
         )
+        latest_quotes_after_snapshot.update(
+            {
+                "provider": active_quote_provider,
+                "feed": execution_quote_feed,
+                "requested_symbols": intraday_bar_symbols_after,
+                "requested_symbol_count": len(intraday_bar_symbols_after),
+            }
+        )
         _write_json_file(output_root / "execution_latest_quotes_snapshot_after.json", latest_quotes_after_snapshot)
+        if isinstance(execution_quote_client, LongbridgeQuoteClient):
+            _write_json_file(
+                output_root / "execution_quote_provider_health_after.json",
+                execution_quote_client.health_snapshot(requested_symbols=intraday_bar_symbols_after),
+            )
+            execution_quote_client.close()
+            execution_quote_client = None
         _write_json_file(
             output_root / "broker_open_orders_after.json",
             _safe_broker_call(
@@ -1515,6 +2385,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         staged_abort_reason = str(staged_diagnostics.get("entry_abort_reason") or "") if staged_diagnostics else ""
         run_ok = bool(submit_error_count == 0 and not staged_abort_reason)
+        phase_timings.finish(
+            "post_run_audit_and_finalize",
+            {
+                "run_ok": bool(run_ok),
+                "position_count_after": len(positions_after),
+                "order_poll_event_count": int(order_poll_timeline.get("event_count") or 0),
+            },
+        )
+        decision_phase_timing_summary = phase_timings.finalize(
+            status="succeeded" if run_ok else "completed_with_errors",
+            context={
+                "run_ok": bool(run_ok),
+                "submit_enabled": bool(should_submit),
+            },
+        )
+        _mark_event(
+            run_events,
+            "decision_phase_timings_finalized",
+            {
+                "path": phase_timings.path.as_posix(),
+                "elapsed_seconds": decision_phase_timing_summary.get("elapsed_seconds"),
+                "decision_compute_elapsed_seconds": decision_phase_timing_summary.get(
+                    "decision_compute_elapsed_seconds"
+                ),
+                "slowest_phase": decision_phase_timing_summary.get("slowest_phase"),
+            },
+        )
         _mark_event(run_events, "execution_summary_ready", {"ok": bool(run_ok)})
         _write_json_file(
             run_context_path,
@@ -1541,6 +2438,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "target_ny_time": str(args.target_ny_time),
             "execution_mode": str(args.execution_mode),
             "execution_order_style": str(args.execution_order_style),
+            "execution_quote_provider_configured": configured_quote_provider,
+            "execution_quote_provider_active": active_quote_provider,
+            "execution_quote_feed": execution_quote_feed,
+            "execution_quote_provider_health": quote_provider_health,
+            "alpaca_intraday_bar_feed": str(args.execution_price_feed),
             "adverse_price_offset_bps": float(adverse_price_offset_bps),
             "marketable_limit_base_offset_bps": float(marketable_limit_base_offset_bps),
             "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
@@ -1558,6 +2460,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             "qty_decimals": int(args.qty_decimals),
             "decision_status": decision_status,
             "decision_skip_reason": decision_skip_reason,
+            "decision_phase_timings": decision_phase_timing_summary,
+            "target_capability_summary": {
+                key: target_capability_snapshot.get(key)
+                for key in (
+                    "blocked_target_count",
+                    "blocked_target_symbols",
+                    "nonshortable_short_target_count",
+                    "nonshortable_short_target_symbols",
+                    "projected_to_zero_count",
+                    "projected_to_zero_symbols",
+                )
+            },
+            "target_capability_drift_summary": {
+                key: target_capability_drift.get(key)
+                for key in (
+                    "status",
+                    "changed_symbol_count",
+                    "execution_blocking_change_count",
+                    "execution_blocking_change_symbols",
+                    "became_nonshortable_symbols",
+                    "projected_to_zero_now_symbols",
+                )
+            },
+            "symbol_universe_intersection_summary": {
+                key: symbol_universe_snapshot.get(key)
+                for key in (
+                    "mode",
+                    "status",
+                    "configured_count",
+                    "alpaca_clean_core_count",
+                    "alpaca_tradable_count",
+                    "longbridge_covered_count",
+                    "longbridge_covered_count_at_decision",
+                    "final_intersection_count",
+                    "dynamic_selected_count",
+                    "coverage_lost_since_decision_count",
+                    "coverage_lost_since_decision_symbols",
+                    "required_symbols_without_coverage",
+                    "blocking_symbols",
+                )
+            },
             "dynamic_symbols": int(len(symbols)),
             "order_plan_count": int(len(instructions)),
             "submitted": bool(should_submit),
@@ -1582,6 +2525,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "outputs": {
                 "run_context_json": run_context_path.as_posix(),
                 "run_events_jsonl": (output_root / "run_events.jsonl").as_posix(),
+                "decision_phase_timings_json": phase_timings.path.as_posix(),
+                "target_capability_snapshot_json": target_capability_snapshot_path.as_posix(),
+                "target_capability_snapshot_csv": target_capability_snapshot_csv_path.as_posix(),
+                "target_capability_drift_json": target_capability_drift_path.as_posix(),
+                "target_capability_drift_csv": target_capability_drift_csv_path.as_posix(),
+                "symbol_universe_intersection_json": symbol_universe_json_path.as_posix(),
+                "symbol_universe_intersection_csv": symbol_universe_csv_path.as_posix(),
                 "runtime_environment_snapshot_json": (output_root / "runtime_environment_snapshot.json").as_posix(),
                 "alpaca_api_audit_jsonl": alpaca_api_audit_path.as_posix(),
                 "source_code_manifest_json": (output_root / "source_code_manifest.json").as_posix(),
@@ -1642,7 +2592,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "broker_assets_active_us_equity_json": (output_root / "broker_assets_active_us_equity.json").as_posix(),
                 "broker_assets_relevant_json": (output_root / "broker_assets_relevant.json").as_posix(),
                 "execution_latest_trades_snapshot_json": (output_root / "execution_latest_trades_snapshot.json").as_posix(),
+                "execution_quote_provider_health_json": (
+                    output_root / "execution_quote_provider_health.json"
+                ).as_posix(),
+                "execution_quote_provider_health_after_json": (
+                    (output_root / "execution_quote_provider_health_after.json").as_posix()
+                    if (output_root / "execution_quote_provider_health_after.json").exists()
+                    else None
+                ),
                 "execution_latest_quotes_snapshot_json": (output_root / "execution_latest_quotes_snapshot.json").as_posix(),
+                "execution_latest_quotes_snapshot_post_submission_json": (
+                    post_submission_quotes_path.as_posix()
+                ),
                 "execution_latest_quotes_snapshot_after_json": (
                     output_root / "execution_latest_quotes_snapshot_after.json"
                 ).as_posix(),
@@ -1674,7 +2635,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(execution_summary, indent=2, ensure_ascii=False))
         return 0 if run_ok else 1
     except (ValueError, FileNotFoundError, AlpacaRequestError, RuntimeError, Exception) as exc:
+        if isinstance(execution_quote_client, LongbridgeQuoteClient):
+            try:
+                execution_quote_client.close()
+            except Exception:
+                pass
+        if isinstance(symbol_universe_quote_client, LongbridgeQuoteClient):
+            try:
+                symbol_universe_quote_client.close()
+            except Exception:
+                pass
         failed_at_utc = _utc_now()
+        decision_phase_timing_summary = None
+        if "phase_timings" in locals():
+            try:
+                decision_phase_timing_summary = phase_timings.fail(exc)
+            except Exception:
+                pass
         if "run_events" in locals():
             try:
                 _mark_event(
@@ -1695,6 +2672,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "traceback": traceback.format_exc(),
             "failed_at_utc": failed_at_utc,
         }
+        if decision_phase_timing_summary is not None:
+            error_summary["decision_phase_timings"] = decision_phase_timing_summary
+            error_summary["outputs"] = {
+                "decision_phase_timings_json": phase_timings.path.as_posix(),
+            }
         if "output_root" in locals():
             try:
                 Path(output_root).mkdir(parents=True, exist_ok=True)
@@ -1869,6 +2851,301 @@ def _target_weights_to_frame(target_signed_weights: Mapping[str, float]) -> pd.D
     if not frame.empty:
         frame = frame.sort_values(["side", "side_weight"], ascending=[True, False]).reset_index(drop=True)
     return frame
+
+
+def _new_longbridge_quote_client(args: argparse.Namespace) -> LongbridgeQuoteClient:
+    credentials = LongbridgeCredentials.from_sources(args.longbridge_config_path)
+    return LongbridgeQuoteClient(
+        credentials,
+        warmup_timeout_seconds=float(args.longbridge_warmup_timeout_seconds),
+        max_quote_age_seconds=float(args.longbridge_max_quote_age_seconds),
+        max_spread_bps=float(args.longbridge_max_spread_bps),
+        max_subscriptions=int(args.longbridge_max_subscriptions),
+    )
+
+
+def _coverage_rows_by_symbol(coverage: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = coverage.get("rows") if isinstance(coverage, Mapping) else None
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return {}
+    return {
+        str(row.get("symbol") or "").strip().upper(): dict(row)
+        for row in rows
+        if isinstance(row, Mapping) and str(row.get("symbol") or "").strip()
+    }
+
+
+def _build_decision_symbol_universe_snapshot(
+    *,
+    candidate_symbols_path: Path,
+    candidate_symbols: Sequence[str],
+    alpaca_assets: Sequence[dict[str, Any]],
+    longbridge_coverage: Mapping[str, Any],
+    decision_date: date,
+) -> dict[str, Any]:
+    configured = sorted(
+        {str(symbol or "").strip().upper() for symbol in candidate_symbols if str(symbol or "").strip()}
+    )
+    configured_set = set(configured)
+    clean_core = _build_runtime_clean_core_symbol_set(alpaca_assets)
+    tradable = _build_tradable_symbol_set(alpaca_assets)
+    alpaca_symbols = {
+        str(asset.get("symbol") or "").strip().upper()
+        for asset in alpaca_assets
+        if isinstance(asset, Mapping) and str(asset.get("symbol") or "").strip()
+    }
+    coverage_rows = _coverage_rows_by_symbol(longbridge_coverage)
+    longbridge_covered = {
+        symbol for symbol, row in coverage_rows.items() if bool(row.get("covered"))
+    }
+    final_intersection = sorted(configured_set & clean_core & tradable & longbridge_covered)
+    rows: list[dict[str, Any]] = []
+    rejection_counts: Counter[str] = Counter()
+    for symbol in configured:
+        coverage_row = coverage_rows.get(symbol, {})
+        reasons: list[str] = []
+        if symbol not in alpaca_symbols:
+            reasons.append("missing_alpaca_active_asset")
+        if symbol not in clean_core:
+            reasons.append("not_alpaca_clean_core")
+        if symbol not in tradable:
+            reasons.append("not_alpaca_tradable")
+        if symbol not in longbridge_covered:
+            reasons.append(str(coverage_row.get("coverage_reason") or "longbridge_missing_quote"))
+        rejection_counts.update(reasons)
+        rows.append(
+            {
+                "symbol": symbol,
+                "configured": True,
+                "alpaca_active_asset": symbol in alpaca_symbols,
+                "alpaca_clean_core": symbol in clean_core,
+                "alpaca_tradable": symbol in tradable,
+                "longbridge_returned": bool(coverage_row.get("returned")),
+                "longbridge_covered": symbol in longbridge_covered,
+                "longbridge_permanently_unavailable": bool(
+                    coverage_row.get("permanently_unavailable")
+                ),
+                "longbridge_trade_status": coverage_row.get("trade_status"),
+                "longbridge_last_price": coverage_row.get("last_price"),
+                "longbridge_quote_timestamp_utc": coverage_row.get("quote_timestamp_utc"),
+                "longbridge_coverage_reason": coverage_row.get("coverage_reason"),
+                "in_final_intersection": symbol in final_intersection,
+                "rejection_reasons": reasons,
+            }
+        )
+    coverage_errors = list(longbridge_coverage.get("errors") or [])
+    return {
+        "schema_version": "1.0",
+        "artifact_type": "symbol_universe_intersection",
+        "mode": "decision",
+        "generated_at_utc": _utc_now(),
+        "decision_date": decision_date.isoformat(),
+        "status": "error" if coverage_errors else "pass" if final_intersection else "empty",
+        "configured_candidate_file": {
+            "path": candidate_symbols_path.resolve().as_posix(),
+            "bytes": candidate_symbols_path.stat().st_size if candidate_symbols_path.exists() else None,
+            "sha256": _sha256_file(candidate_symbols_path),
+        },
+        "configured_count": len(configured),
+        "alpaca_active_asset_count": len(configured_set & alpaca_symbols),
+        "alpaca_clean_core_count": len(configured_set & clean_core),
+        "alpaca_tradable_count": len(configured_set & tradable),
+        "longbridge_returned_count": len(configured_set & set(coverage_rows)),
+        "longbridge_covered_count": len(configured_set & longbridge_covered),
+        "final_intersection_count": len(final_intersection),
+        "configured_symbols": configured,
+        "alpaca_clean_core_symbols": sorted(configured_set & clean_core),
+        "alpaca_tradable_symbols": sorted(configured_set & tradable),
+        "longbridge_covered_symbols": sorted(configured_set & longbridge_covered),
+        "final_intersection_symbols": final_intersection,
+        "rejected_symbols": [row["symbol"] for row in rows if not row["in_final_intersection"]],
+        "rejection_reason_counts": dict(sorted(rejection_counts.items())),
+        "longbridge_coverage": dict(longbridge_coverage),
+        "rows": rows,
+        "scope_rule": (
+            "configured candidates intersect Alpaca active clean-core/tradable assets "
+            "intersect Longbridge covered symbols"
+        ),
+    }
+
+
+def _target_scope_assessment(
+    *,
+    target_signed_weights: Mapping[str, float],
+    broker_weights: Mapping[str, float],
+    strategy_symbols: Sequence[str],
+) -> dict[str, Any]:
+    allowed = {str(symbol).strip().upper() for symbol in strategy_symbols if str(symbol).strip()}
+    target_symbols = {
+        str(symbol).strip().upper()
+        for symbol, weight in target_signed_weights.items()
+        if str(symbol).strip() and abs(float(weight)) > EPS
+    }
+    held_symbols = {
+        str(symbol).strip().upper()
+        for symbol, weight in broker_weights.items()
+        if str(symbol).strip() and abs(float(weight)) > EPS
+    }
+    outside = sorted(target_symbols - allowed)
+    held_outside = sorted(held_symbols - allowed)
+    exit_only: list[str] = []
+    invalid: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for symbol in outside:
+        target_weight = float(target_signed_weights.get(symbol) or 0.0)
+        current_weight = float(broker_weights.get(symbol) or 0.0)
+        same_direction = target_weight * current_weight >= -EPS
+        non_increasing = abs(target_weight) <= abs(current_weight) + 1e-6
+        allowed_exit_only = symbol in held_symbols and same_direction and non_increasing
+        (exit_only if allowed_exit_only else invalid).append(symbol)
+        rows.append(
+            {
+                "symbol": symbol,
+                "target_weight": target_weight,
+                "current_weight": current_weight,
+                "same_direction": same_direction,
+                "non_increasing_exposure": non_increasing,
+                "classification": "exit_only" if allowed_exit_only else "invalid_out_of_scope_target",
+            }
+        )
+    return {
+        "target_symbol_count": len(target_symbols),
+        "held_symbol_count": len(held_symbols),
+        "target_symbols": sorted(target_symbols),
+        "held_symbols": sorted(held_symbols),
+        "held_symbols_outside_intersection": held_outside,
+        "target_symbols_outside_intersection": outside,
+        "exit_only_symbols": sorted(exit_only),
+        "invalid_target_scope_symbols": sorted(invalid),
+        "rows": rows,
+        "status": "error" if invalid else "pass",
+    }
+
+
+def _build_execution_symbol_universe_snapshot(
+    *,
+    decision_snapshot_path: Path,
+    target_signed_weights: Mapping[str, float],
+    broker_weights: Mapping[str, float],
+    current_longbridge_coverage: Mapping[str, Any],
+    decision_date: date,
+) -> dict[str, Any]:
+    decision_snapshot = _load_json_dict(decision_snapshot_path)
+    if str(decision_snapshot.get("artifact_type") or "") != "symbol_universe_intersection":
+        raise ValueError(
+            f"Invalid decision symbol-universe snapshot: {decision_snapshot_path.as_posix()}"
+        )
+    if str(decision_snapshot.get("status") or "") != "pass":
+        raise ValueError(
+            f"Decision symbol-universe snapshot is not pass: {decision_snapshot_path.as_posix()}"
+        )
+    decision_final = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in (decision_snapshot.get("final_intersection_symbols") or [])
+            if str(symbol).strip()
+        }
+    )
+    if not decision_final:
+        raise ValueError(
+            f"Decision symbol-universe snapshot has an empty final intersection: "
+            f"{decision_snapshot_path.as_posix()}"
+        )
+    current_covered = {
+        str(symbol).strip().upper()
+        for symbol in (current_longbridge_coverage.get("covered_symbols") or [])
+        if str(symbol).strip()
+    }
+    scope = _target_scope_assessment(
+        target_signed_weights=target_signed_weights,
+        broker_weights=broker_weights,
+        strategy_symbols=decision_final,
+    )
+    target_symbols = set(scope["target_symbols"])
+    held_symbols = set(scope["held_symbols"])
+    required_quote_symbols = sorted(target_symbols | held_symbols)
+    required_without_coverage = sorted(set(required_quote_symbols) - current_covered)
+    lost_coverage = sorted(set(decision_final) - current_covered)
+    coverage_errors = list(current_longbridge_coverage.get("errors") or [])
+    blocking_symbols = sorted(
+        set(scope["invalid_target_scope_symbols"]) | set(required_without_coverage)
+    )
+    rows: list[dict[str, Any]] = []
+    current_rows = _coverage_rows_by_symbol(current_longbridge_coverage)
+    for symbol in sorted(set(decision_final) | target_symbols | held_symbols):
+        current_row = current_rows.get(symbol, {})
+        rows.append(
+            {
+                "symbol": symbol,
+                "in_decision_intersection": symbol in decision_final,
+                "is_target": symbol in target_symbols,
+                "is_held": symbol in held_symbols,
+                "required_for_execution": symbol in required_quote_symbols,
+                "current_longbridge_covered": symbol in current_covered,
+                "coverage_lost_since_decision": symbol in lost_coverage,
+                "current_longbridge_trade_status": current_row.get("trade_status"),
+                "current_longbridge_last_price": current_row.get("last_price"),
+                "current_longbridge_coverage_reason": current_row.get("coverage_reason"),
+                "blocking": symbol in blocking_symbols,
+            }
+        )
+    return {
+        "schema_version": "1.0",
+        "artifact_type": "symbol_universe_intersection",
+        "mode": "execute_validation",
+        "generated_at_utc": _utc_now(),
+        "decision_date": decision_date.isoformat(),
+        "status": "error" if coverage_errors or blocking_symbols else "pass",
+        "decision_snapshot": {
+            "path": decision_snapshot_path.resolve().as_posix(),
+            "bytes": decision_snapshot_path.stat().st_size,
+            "sha256": _sha256_file(decision_snapshot_path),
+            "generated_at_utc": decision_snapshot.get("generated_at_utc"),
+            "decision_status": decision_snapshot.get("status"),
+        },
+        "configured_count": int(decision_snapshot.get("configured_count") or 0),
+        "alpaca_clean_core_count": int(decision_snapshot.get("alpaca_clean_core_count") or 0),
+        "alpaca_tradable_count": int(decision_snapshot.get("alpaca_tradable_count") or 0),
+        "longbridge_covered_count_at_decision": int(
+            decision_snapshot.get("longbridge_covered_count") or 0
+        ),
+        "final_intersection_count": len(decision_final),
+        "final_intersection_symbols": decision_final,
+        "current_longbridge_covered_count": len(current_covered),
+        "coverage_lost_since_decision_count": len(lost_coverage),
+        "coverage_lost_since_decision_symbols": lost_coverage,
+        "required_quote_symbol_count": len(required_quote_symbols),
+        "required_quote_symbols": required_quote_symbols,
+        "required_symbols_without_coverage": required_without_coverage,
+        "target_scope": scope,
+        "blocking_symbols": blocking_symbols,
+        "current_longbridge_coverage": dict(current_longbridge_coverage),
+        "rows": rows,
+    }
+
+
+def _write_symbol_universe_artifacts(
+    output_root: Path,
+    snapshot: Mapping[str, Any],
+) -> tuple[Path, Path]:
+    json_path = output_root / "symbol_universe_intersection.json"
+    csv_path = output_root / "symbol_universe_intersection.csv"
+    _write_json_file(json_path, dict(snapshot))
+    rows = snapshot.get("rows") if isinstance(snapshot, Mapping) else []
+    frame_rows: list[dict[str, Any]] = []
+    if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+        for raw_row in rows:
+            if not isinstance(raw_row, Mapping):
+                continue
+            row = dict(raw_row)
+            rejection_reasons = row.get("rejection_reasons")
+            if isinstance(rejection_reasons, Sequence) and not isinstance(
+                rejection_reasons, (str, bytes)
+            ):
+                row["rejection_reasons"] = "|".join(str(item) for item in rejection_reasons)
+            frame_rows.append(row)
+    pd.DataFrame(frame_rows).to_csv(csv_path, index=False)
+    return json_path, csv_path
 
 
 def _safe_float(value: Any) -> float | None:
@@ -2129,11 +3406,13 @@ def _chunks(values: Sequence[str], size: int) -> list[list[str]]:
 
 def _resolve_reference_prices(
     *,
-    client: AlpacaHttpClient,
+    client: Any,
     symbols: Sequence[str],
     fallback_prices: Mapping[str, float],
     feed: str,
     prefer_live: bool = False,
+    allow_fallback: bool = True,
+    require_fresh: bool = False,
 ) -> dict[str, float]:
     fallback: dict[str, float] = {
         str(symbol).upper(): float(price)
@@ -2143,17 +3422,29 @@ def _resolve_reference_prices(
     requested = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
     out: dict[str, float] = {} if prefer_live else dict(fallback)
     needed = requested if prefer_live else [symbol for symbol in requested if symbol not in out]
-    for chunk in _chunks(needed, 150):
-        try:
-            trades = client.get_latest_trades(symbols=chunk, feed=str(feed))
-        except AlpacaRequestError:
-            continue
-        for symbol, trade in trades.items():
-            px = _safe_float(trade.get("p"))
+    if hasattr(client, "get_reference_prices"):
+        live_prices = client.get_reference_prices(needed)
+        for symbol, price in live_prices.items():
+            px = _safe_float(price)
             if px is not None and px > 0:
                 out[str(symbol).upper()] = float(px)
-    for symbol, price in fallback.items():
-        out.setdefault(str(symbol).upper(), float(price))
+    else:
+        for chunk in _chunks(needed, 150):
+            try:
+                trades = client.get_latest_trades(symbols=chunk, feed=str(feed))
+            except AlpacaRequestError:
+                continue
+            for symbol, trade in trades.items():
+                px = _safe_float(trade.get("p"))
+                if px is not None and px > 0:
+                    out[str(symbol).upper()] = float(px)
+    if allow_fallback:
+        for symbol, price in fallback.items():
+            out.setdefault(str(symbol).upper(), float(price))
+    if require_fresh:
+        missing = sorted(set(requested) - set(out))
+        if missing:
+            raise LongbridgeQuoteError("Missing fresh Longbridge prices: " + ", ".join(missing))
     return out
 
 
@@ -2308,6 +3599,15 @@ def _build_order_instructions(
         if target_notional < -EPS:
             target_short_raw_qty = abs(target_notional) / float(sizing_price)
             target_short_qty = _projected_whole_share_qty(target_short_raw_qty)
+        target_signed_qty = 0.0
+        if target_notional > EPS:
+            target_signed_qty = _quantize_qty(
+                target_notional / float(sizing_price),
+                whole_shares_only=bool(whole_shares_only),
+                decimals=qty_decimals,
+            )
+        elif target_notional < -EPS:
+            target_signed_qty = -float(target_short_qty)
         if short_sale and target_short_qty > current_short_whole_qty + EPS:
             raw_qty = target_short_qty - current_short_whole_qty
         elif cover_short:
@@ -2384,6 +3684,8 @@ def _build_order_instructions(
                 target_notional=float(target_notional),
                 delta_notional=float(delta_notional),
                 opening_short=bool(opening_short),
+                current_signed_qty=float(signed_qty),
+                target_signed_qty=float(target_signed_qty),
             )
         )
     instructions.sort(key=lambda item: abs(item.delta_notional), reverse=True)
@@ -2404,10 +3706,72 @@ def _is_release_instruction(item: OrderInstruction) -> bool:
 
 def _split_release_entry_instructions(
     instructions: Sequence[OrderInstruction],
+    *,
+    current_signed_qty: Mapping[str, float] | None = None,
 ) -> tuple[list[OrderInstruction], list[OrderInstruction]]:
     release: list[OrderInstruction] = []
     entry: list[OrderInstruction] = []
     for item in instructions:
+        current_notional = float(item.current_notional)
+        target_notional = float(item.target_notional)
+        sign_flip = (
+            current_notional > EPS and target_notional < -EPS
+        ) or (
+            current_notional < -EPS and target_notional > EPS
+        )
+        if sign_flip:
+            symbol = str(item.symbol).upper()
+            current_qty_hint = _safe_float((current_signed_qty or {}).get(symbol))
+            if current_qty_hint is None:
+                current_qty_hint = _safe_float(item.current_signed_qty)
+            if current_qty_hint is None or current_qty_hint * current_notional <= 0:
+                current_qty_hint = math.copysign(
+                    abs(current_notional) / max(float(item.reference_price), 1e-9),
+                    current_notional,
+                )
+
+            target_qty_hint = _safe_float(item.target_signed_qty)
+            if target_qty_hint is None or target_qty_hint * target_notional <= 0:
+                target_qty_abs = abs(target_notional) / max(float(item.sizing_price), 1e-9)
+                if target_notional < -EPS:
+                    target_qty_abs = _projected_whole_share_qty(target_qty_abs)
+                target_qty_hint = math.copysign(target_qty_abs, target_notional)
+
+            close_qty = abs(float(current_qty_hint))
+            open_qty = abs(float(target_qty_hint))
+            if close_qty > EPS:
+                release.append(
+                    OrderInstruction(
+                        symbol=item.symbol,
+                        side="sell" if current_notional > 0 else "buy",
+                        qty=float(close_qty),
+                        reference_price=float(item.reference_price),
+                        sizing_price=float(item.sizing_price),
+                        current_notional=float(current_notional),
+                        target_notional=0.0,
+                        delta_notional=float(-current_notional),
+                        opening_short=False,
+                        current_signed_qty=float(current_qty_hint),
+                        target_signed_qty=0.0,
+                    )
+                )
+            if open_qty > EPS:
+                entry.append(
+                    OrderInstruction(
+                        symbol=item.symbol,
+                        side="sell" if target_notional < 0 else "buy",
+                        qty=float(open_qty),
+                        reference_price=float(item.reference_price),
+                        sizing_price=float(item.sizing_price),
+                        current_notional=0.0,
+                        target_notional=float(target_notional),
+                        delta_notional=float(target_notional),
+                        opening_short=bool(target_notional < 0),
+                        current_signed_qty=0.0,
+                        target_signed_qty=float(target_qty_hint),
+                    )
+                )
+            continue
         if _is_release_instruction(item):
             release.append(item)
         else:
@@ -2562,6 +3926,8 @@ def _scale_entry_instructions_to_buying_power(
                 target_notional=float(item.target_notional),
                 delta_notional=float(math.copysign(est_notional, item.delta_notional)),
                 opening_short=bool(item.opening_short),
+                current_signed_qty=item.current_signed_qty,
+                target_signed_qty=item.target_signed_qty,
             )
         )
     return out, {
@@ -3117,33 +4483,59 @@ def _collect_intraday_bars_snapshot(
     feed: str,
     label: str,
     chunk_size: int = 100,
+    fallback_feed: str | None = "sip",
 ) -> dict[str, Any]:
     requested_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
     start = f"{session_date.isoformat()}T00:00:00Z"
     end = f"{(session_date + timedelta(days=1)).isoformat()}T00:00:00Z"
     bars: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    for chunk_index, chunk in enumerate(_chunks(requested_symbols, chunk_size), start=1):
-        try:
-            bars.extend(
-                client.get_stock_bars(
+    source_by_symbol: dict[str, str] = {}
+
+    def collect(request_symbols: Sequence[str], *, request_feed: str, source: str) -> None:
+        for chunk_index, chunk in enumerate(_chunks(list(request_symbols), chunk_size), start=1):
+            try:
+                payload = client.get_stock_bars(
                     symbols=chunk,
                     start=start,
                     end=end,
                     timeframe="1Min",
                     adjustment="raw",
-                    feed=str(feed),
+                    feed=str(request_feed),
                     limit=10000,
                 )
-            )
-        except Exception as exc:
-            errors.append(
-                {
-                    "chunk_index": int(chunk_index),
-                    "symbols": list(chunk),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
+                for raw in payload:
+                    row = dict(raw) if isinstance(raw, Mapping) else raw
+                    if isinstance(row, dict):
+                        symbol = str(row.get("symbol") or "").strip().upper()
+                        row["capture_feed"] = str(request_feed)
+                        row["capture_source"] = str(source)
+                        if symbol:
+                            source_by_symbol[symbol] = str(request_feed)
+                    bars.append(row)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "source": str(source),
+                        "feed": str(request_feed),
+                        "chunk_index": int(chunk_index),
+                        "symbols": list(chunk),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+
+    collect(requested_symbols, request_feed=str(feed), source="primary")
+    primary_bar_symbols = sorted(source_by_symbol)
+    fallback_requested_symbols: list[str] = []
+    normalized_fallback_feed = str(fallback_feed or "").strip().lower()
+    if normalized_fallback_feed and normalized_fallback_feed != str(feed).strip().lower():
+        fallback_requested_symbols = sorted(set(requested_symbols) - set(primary_bar_symbols))
+        if fallback_requested_symbols:
+            collect(
+                fallback_requested_symbols,
+                request_feed=normalized_fallback_feed,
+                source="fallback_for_primary_missing",
             )
     bar_symbols = sorted(
         {
@@ -3160,6 +4552,21 @@ def _collect_intraday_bars_snapshot(
         "collected_at_utc": _utc_now(),
         "session_date": session_date.isoformat(),
         "feed": str(feed),
+        "primary_feed": str(feed),
+        "fallback_feed": normalized_fallback_feed or None,
+        "fallback_attempted": bool(fallback_requested_symbols),
+        "fallback_requested_symbol_count": len(fallback_requested_symbols),
+        "fallback_requested_symbols": fallback_requested_symbols,
+        "primary_bar_symbol_count": len(primary_bar_symbols),
+        "primary_bar_symbols": primary_bar_symbols,
+        "fallback_bar_symbol_count": sum(
+            source == normalized_fallback_feed for source in source_by_symbol.values()
+        ),
+        "fallback_bar_symbols": sorted(
+            symbol for symbol, source in source_by_symbol.items() if source == normalized_fallback_feed
+        ),
+        "source_by_symbol": dict(sorted(source_by_symbol.items())),
+        "source_counts": dict(sorted(Counter(source_by_symbol.values()).items())),
         "timeframe": "1Min",
         "adjustment": "raw",
         "start": start,
@@ -3171,7 +4578,24 @@ def _collect_intraday_bars_snapshot(
         "bar_count": len(bars),
         "missing_bar_symbols": sorted(set(requested_symbols) - set(bar_symbols)),
         "chunk_size": int(max(1, int(chunk_size))),
-        "chunk_count": int(math.ceil(len(requested_symbols) / max(1, int(chunk_size)))) if requested_symbols else 0,
+        "primary_chunk_count": int(math.ceil(len(requested_symbols) / max(1, int(chunk_size))))
+        if requested_symbols
+        else 0,
+        "fallback_chunk_count": int(
+            math.ceil(len(fallback_requested_symbols) / max(1, int(chunk_size)))
+        )
+        if fallback_requested_symbols
+        else 0,
+        "chunk_count": (
+            int(math.ceil(len(requested_symbols) / max(1, int(chunk_size))))
+            if requested_symbols
+            else 0
+        )
+        + (
+            int(math.ceil(len(fallback_requested_symbols) / max(1, int(chunk_size))))
+            if fallback_requested_symbols
+            else 0
+        ),
         "bars": [dict(row) if isinstance(row, Mapping) else row for row in bars],
         "errors": errors,
     }
@@ -3200,24 +4624,93 @@ def _marketable_offset_ladder(
 
 def _live_marketable_reference_price(
     *,
-    client: AlpacaHttpClient,
+    client: Any,
     instruction: OrderInstruction,
     execution_price_feed: str,
+    strict: bool = False,
 ) -> tuple[float, str, dict[str, Any] | None, str | None]:
     fallback = max(float(instruction.reference_price), 1e-9)
     try:
-        quotes = client.get_latest_quotes(
-            symbols=[str(instruction.symbol)],
-            feed=str(execution_price_feed),
-        )
-        quote = quotes.get(str(instruction.symbol).upper(), {})
+        if hasattr(client, "get_marketable_quote"):
+            quote = client.get_marketable_quote(str(instruction.symbol))
+        else:
+            quotes = client.get_latest_quotes(
+                symbols=[str(instruction.symbol)],
+                feed=str(execution_price_feed),
+            )
+            quote = quotes.get(str(instruction.symbol).upper(), {})
         field = "ap" if str(instruction.side).lower() == "buy" else "bp"
         live_price = _safe_float(quote.get(field)) if isinstance(quote, Mapping) else None
         if live_price is not None and live_price > EPS:
-            return float(live_price), f"latest_quote.{field}", dict(quote), None
+            provider = str(quote.get("provider") or "alpaca") if isinstance(quote, Mapping) else "alpaca"
+            source = f"latest_quote.{field}" if provider == "alpaca" else f"{provider}.latest_quote.{field}"
+            return float(live_price), source, dict(quote), None
+        if strict:
+            raise LongbridgeQuoteError(
+                f"{instruction.symbol}: missing positive execution quote field {field}"
+            )
         return fallback, "instruction_reference_fallback", dict(quote), f"missing_positive_{field}"
+    except LongbridgeQuoteError:
+        if strict:
+            raise
+        return fallback, "instruction_reference_fallback", None, "LongbridgeQuoteError"
     except Exception as exc:
+        if strict:
+            raise LongbridgeQuoteError(
+                f"{instruction.symbol}: execution quote refresh failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return fallback, "instruction_reference_fallback", None, f"{type(exc).__name__}: {exc}"
+
+
+def _quote_execution_evidence(
+    quote: Mapping[str, Any] | None,
+    *,
+    side: str,
+) -> dict[str, Any]:
+    payload = dict(quote) if isinstance(quote, Mapping) else {}
+    observed_at = datetime.now(timezone.utc)
+    bid = _safe_float(payload.get("bp"))
+    ask = _safe_float(payload.get("ap"))
+    bid_size = _safe_float(payload.get("bs"))
+    ask_size = _safe_float(payload.get("as"))
+    mid = (float(bid) + float(ask)) / 2.0 if bid and ask and bid > 0 and ask > 0 else None
+    spread = float(ask) - float(bid) if bid and ask and ask >= bid else None
+    spread_bps = float(spread / mid * 10000.0) if spread is not None and mid and mid > 0 else None
+    quote_timestamp = str(payload.get("t") or "")
+    quote_age_ms: float | None = None
+    if quote_timestamp:
+        try:
+            quote_epoch = float(pd.Timestamp(quote_timestamp).timestamp())
+            quote_age_ms = (observed_at.timestamp() - quote_epoch) * 1000.0
+        except Exception:
+            quote_age_ms = None
+    reference_field = "ap" if str(side).lower() == "buy" else "bp"
+    return {
+        "quote_observed_at_utc": observed_at.isoformat(timespec="milliseconds"),
+        "quote_timestamp_utc": quote_timestamp,
+        "quote_age_ms": round(float(quote_age_ms), 3) if quote_age_ms is not None else None,
+        "live_bid_price": float(bid) if bid is not None else None,
+        "live_ask_price": float(ask) if ask is not None else None,
+        "live_mid_price": float(mid) if mid is not None else None,
+        "live_spread": float(spread) if spread is not None else None,
+        "live_spread_bps": float(spread_bps) if spread_bps is not None else None,
+        "live_bid_size": float(bid_size) if bid_size is not None else None,
+        "live_ask_size": float(ask_size) if ask_size is not None else None,
+        "live_bid_exchange": str(payload.get("bx") or ""),
+        "live_ask_exchange": str(payload.get("ax") or ""),
+        "live_tape": str(payload.get("z") or ""),
+        "quote_provider": str(payload.get("provider") or "alpaca"),
+        "quote_feed": str(payload.get("feed") or ""),
+        "provider_symbol": str(payload.get("provider_symbol") or ""),
+        "depth_received_at_utc": str(payload.get("depth_received_at_utc") or quote_timestamp),
+        "depth_local_age_ms": _safe_float(payload.get("depth_local_age_ms")),
+        "last_trade_price_at_quote": _safe_float(payload.get("last_trade_price")),
+        "last_trade_timestamp_utc": str(payload.get("last_trade_timestamp_utc") or ""),
+        "quote_trade_status": str(payload.get("trade_status") or ""),
+        "quote_trade_session": str(payload.get("trade_session") or ""),
+        "quote_validation_error": str(payload.get("validation_error") or ""),
+        "marketable_reference_field": reference_field,
+    }
 
 
 def _order_batch_summary(
@@ -3269,6 +4762,7 @@ def _submit_and_track_orders(
     marketable_limit_max_attempts: int = 4,
     max_workers: int = 1,
     execution_price_feed: str = "iex",
+    execution_quote_client: Any | None = None,
     max_attempts_by_symbol: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     instruction_list = list(instructions)
@@ -3300,15 +4794,20 @@ def _submit_and_track_orders(
                 marketable_limit_max_attempts=marketable_limit_max_attempts,
                 max_workers=1,
                 execution_price_feed=execution_price_feed,
+                execution_quote_client=execution_quote_client,
                 max_attempts_by_symbol=symbol_attempt_limits,
             )
             record = dict(child_records[0])
             record.update(
                 {
                     "instruction_index": int(index),
+                    "dispatch_rank": int(index),
                     "batch_instruction_count": int(len(instruction_list)),
                     "batch_requested_workers": int(requested_workers),
                     "batch_effective_workers": int(effective_workers),
+                    "batch_wave_index": int((index - 1) // effective_workers + 1),
+                    "batch_wave_count": int(math.ceil(len(instruction_list) / effective_workers)),
+                    "dispatch_policy": "instruction_order_fifo_thread_pool",
                     "batch_started_at_utc": batch_started_at_utc,
                     "queue_wait_ms": round(
                         (worker_started - batch_started_monotonic) * 1000.0,
@@ -3347,9 +4846,13 @@ def _submit_and_track_orders(
             "reference_price": float(item.reference_price),
             "submitted_at_utc": _utc_now(),
             "instruction_index": int(idx),
+            "dispatch_rank": int(idx),
             "batch_instruction_count": int(len(instruction_list)),
             "batch_requested_workers": int(requested_workers),
             "batch_effective_workers": int(effective_workers),
+            "batch_wave_index": int((idx - 1) // effective_workers + 1),
+            "batch_wave_count": int(math.ceil(len(instruction_list) / effective_workers)),
+            "dispatch_policy": "instruction_order_fifo_thread_pool",
             "batch_started_at_utc": batch_started_at_utc,
             "queue_wait_ms": 0.0,
             "marketable_limit_max_attempts": int(item_max_attempts),
@@ -3437,11 +4940,13 @@ def _submit_and_track_orders(
                 total_offset_bps = float(offset_ladder[step_index])
                 live_reference_price, reference_source, live_quote, quote_error = (
                     _live_marketable_reference_price(
-                        client=client,
+                        client=execution_quote_client or client,
                         instruction=item,
                         execution_price_feed=execution_price_feed,
+                        strict=execution_quote_client is not None,
                     )
                 )
+                quote_evidence = _quote_execution_evidence(live_quote, side=item.side)
                 limit_price = _marketable_limit_price(
                     side=item.side,
                     reference_price=live_reference_price,
@@ -3486,6 +4991,7 @@ def _submit_and_track_orders(
                         "live_reference_price": float(live_reference_price),
                         "reference_price_source": str(reference_source),
                         "quote_refresh_error": quote_error,
+                        **quote_evidence,
                     },
                 )
                 if order_id:
@@ -3558,6 +5064,7 @@ def _submit_and_track_orders(
                         "reference_price_source": str(reference_source),
                         "live_quote": live_quote,
                         "quote_refresh_error": quote_error,
+                        **quote_evidence,
                         "status_latest": latest_status,
                         "filled_qty": float(filled_qty_this_attempt),
                         "filled_avg_price": latest_filled_avg_price,
@@ -3585,6 +5092,22 @@ def _submit_and_track_orders(
             }
             record["order_wall_time_seconds"] = float(time.monotonic() - order_started_monotonic)
             records.append(record)
+        except LongbridgeQuoteError as exc:
+            records.append(
+                {
+                    **base_record,
+                    "execution_order_style": str(execution_order_style),
+                    "status_latest": "quote_unavailable",
+                    "filled_qty": 0.0,
+                    "remaining_qty": float(item.qty),
+                    "requested_qty": float(item.qty),
+                    "submit_error_class": "execution_quote_unavailable",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "abort_remaining_orders": False,
+                    "order_wall_time_seconds": float(time.monotonic() - order_started_monotonic),
+                }
+            )
         except AlpacaRequestError as exc:
             error_payload = _alpaca_error_payload(exc)
             submit_error_class = "insufficient_buying_power" if _is_insufficient_buying_power_error(exc) else (
@@ -3636,9 +5159,67 @@ def _instruction_symbols(instructions: Sequence[OrderInstruction]) -> list[str]:
     return sorted({str(item.symbol).upper() for item in instructions if str(item.symbol).strip()})
 
 
+def _wait_for_release_position_reconciliation(
+    *,
+    client: AlpacaHttpClient,
+    release_instructions: Sequence[OrderInstruction],
+    qty_decimals: int,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    expected_signed_qty: dict[str, float] = {}
+    for item in release_instructions:
+        symbol = str(item.symbol).upper()
+        current_qty = _safe_float(item.current_signed_qty)
+        if current_qty is None:
+            current_qty = math.copysign(
+                abs(float(item.current_notional)) / max(float(item.reference_price), 1e-9),
+                float(item.current_notional),
+            )
+        signed_order_qty = float(item.qty) if item.side == "buy" else -float(item.qty)
+        expected_signed_qty[symbol] = float(current_qty) + signed_order_qty
+
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout_seconds))
+    tolerance = max(1e-8, 1.5 * (10.0 ** -max(0, int(qty_decimals))))
+    polls = 0
+    positions: list[dict[str, Any]] = []
+    actual_signed_qty: dict[str, float] = {}
+    pending_symbols: list[str] = sorted(expected_signed_qty)
+    while True:
+        polls += 1
+        positions = [dict(item) for item in client.list_positions()]
+        actual_signed_qty = _signed_qty_from_positions(positions)
+        pending_symbols = sorted(
+            symbol
+            for symbol, expected in expected_signed_qty.items()
+            if abs(float(actual_signed_qty.get(symbol, 0.0)) - float(expected)) > tolerance
+        )
+        if not pending_symbols or time.monotonic() >= deadline:
+            break
+        time.sleep(min(1.0, max(0.05, float(poll_seconds))))
+
+    elapsed = max(0.0, time.monotonic() - started)
+    return positions, {
+        "schema_version": "1.0",
+        "status": "pass" if not pending_symbols else "timeout",
+        "timeout_seconds": float(max(0.0, timeout_seconds)),
+        "elapsed_seconds": float(elapsed),
+        "poll_count": int(polls),
+        "qty_tolerance": float(tolerance),
+        "expected_signed_qty": dict(sorted(expected_signed_qty.items())),
+        "actual_signed_qty": {
+            symbol: float(actual_signed_qty.get(symbol, 0.0))
+            for symbol in sorted(expected_signed_qty)
+        },
+        "pending_symbols": pending_symbols,
+    }
+
+
 def _submit_staged_regt_orders(
     *,
     client: AlpacaHttpClient,
+    execution_quote_client: Any | None = None,
     initial_instructions: Sequence[OrderInstruction],
     target_signed_weights: Mapping[str, float],
     raw_target_signed_weights: Mapping[str, float],
@@ -3672,15 +5253,20 @@ def _submit_staged_regt_orders(
     release_round_extra_bps: float,
     release_round_sleep_seconds: float,
     stage_snapshots: list[dict[str, Any]] | None = None,
+    initial_current_signed_qty: Mapping[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     snapshots = stage_snapshots if stage_snapshots is not None else []
-    release_instructions, _ = _split_release_entry_instructions(initial_instructions)
+    release_instructions, deferred_entry_instructions = _split_release_entry_instructions(
+        initial_instructions,
+        current_signed_qty=initial_current_signed_qty,
+    )
     release_sell_long, release_buy_to_cover = _split_release_substages(release_instructions)
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
         "mode": "staged_regt",
         "initial_order_count": int(len(initial_instructions)),
         "initial_release_count": int(len(release_instructions)),
+        "initial_deferred_entry_count": int(len(deferred_entry_instructions)),
         "release_sell_long_count": int(len(release_sell_long)),
         "release_buy_to_cover_count": int(len(release_buy_to_cover)),
         "release_max_rounds": int(max(1, release_max_rounds)),
@@ -3699,7 +5285,14 @@ def _submit_staged_regt_orders(
     }
 
     release_reference_prices = dict(fallback_prices)
-    release_target_signed_weights = dict(target_signed_weights)
+    release_target_signed_weights = {
+        str(item.symbol).upper(): float(item.target_notional) / max(float(account_equity), 1e-9)
+        for item in release_instructions
+    }
+    diagnostics["release_target_signed_weights"] = dict(sorted(release_target_signed_weights.items()))
+    diagnostics["initial_deferred_entry_instructions"] = _instruction_payloads(
+        deferred_entry_instructions
+    )
     for stage_name, stage_token, stage_instructions in (
         ("release_sell_long", "rsl", release_sell_long),
         ("release_buy_to_cover", "rbc", release_buy_to_cover),
@@ -3751,6 +5344,7 @@ def _submit_staged_regt_orders(
                 marketable_limit_max_attempts=int(marketable_limit_max_attempts),
                 max_workers=int(execution_workers),
                 execution_price_feed=str(execution_price_feed),
+                execution_quote_client=execution_quote_client,
                 max_attempts_by_symbol=round_attempt_budget_before,
             )
             release_batch_summary = _order_batch_summary(
@@ -3794,11 +5388,13 @@ def _submit_staged_regt_orders(
                 signed_notional=refreshed_substage_signed_notional,
             )
             release_reference_prices = _resolve_reference_prices(
-                client=client,
+                client=execution_quote_client or client,
                 symbols=sorted(set(stage_symbols) | set(refreshed_substage_signed_notional)),
                 fallback_prices=release_reference_prices,
                 feed=execution_price_feed,
                 prefer_live=True,
+                allow_fallback=execution_quote_client is None,
+                require_fresh=execution_quote_client is not None,
             )
             release_min_trade_notional = _effective_min_trade_notional(
                 account_equity=float(refreshed_substage_equity),
@@ -3820,13 +5416,33 @@ def _submit_staged_regt_orders(
                 short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
                 shorting_enabled=bool(shorting_enabled),
             )
-            rebuilt_release, _ = _split_release_entry_instructions(rebuilt_instructions)
+            rebuilt_release, _ = _split_release_entry_instructions(
+                rebuilt_instructions,
+                current_signed_qty=refreshed_substage_signed_qty,
+            )
             rebuilt_sell_long, rebuilt_buy_to_cover = _split_release_substages(rebuilt_release)
             rebuilt_stage_instructions = (
                 rebuilt_sell_long if stage_name == "release_sell_long" else rebuilt_buy_to_cover
             )
             rebuilt_stage_instructions = [
                 item for item in rebuilt_stage_instructions if item.symbol in set(stage_symbols)
+            ]
+            round_filled_symbols = {
+                str(record.get("symbol") or "").upper()
+                for record in release_records
+                if _order_record_fully_filled(record)
+            }
+            filled_instruction_suppressed_rebuild_symbols = sorted(
+                {
+                    str(item.symbol).upper()
+                    for item in rebuilt_stage_instructions
+                    if str(item.symbol).upper() in round_filled_symbols
+                }
+            )
+            rebuilt_stage_instructions = [
+                item
+                for item in rebuilt_stage_instructions
+                if str(item.symbol).upper() not in round_filled_symbols
             ]
             stage_remaining_symbols = [item.symbol for item in rebuilt_stage_instructions]
             stage_budget_exhausted_symbols = sorted(
@@ -3888,10 +5504,18 @@ def _submit_staged_regt_orders(
                     "rebuilt_stage_instructions": _instruction_payloads(
                         rebuilt_stage_instructions
                     ),
+                    "round_fully_filled_symbols": sorted(round_filled_symbols),
+                    "filled_instruction_suppressed_rebuild_symbols": (
+                        filled_instruction_suppressed_rebuild_symbols
+                    ),
                     "attempt_budget_eligible_stage_instructions": _instruction_payloads(
                         current_stage_instructions
                     ),
                     "rebuilt_skipped_orders": rebuilt_skipped,
+                    "round_fully_filled_symbols": sorted(round_filled_symbols),
+                    "filled_instruction_suppressed_rebuild_symbols": (
+                        filled_instruction_suppressed_rebuild_symbols
+                    ),
                     "remaining_order_count": int(len(rebuilt_stage_instructions)),
                     "attempt_budget_eligible_order_count": int(
                         len(current_stage_instructions)
@@ -3970,7 +5594,36 @@ def _submit_staged_regt_orders(
             )
             return records, diagnostics
 
-    refreshed_positions = client.list_positions()
+    if release_instructions:
+        refreshed_positions, release_position_reconciliation = (
+            _wait_for_release_position_reconciliation(
+                client=client,
+                release_instructions=release_instructions,
+                qty_decimals=int(qty_decimals),
+                timeout_seconds=min(30.0, max(5.0, float(release_timeout_seconds) / 4.0)),
+                poll_seconds=float(poll_seconds),
+            )
+        )
+        diagnostics["release_position_reconciliation"] = release_position_reconciliation
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "release_position_reconciliation",
+                "captured_at_utc": _utc_now(),
+                **release_position_reconciliation,
+                "positions_raw": _raw_dict_list(refreshed_positions),
+            }
+        )
+        if release_position_reconciliation["pending_symbols"]:
+            diagnostics["release_fully_filled"] = False
+            diagnostics["entry_aborted"] = True
+            diagnostics["entry_abort_reason"] = "release_position_reconciliation_timeout"
+            diagnostics["release_unfilled_symbols"] = list(
+                release_position_reconciliation["pending_symbols"]
+            )
+            return records, diagnostics
+    else:
+        refreshed_positions = client.list_positions()
     _, refreshed_signed_notional = _positions_to_frame_and_notional(refreshed_positions)
     refreshed_signed_qty = _signed_qty_from_positions(refreshed_positions)
     refreshed_account = client.get_account()
@@ -3989,11 +5642,13 @@ def _submit_staged_regt_orders(
         signed_notional=refreshed_signed_notional,
     )
     refreshed_prices = _resolve_reference_prices(
-        client=client,
+        client=execution_quote_client or client,
         symbols=sorted(set(target_signed_weights) | set(refreshed_signed_notional)),
         fallback_prices=fallback_prices,
         feed=execution_price_feed,
         prefer_live=True,
+        allow_fallback=execution_quote_client is None,
+        require_fresh=execution_quote_client is not None,
     )
     entry_min_trade_notional = _effective_min_trade_notional(
         account_equity=float(refreshed_equity),
@@ -4035,7 +5690,10 @@ def _submit_staged_regt_orders(
         shorting_enabled=bool(shorting_enabled),
     )
     rebuilt_all_entry_instructions = list(entry_instructions)
-    rebuilt_release_residual, entry_instructions = _split_release_entry_instructions(entry_instructions)
+    rebuilt_release_residual, entry_instructions = _split_release_entry_instructions(
+        entry_instructions,
+        current_signed_qty=refreshed_signed_qty,
+    )
     entry_instructions_before_cap = list(entry_instructions)
     entry_instructions, cap_diag = _scale_entry_instructions_to_buying_power(
         entry_instructions,
@@ -4125,6 +5783,7 @@ def _submit_staged_regt_orders(
             marketable_limit_max_attempts=int(marketable_limit_max_attempts),
             max_workers=int(execution_workers),
             execution_price_feed=str(execution_price_feed),
+            execution_quote_client=execution_quote_client,
         )
         entry_batch_summary = _order_batch_summary(
             entry_records,
@@ -4185,15 +5844,229 @@ def _alignment_to_target(
     }
 
 
+def _constraint_reason_list(value: Any) -> list[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return sorted({str(item).strip() for item in value if str(item).strip()})
+    return sorted({item.strip() for item in str(value or "").split(";") if item.strip()})
+
+
+def _build_target_capability_snapshot(
+    *,
+    raw_target_signed_weights: Mapping[str, float],
+    projection: Mapping[str, Any],
+    assets_by_symbol: Mapping[str, Mapping[str, Any]],
+    account_shorting_enabled: bool,
+    run_role: str,
+    input_target_path: str | None,
+) -> dict[str, Any]:
+    projection_rows = {
+        str(item.get("symbol") or "").upper(): dict(item)
+        for item in (projection.get("symbols") or [])
+        if isinstance(item, Mapping) and str(item.get("symbol") or "").strip()
+    }
+    rows: list[dict[str, Any]] = []
+    for symbol in sorted(raw_target_signed_weights):
+        raw_weight = float(raw_target_signed_weights.get(symbol) or 0.0)
+        target_side = "long" if raw_weight > EPS else "short" if raw_weight < -EPS else "flat"
+        asset = dict(assets_by_symbol.get(symbol) or {})
+        projected = projection_rows.get(symbol, {})
+        reasons = _constraint_reason_list(projected.get("constraint_reasons"))
+        issues: list[str] = []
+        if not asset:
+            issues.append("asset_metadata_missing")
+        if asset and not bool(asset.get("tradable", False)):
+            issues.append("asset_not_tradable")
+        if target_side == "short" and not bool(account_shorting_enabled):
+            issues.append("account_shorting_disabled")
+        if target_side == "short" and asset and not bool(asset.get("shortable", False)):
+            issues.append("asset_not_shortable")
+        if target_side == "short" and str(asset.get("borrow_status") or "").lower() == "hard_to_borrow":
+            issues.append("hard_to_borrow")
+        executable_weight = float(projected.get("executable_expected_signed_weight") or 0.0)
+        projected_to_zero = bool(abs(raw_weight) > EPS and abs(executable_weight) <= EPS)
+        if projected_to_zero:
+            issues.append("projected_to_zero")
+        blocking_issues = {
+            "asset_not_tradable",
+            "account_shorting_disabled",
+            "asset_not_shortable",
+            "projected_to_zero",
+        }
+        capability_status = (
+            "blocked"
+            if blocking_issues.intersection(issues)
+            else "attention"
+            if issues
+            else "pass"
+        )
+        rows.append(
+            {
+                "symbol": symbol,
+                "target_side": target_side,
+                "raw_target_signed_weight": raw_weight,
+                "capacity_adjusted_target_signed_weight": _safe_float(
+                    projected.get("capacity_adjusted_target_signed_weight")
+                ),
+                "executable_expected_signed_weight": executable_weight,
+                "target_lattice_signed_qty": _safe_float(projected.get("target_lattice_signed_qty")),
+                "reference_price": _safe_float(projected.get("reference_price")),
+                "asset_metadata_present": bool(asset),
+                "tradable": bool(asset.get("tradable", False)) if asset else None,
+                "shortable": bool(asset.get("shortable", False)) if asset else None,
+                "easy_to_borrow": bool(asset.get("easy_to_borrow", False)) if asset else None,
+                "borrow_status": str(asset.get("borrow_status") or ""),
+                "fractionable": bool(asset.get("fractionable", False)) if asset else None,
+                "marginable": bool(asset.get("marginable", False)) if asset else None,
+                "maintenance_margin_requirement": _safe_float(
+                    asset.get("maintenance_margin_requirement")
+                ),
+                "constraint_reasons": reasons,
+                "capability_issues": sorted(set(issues)),
+                "capability_status": capability_status,
+                "projected_to_zero": projected_to_zero,
+            }
+        )
+    blocked = [row for row in rows if row["capability_status"] == "blocked"]
+    nonshortable = [
+        row["symbol"]
+        for row in rows
+        if row["target_side"] == "short" and row.get("shortable") is False
+    ]
+    projected_zero = [row["symbol"] for row in rows if row["projected_to_zero"]]
+    return {
+        "schema_version": "1.0",
+        "generated_at_utc": _utc_now(),
+        "run_role": str(run_role),
+        "input_target_path": input_target_path,
+        "account_shorting_enabled": bool(account_shorting_enabled),
+        "target_symbol_count": len(rows),
+        "target_long_count": sum(row["target_side"] == "long" for row in rows),
+        "target_short_count": sum(row["target_side"] == "short" for row in rows),
+        "blocked_target_count": len(blocked),
+        "blocked_target_symbols": [row["symbol"] for row in blocked],
+        "nonshortable_short_target_count": len(nonshortable),
+        "nonshortable_short_target_symbols": nonshortable,
+        "projected_to_zero_count": len(projected_zero),
+        "projected_to_zero_symbols": projected_zero,
+        "rows": rows,
+    }
+
+
+def _build_target_capability_drift(
+    *,
+    current_snapshot: Mapping[str, Any],
+    prior_snapshot: Mapping[str, Any] | None,
+    prior_snapshot_path: Path | None,
+) -> dict[str, Any]:
+    if not prior_snapshot or not isinstance(prior_snapshot.get("rows"), list):
+        return {
+            "schema_version": "1.0",
+            "generated_at_utc": _utc_now(),
+            "status": "not_applicable" if prior_snapshot_path is None else "prior_snapshot_missing",
+            "prior_snapshot_path": prior_snapshot_path.as_posix() if prior_snapshot_path else None,
+            "current_snapshot_role": current_snapshot.get("run_role"),
+            "changed_symbol_count": 0,
+            "execution_blocking_change_count": 0,
+            "became_nonshortable_symbols": [],
+            "rows": [],
+        }
+    prior_by_symbol = {
+        str(item.get("symbol") or "").upper(): dict(item)
+        for item in prior_snapshot.get("rows", [])
+        if isinstance(item, Mapping) and str(item.get("symbol") or "").strip()
+    }
+    current_by_symbol = {
+        str(item.get("symbol") or "").upper(): dict(item)
+        for item in current_snapshot.get("rows", [])
+        if isinstance(item, Mapping) and str(item.get("symbol") or "").strip()
+    }
+    capability_fields = [
+        "asset_metadata_present",
+        "tradable",
+        "shortable",
+        "easy_to_borrow",
+        "borrow_status",
+        "fractionable",
+        "marginable",
+        "maintenance_margin_requirement",
+    ]
+    rows: list[dict[str, Any]] = []
+    for symbol in sorted(set(prior_by_symbol) | set(current_by_symbol)):
+        prior = prior_by_symbol.get(symbol, {})
+        current = current_by_symbol.get(symbol, {})
+        changed_fields = [field for field in capability_fields if prior.get(field) != current.get(field)]
+        prior_weight = _safe_float(prior.get("executable_expected_signed_weight")) or 0.0
+        current_weight = _safe_float(current.get("executable_expected_signed_weight")) or 0.0
+        target_side = str(current.get("target_side") or prior.get("target_side") or "")
+        became_nonshortable = bool(
+            target_side == "short"
+            and prior.get("shortable") is True
+            and current.get("shortable") is False
+        )
+        projected_to_zero_now = bool(abs(prior_weight) > EPS and abs(current_weight) <= EPS)
+        capability_changed = bool(changed_fields)
+        if not capability_changed and not projected_to_zero_now:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "target_side": target_side,
+                "changed_fields": changed_fields,
+                "prior_tradable": prior.get("tradable"),
+                "current_tradable": current.get("tradable"),
+                "prior_shortable": prior.get("shortable"),
+                "current_shortable": current.get("shortable"),
+                "prior_easy_to_borrow": prior.get("easy_to_borrow"),
+                "current_easy_to_borrow": current.get("easy_to_borrow"),
+                "prior_borrow_status": prior.get("borrow_status"),
+                "current_borrow_status": current.get("borrow_status"),
+                "prior_executable_expected_signed_weight": prior_weight,
+                "current_executable_expected_signed_weight": current_weight,
+                "executable_weight_delta": current_weight - prior_weight,
+                "current_constraint_reasons": current.get("constraint_reasons") or [],
+                "current_capability_issues": current.get("capability_issues") or [],
+                "became_nonshortable": became_nonshortable,
+                "projected_to_zero_now": projected_to_zero_now,
+                "execution_blocking_change": bool(became_nonshortable or projected_to_zero_now),
+            }
+        )
+    blocking = [row for row in rows if row["execution_blocking_change"]]
+    return {
+        "schema_version": "1.0",
+        "generated_at_utc": _utc_now(),
+        "status": "attention" if blocking else "pass",
+        "prior_snapshot_path": prior_snapshot_path.as_posix() if prior_snapshot_path else None,
+        "prior_generated_at_utc": prior_snapshot.get("generated_at_utc"),
+        "current_generated_at_utc": current_snapshot.get("generated_at_utc"),
+        "changed_symbol_count": len(rows),
+        "execution_blocking_change_count": len(blocking),
+        "execution_blocking_change_symbols": [row["symbol"] for row in blocking],
+        "became_nonshortable_symbols": [row["symbol"] for row in rows if row["became_nonshortable"]],
+        "projected_to_zero_now_symbols": [row["symbol"] for row in rows if row["projected_to_zero_now"]],
+        "rows": rows,
+    }
+
+
 def _mark_event(events: list[dict[str, Any]], name: str, payload: Mapping[str, Any] | None = None) -> None:
+    now_monotonic = float(time.monotonic())
+    run_started_monotonic = getattr(events, "run_started_monotonic", None)
     event = {
+        "seq": int(len(events) + 1),
         "name": str(name),
         "at_utc": _utc_now(),
-        "monotonic_seconds": float(time.monotonic()),
+        "monotonic_seconds": now_monotonic,
+        "run_elapsed_seconds": (
+            max(0.0, now_monotonic - float(run_started_monotonic))
+            if run_started_monotonic is not None
+            else None
+        ),
     }
     if payload:
         event["payload"] = dict(payload)
     events.append(event)
+    persist = getattr(events, "persist", None)
+    if callable(persist):
+        persist()
 
 
 def _stable_json_digest(payload: Any) -> str:
@@ -4350,7 +6223,12 @@ def _write_jsonl_file(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _write_run_events(output_root: Path, events: Sequence[Mapping[str, Any]]) -> Path:
     path = output_root / "run_events.jsonl"
-    _write_jsonl_file(path, events)
+    persist = getattr(events, "persist", None)
+    event_path = getattr(events, "path", None)
+    if callable(persist) and event_path is not None and Path(event_path).resolve() == path.resolve():
+        persist()
+    else:
+        _write_jsonl_file(path, events)
     return path
 
 
@@ -4439,6 +6317,7 @@ def _build_run_context(
         },
         "runtime_environment_snapshot_path": (output_root / "runtime_environment_snapshot.json").as_posix(),
         "run_events_path": (output_root / "run_events.jsonl").as_posix(),
+        "decision_phase_timings_path": (output_root / "decision_phase_timings.json").as_posix(),
         "file_hash_manifest_path": (output_root / "file_hash_manifest.json").as_posix(),
         "artifact_completeness_snapshot_path": (output_root / "artifact_completeness_snapshot.json").as_posix(),
         "events": list(events),
@@ -4630,6 +6509,7 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
         "runtime": [
             "run_context.json",
             "run_events.jsonl",
+            "decision_phase_timings.json",
             "runtime_environment_snapshot.json",
             "python_environment.json",
             "input_file_manifest.json",
@@ -4665,9 +6545,11 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
             "broker_account_activities.json",
         ],
         "market_context": [
+            "execution_quote_provider_health.json",
             "execution_price_snapshot.json",
             "execution_latest_trades_snapshot.json",
             "execution_latest_quotes_snapshot.json",
+            "execution_latest_quotes_snapshot_post_submission.json",
             "execution_latest_quotes_snapshot_after.json",
             "execution_intraday_bars_1min.json",
             "execution_intraday_bars_1min_after.json",
@@ -4681,9 +6563,15 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
         "portfolio_intent": [
             "decision_targets.csv",
             "alpha_core_panel_" + output_root.name[:8] + ".csv",
+            "symbol_universe_intersection.json",
+            "symbol_universe_intersection.csv",
             "target_weights_snapshot.json",
             "executable_target_projection.json",
             "executable_target_projection.csv",
+            "target_capability_snapshot.json",
+            "target_capability_snapshot.csv",
+            "target_capability_drift.json",
+            "target_capability_drift.csv",
             "portfolio_weights_snapshot.json",
             "portfolio_weights_after_snapshot.json",
         ],
@@ -4946,8 +6834,17 @@ def _execution_evidence_digest(output_root: Path) -> dict[str, Any]:
 
 def _market_evidence_digest(output_root: Path) -> dict[str, Any]:
     return {
+        "symbol_universe_intersection": _json_artifact_status(
+            output_root / "symbol_universe_intersection.json"
+        ),
         "execution_price_snapshot": _json_artifact_status(output_root / "execution_price_snapshot.json"),
         "target_weights_snapshot": _json_artifact_status(output_root / "target_weights_snapshot.json"),
+        "target_capability_snapshot": _json_artifact_status(
+            output_root / "target_capability_snapshot.json"
+        ),
+        "target_capability_drift": _json_artifact_status(
+            output_root / "target_capability_drift.json"
+        ),
         "executable_target_projection": _json_artifact_status(
             output_root / "executable_target_projection.json"
         ),
@@ -4957,6 +6854,9 @@ def _market_evidence_digest(output_root: Path) -> dict[str, Any]:
         ),
         "latest_trades_before": _json_artifact_status(output_root / "execution_latest_trades_snapshot.json"),
         "latest_quotes_before": _json_artifact_status(output_root / "execution_latest_quotes_snapshot.json"),
+        "latest_quotes_post_submission": _json_artifact_status(
+            output_root / "execution_latest_quotes_snapshot_post_submission.json"
+        ),
         "latest_quotes_after": _json_artifact_status(output_root / "execution_latest_quotes_snapshot_after.json"),
         "intraday_bars_before": _json_artifact_status(output_root / "execution_intraday_bars_1min.json"),
         "intraday_bars_after": _json_artifact_status(output_root / "execution_intraday_bars_1min_after.json"),
@@ -4969,6 +6869,7 @@ def _market_evidence_digest(output_root: Path) -> dict[str, Any]:
 def _runtime_evidence_digest(output_root: Path) -> dict[str, Any]:
     return {
         "run_context": _json_artifact_status(output_root / "run_context.json"),
+        "decision_phase_timings": _json_artifact_status(output_root / "decision_phase_timings.json"),
         "run_events": {
             **_artifact_entry(output_root / "run_events.jsonl", output_root),
             **_read_jsonl_count(output_root / "run_events.jsonl"),
@@ -4998,6 +6899,7 @@ def _write_run_evidence_digest(output_root: Path) -> Path:
         "execution_summary.json",
         "run_context.json",
         "run_events.jsonl",
+        "decision_phase_timings.json",
         "runtime_environment_snapshot.json",
         "order_plan.json",
         "execution_records.json",
@@ -5013,11 +6915,19 @@ def _write_run_evidence_digest(output_root: Path) -> Path:
         "order_poll_timeline.json",
         "alpaca_api_audit.jsonl",
         "execution_price_snapshot.json",
+        "execution_quote_provider_health.json",
+        "symbol_universe_intersection.json",
+        "symbol_universe_intersection.csv",
         "executable_target_projection.json",
         "executable_target_projection.csv",
+        "target_capability_snapshot.json",
+        "target_capability_snapshot.csv",
+        "target_capability_drift.json",
+        "target_capability_drift.csv",
         "execution_intraday_bars_1min.json",
         "execution_intraday_bars_1min_after.json",
         "execution_latest_quotes_snapshot.json",
+        "execution_latest_quotes_snapshot_post_submission.json",
         "execution_latest_quotes_snapshot_after.json",
         "broker_portfolio_history_before.json",
         "broker_portfolio_history_after.json",
@@ -5216,6 +7126,8 @@ def _input_file_manifest(args: argparse.Namespace, ledger_path: Path) -> dict[st
         "candidate_symbols_path": Path(str(args.candidate_symbols_path)).resolve(),
         "ledger_path": ledger_path.resolve(),
     }
+    if str(getattr(args, "execution_quote_provider", "alpaca")) == "longbridge":
+        paths["longbridge_config_path"] = Path(str(args.longbridge_config_path)).resolve()
     optional_keys = [
         "decision_targets_input_path",
         "order_plan_input_path",
@@ -5228,6 +7140,13 @@ def _input_file_manifest(args: argparse.Namespace, ledger_path: Path) -> dict[st
         raw = getattr(args, key, None)
         if raw:
             paths[key] = Path(str(raw)).resolve()
+    source_input = getattr(args, "decision_targets_input_path", None) or getattr(
+        args, "order_plan_input_path", None
+    )
+    if source_input:
+        paths["decision_symbol_universe_intersection"] = (
+            Path(str(source_input)).resolve().parent / "symbol_universe_intersection.json"
+        )
     entries: dict[str, Any] = {}
     for key, path in paths.items():
         if path.is_dir():

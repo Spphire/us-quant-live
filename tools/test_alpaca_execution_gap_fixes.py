@@ -18,13 +18,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.alpaca_executor import (  # noqa: E402
+    _DecisionPhaseTimingRecorder,
+    _PersistentRunEvents,
+    _build_submission_capability_guard,
+    _build_target_capability_drift,
+    _build_target_capability_snapshot,
     OrderInstruction,
     _build_order_instructions,
+    _collect_intraday_bars_snapshot,
     _collect_portfolio_history_snapshot,
     _effective_min_trade_notional,
     _is_insufficient_buying_power_error,
     _is_insufficient_qty_available_error,
     _marketable_offset_ladder,
+    _mark_event,
     _submit_and_track_orders,
     _submit_staged_regt_orders,
     _total_regt_buying_power_capacity,
@@ -36,6 +43,7 @@ from tools.daily_audit_report import (  # noqa: E402
     _build_order_attempt_rows,
     _build_order_trace,
     _build_position_capacity_summary,
+    _build_quote_evidence,
 )
 from tools.execution_quality import _logical_records  # noqa: E402
 
@@ -72,6 +80,17 @@ class _NeverFillClient:
         self.cancel_count += 1
         self.orders[order_id]["status"] = "canceled"
         return {}
+
+
+class _ManualClock:
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += float(seconds)
 
 
 class _ImmediateFillConcurrencyClient:
@@ -115,7 +134,17 @@ class _ImmediateFillConcurrencyClient:
 class _QuoteNeverFillClient(_NeverFillClient):
     def get_latest_quotes(self, *, symbols, feed):
         return {
-            str(symbol).upper(): {"bp": 90.0, "ap": 91.0, "feed": str(feed)}
+            str(symbol).upper(): {
+                "bp": 90.0,
+                "ap": 91.0,
+                "bs": 20,
+                "as": 30,
+                "bx": "V",
+                "ax": "V",
+                "z": "A",
+                "t": "2026-07-24T14:00:00Z",
+                "feed": str(feed),
+            }
             for symbol in symbols
         }
 
@@ -146,6 +175,104 @@ class _StagedNeverFillClient(_QuoteNeverFillClient):
         }
 
 
+class _StatefulStagedFillClient:
+    def __init__(self, signed_qty: float, *, stale_position_reads_after_fill: int = 0) -> None:
+        self.signed_qty = float(signed_qty)
+        self.initial_signed_qty = float(signed_qty)
+        self.stale_position_reads_after_fill = max(0, int(stale_position_reads_after_fill))
+        self.orders: dict[str, dict[str, object]] = {}
+        self.submissions: list[dict[str, object]] = []
+
+    def submit_order(self, **kwargs):
+        qty = float(kwargs.get("qty") or 0.0)
+        side = str(kwargs.get("side") or "")
+        client_order_id = str(kwargs.get("client_order_id") or "")
+        before = float(self.signed_qty)
+        is_release_sell = "_rsl_" in client_order_id
+        is_release_cover = "_rbc_" in client_order_id
+        if is_release_sell:
+            assert before > 0.0, (before, kwargs)
+            assert side == "sell", kwargs
+            assert qty <= before + 1e-9, (qty, before, kwargs)
+        if is_release_cover:
+            assert before < 0.0, (before, kwargs)
+            assert side == "buy", kwargs
+            assert qty <= abs(before) + 1e-9, (qty, before, kwargs)
+
+        self.signed_qty += qty if side == "buy" else -qty
+        if abs(self.signed_qty) <= 1e-9:
+            self.signed_qty = 0.0
+        order_id = client_order_id
+        order = {
+            "id": order_id,
+            "client_order_id": client_order_id,
+            "symbol": str(kwargs.get("symbol") or "X"),
+            "side": side,
+            "type": str(kwargs.get("type") or "market"),
+            "time_in_force": str(kwargs.get("time_in_force") or "day"),
+            "qty": str(qty),
+            "status": "filled",
+            "filled_qty": str(qty),
+            "filled_avg_price": "100",
+            "updated_at": "2026-07-27T14:00:00Z",
+        }
+        self.orders[order_id] = dict(order)
+        self.submissions.append(
+            {
+                "client_order_id": client_order_id,
+                "side": side,
+                "qty": qty,
+                "signed_qty_before": before,
+                "signed_qty_after": float(self.signed_qty),
+                "is_release": bool(is_release_sell or is_release_cover),
+            }
+        )
+        return dict(order)
+
+    def get_order(self, order_id):
+        return dict(self.orders[order_id])
+
+    def list_positions(self):
+        reported_signed_qty = float(self.signed_qty)
+        if self.submissions and self.stale_position_reads_after_fill > 0:
+            reported_signed_qty = float(self.initial_signed_qty)
+            self.stale_position_reads_after_fill -= 1
+        if abs(reported_signed_qty) <= 1e-9:
+            return []
+        return [
+            {
+                "symbol": "X",
+                "side": "long" if reported_signed_qty > 0 else "short",
+                "qty": str(abs(reported_signed_qty)),
+                "market_value": str(abs(reported_signed_qty) * 100.0),
+                "current_price": "100",
+            }
+        ]
+
+    def get_account(self):
+        return {
+            "equity": "10000",
+            "buying_power": "19000",
+            "regt_buying_power": "19000",
+        }
+
+    def get_latest_trades(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {"p": 100.0, "feed": str(feed)}
+            for symbol in symbols
+        }
+
+    def get_latest_quotes(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {
+                "bp": 100.0,
+                "ap": 100.0,
+                "feed": str(feed),
+            }
+            for symbol in symbols
+        }
+
+
 class _PortfolioHistoryClient:
     def __init__(self) -> None:
         self.kwargs = None
@@ -153,6 +280,29 @@ class _PortfolioHistoryClient:
     def get_portfolio_history(self, **kwargs):
         self.kwargs = dict(kwargs)
         return {"timestamp": [], "equity": []}
+
+
+class _IntradayFallbackClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get_stock_bars(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        feed = str(kwargs.get("feed") or "")
+        symbols = [str(symbol) for symbol in kwargs.get("symbols") or []]
+        available = {"X"} if feed == "iex" else {"Y"}
+        return [
+            {
+                "symbol": symbol,
+                "timestamp": "2026-07-24T14:00:00Z",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+            }
+            for symbol in symbols
+            if symbol in available
+        ]
 
 
 def _instructions_for_case(*, target_notional: float, current_notional: float, current_qty: float, price: float):
@@ -391,6 +541,38 @@ def test_projector_enforces_final_gross_capacity_target():
     print("  [OK] final gross is capped at 95% of stable total RegT capacity")
 
 
+def test_submission_guard_blocks_missing_short_side():
+    guard = _build_submission_capability_guard(
+        raw_target_signed_weights={"LONG": 0.50, "SHORT": -0.50},
+        capacity_adjusted_target_signed_weights={"LONG": 0.475, "SHORT": -0.475},
+        executable_expected_signed_weights={"LONG": 0.475, "SHORT": 0.0},
+        current_signed_notional={},
+        account_equity=100000.0,
+        shorting_enabled=False,
+        material_notional_tolerance=10.0,
+    )
+    assert guard["status"] == "blocked", guard
+    assert "account_shorting_disabled_for_required_short_increase" in guard["blocking_reasons"]
+    assert "long_short_side_missing_after_projection" in guard["blocking_reasons"]
+    assert guard["required_short_increase_symbols"] == ["SHORT"]
+    print("  [OK] submission guard blocks a long-only projection of a long/short strategy")
+
+
+def test_submission_guard_allows_complete_long_short_projection():
+    guard = _build_submission_capability_guard(
+        raw_target_signed_weights={"LONG": 0.50, "SHORT": -0.50},
+        capacity_adjusted_target_signed_weights={"LONG": 0.475, "SHORT": -0.475},
+        executable_expected_signed_weights={"LONG": 0.474, "SHORT": -0.473},
+        current_signed_notional={},
+        account_equity=100000.0,
+        shorting_enabled=True,
+        material_notional_tolerance=10.0,
+    )
+    assert guard["status"] == "pass", guard
+    assert not guard["blocking_reasons"], guard
+    print("  [OK] submission guard allows a complete executable long/short portfolio")
+
+
 def test_total_regt_capacity_reconstruction():
     total, gross, remaining, source = _total_regt_buying_power_capacity(
         account={
@@ -420,6 +602,32 @@ def test_portfolio_history_uses_explicit_range_without_period():
     assert client.kwargs["start"] == "2026-07-22T00:00:00Z"
     assert client.kwargs["end"] == "2026-07-23T00:00:00Z"
     print("  [OK] portfolio history avoids conflicting period plus start/end parameters")
+
+
+def test_intraday_bar_capture_falls_back_for_primary_missing_symbols():
+    client = _IntradayFallbackClient()
+    snapshot = _collect_intraday_bars_snapshot(
+        client=client,
+        symbols=["X", "Y"],
+        session_date=date(2026, 7, 24),
+        feed="iex",
+        fallback_feed="sip",
+        label="test",
+    )
+
+    assert len(client.calls) == 2, client.calls
+    assert client.calls[0]["feed"] == "iex", client.calls
+    assert client.calls[1]["feed"] == "sip", client.calls
+    assert client.calls[1]["symbols"] == ["Y"], client.calls
+    assert snapshot["missing_bar_symbols"] == [], snapshot
+    assert snapshot["primary_bar_symbols"] == ["X"], snapshot
+    assert snapshot["fallback_bar_symbols"] == ["Y"], snapshot
+    assert snapshot["source_by_symbol"] == {"X": "iex", "Y": "sip"}, snapshot
+    assert {row["capture_source"] for row in snapshot["bars"]} == {
+        "primary",
+        "fallback_for_primary_missing",
+    }
+    print("  [OK] missing IEX minute bars are backfilled from SIP with per-symbol source evidence")
 
 
 def test_projection_audit_prefers_staged_entry_snapshot():
@@ -605,12 +813,20 @@ def test_marketable_limit_uses_live_quote_side():
     assert attempt["live_reference_price"] == 90.0, attempt
     assert attempt["limit_price"] == 89.89, attempt
     assert attempt["max_offset_bps"] == 150.0, attempt
+    assert attempt["live_bid_price"] == 90.0, attempt
+    assert attempt["live_ask_price"] == 91.0, attempt
+    assert abs(attempt["live_mid_price"] - 90.5) < 1e-12, attempt
+    assert abs(attempt["live_spread_bps"] - (1.0 / 90.5 * 10000.0)) < 1e-9, attempt
+    assert attempt["marketable_reference_field"] == "bp", attempt
     assert records[0]["attempt_count"] == 1, records[0]
     audit_row = _build_order_attempt_rows(records, [])[0]
     assert audit_row["live_reference_price"] == 90.0, audit_row
     assert audit_row["reference_price_source"] == "latest_quote.bp", audit_row
     assert audit_row["marketable_limit_max_attempts"] == 1, audit_row
     assert audit_row["max_offset_bps"] == 150.0, audit_row
+    assert audit_row["live_bid_price"] == 90.0, audit_row
+    assert audit_row["live_ask_price"] == 91.0, audit_row
+    assert audit_row["live_spread_bps"] == attempt["live_spread_bps"], audit_row
     print("  [OK] sell limit refreshes from live bid and obeys one-attempt cap")
 
 
@@ -768,6 +984,166 @@ def test_staged_release_attempt_budget_is_global_across_rounds():
     assert len(release_snapshots) == 1, release_snapshots
     assert release_snapshots[0]["stage_symbol_attempt_counts"] == {"X": 4}
     print("  [OK] three release rounds share one four-attempt per-symbol budget")
+
+
+def _run_stateful_staged_case(
+    *,
+    initial_signed_qty: float,
+    target_signed_weight: float,
+    stale_position_reads_after_fill: int = 0,
+) -> tuple[_StatefulStagedFillClient, list[dict[str, object]], dict[str, object], list[dict[str, object]]]:
+    client = _StatefulStagedFillClient(
+        initial_signed_qty,
+        stale_position_reads_after_fill=stale_position_reads_after_fill,
+    )
+    current_qty = {"X": float(initial_signed_qty)}
+    current_notional = {"X": float(initial_signed_qty) * 100.0}
+    weights = {"X": float(target_signed_weight)}
+    assets = {
+        "X": {
+            "symbol": "X",
+            "tradable": True,
+            "fractionable": True,
+            "shortable": True,
+        }
+    }
+    instructions, skipped = _build_order_instructions(
+        target_signed_weights=weights,
+        current_signed_notional=current_notional,
+        current_signed_qty=current_qty,
+        account_equity=10000.0,
+        reference_prices={"X": 100.0},
+        assets_by_symbol=assets,
+        min_trade_notional=1.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+    )
+    assert not skipped, skipped
+    assert len(instructions) == 1, instructions
+    snapshots: list[dict[str, object]] = []
+    records, diagnostics = _submit_staged_regt_orders(
+        client=client,
+        initial_instructions=instructions,
+        target_signed_weights=weights,
+        raw_target_signed_weights=weights,
+        assets_by_symbol=assets,
+        fallback_prices={"X": 100.0},
+        session_token="stateful-stage",
+        execution_price_feed="iex",
+        account_equity=10000.0,
+        min_trade_notional_floor=1.0,
+        min_trade_weight_bps=0.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        buying_power_buffer=0.95,
+        gross_capacity_target_ratio=0.95,
+        short_buying_power_adverse_offset_bps=300.0,
+        release_timeout_seconds=2.0,
+        entry_timeout_seconds=2.0,
+        poll_seconds=0.01,
+        execution_order_style="market",
+        marketable_limit_base_offset_bps=0.0,
+        marketable_limit_max_offset_bps=50.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.01,
+        marketable_limit_max_attempts=2,
+        execution_workers=2,
+        release_max_rounds=3,
+        release_round_extra_bps=5.0,
+        release_round_sleep_seconds=0.0,
+        stage_snapshots=snapshots,
+        initial_current_signed_qty=current_qty,
+    )
+    return client, records, diagnostics, snapshots
+
+
+def test_staged_long_to_short_stops_at_zero_before_entry():
+    client, records, diagnostics, snapshots = _run_stateful_staged_case(
+        initial_signed_qty=10.0,
+        target_signed_weight=-0.05,
+    )
+    assert diagnostics["release_target_signed_weights"] == {"X": 0.0}, diagnostics
+    assert diagnostics["initial_deferred_entry_count"] == 1, diagnostics
+    assert len(client.submissions) == 2, client.submissions
+    release, entry = client.submissions
+    assert release["is_release"] is True and release["side"] == "sell", release
+    assert release["qty"] == 10.0 and release["signed_qty_after"] == 0.0, release
+    assert entry["is_release"] is False and entry["side"] == "sell", entry
+    assert entry["qty"] == 5.0 and entry["signed_qty_after"] == -5.0, entry
+    release_rounds = [row for row in snapshots if row.get("snapshot_type") == "release_round"]
+    assert len(release_rounds) == 1, release_rounds
+    assert release_rounds[0]["fully_filled"] is True, release_rounds[0]
+    assert all(record.get("status_latest") == "filled" for record in records), records
+    print("  [OK] long-to-short closes exactly to zero once, then opens the short")
+
+
+def test_staged_short_to_long_stops_at_zero_before_entry():
+    client, records, diagnostics, snapshots = _run_stateful_staged_case(
+        initial_signed_qty=-5.0,
+        target_signed_weight=0.05,
+    )
+    assert diagnostics["release_target_signed_weights"] == {"X": 0.0}, diagnostics
+    assert diagnostics["initial_deferred_entry_count"] == 1, diagnostics
+    assert len(client.submissions) == 2, client.submissions
+    release, entry = client.submissions
+    assert release["is_release"] is True and release["side"] == "buy", release
+    assert release["qty"] == 5.0 and release["signed_qty_after"] == 0.0, release
+    assert entry["is_release"] is False and entry["side"] == "buy", entry
+    assert entry["qty"] == 5.0 and entry["signed_qty_after"] == 5.0, entry
+    release_rounds = [row for row in snapshots if row.get("snapshot_type") == "release_round"]
+    assert len(release_rounds) == 1, release_rounds
+    assert all(record.get("status_latest") == "filled" for record in records), records
+    print("  [OK] short-to-long covers exactly to zero once, then opens the long")
+
+
+def test_staged_same_side_reduction_has_no_entry_leg():
+    client, records, diagnostics, snapshots = _run_stateful_staged_case(
+        initial_signed_qty=10.0,
+        target_signed_weight=0.05,
+    )
+    assert diagnostics["release_target_signed_weights"] == {"X": 0.05}, diagnostics
+    assert diagnostics["initial_deferred_entry_count"] == 0, diagnostics
+    assert len(client.submissions) == 1, client.submissions
+    release = client.submissions[0]
+    assert release["is_release"] is True and release["side"] == "sell", release
+    assert release["qty"] == 5.0 and release["signed_qty_after"] == 5.0, release
+    release_rounds = [row for row in snapshots if row.get("snapshot_type") == "release_round"]
+    assert len(release_rounds) == 1, release_rounds
+    assert all(record.get("status_latest") == "filled" for record in records), records
+    print("  [OK] same-side reduction reaches its target without an entry order")
+
+
+def test_staged_filled_release_is_not_rebuilt_from_lagged_position():
+    client, records, diagnostics, snapshots = _run_stateful_staged_case(
+        initial_signed_qty=10.0,
+        target_signed_weight=-0.05,
+        stale_position_reads_after_fill=2,
+    )
+    release_submissions = [row for row in client.submissions if row["is_release"]]
+    assert len(release_submissions) == 1, client.submissions
+    assert len(client.submissions) == 2, client.submissions
+    release_rounds = [row for row in snapshots if row.get("snapshot_type") == "release_round"]
+    assert len(release_rounds) == 1, release_rounds
+    assert release_rounds[0]["filled_instruction_suppressed_rebuild_symbols"] == ["X"]
+    reconciliation = [
+        row
+        for row in snapshots
+        if row.get("snapshot_type") == "release_position_reconciliation"
+    ]
+    assert len(reconciliation) == 1, reconciliation
+    assert reconciliation[0]["status"] == "pass", reconciliation[0]
+    assert reconciliation[0]["poll_count"] == 2, reconciliation[0]
+    assert diagnostics["entry_aborted"] is False, diagnostics
+    assert all(record.get("status_latest") == "filled" for record in records), records
+    print("  [OK] filled release is not resubmitted when Alpaca positions briefly lag")
 
 
 def test_audit_keeps_requote_fields():
@@ -985,6 +1361,177 @@ def test_position_capacity_uses_total_regt_capacity():
     print("  [OK] gross position is benchmarked against reconstructed total RegT capacity")
 
 
+def test_decision_phase_timings_persist_progress_and_failure():
+    clock = _ManualClock(100.0)
+    with TemporaryDirectory() as tmp:
+        recorder = _DecisionPhaseTimingRecorder(
+            output_root=Path(tmp),
+            run_started_at_utc="2026-07-24T00:00:00+00:00",
+            run_started_monotonic=clock(),
+            clock=clock,
+            utc_now=lambda: "2026-07-24T00:00:00+00:00",
+        )
+        recorder.start("sec_industry_map", {"symbol_count": 917, "cache_mode": "network"})
+        running = json.loads(recorder.path.read_text(encoding="utf-8"))
+        assert running["status"] == "running"
+        assert running["current_phase"] == "sec_industry_map"
+        assert running["phases"][0]["status"] == "running"
+
+        clock.advance(12.5)
+        recorder.finish("sec_industry_map", {"industry_record_count": 917})
+        clock.advance(0.25)
+        recorder.start("alpha_core_build", {"symbol_count": 917})
+        clock.advance(4.75)
+        failed = recorder.fail(RuntimeError("synthetic alpha failure"))
+        persisted = json.loads(recorder.path.read_text(encoding="utf-8"))
+
+    assert failed == persisted
+    assert persisted["status"] == "failed"
+    assert persisted["current_phase"] is None
+    assert persisted["elapsed_seconds"] == 17.5
+    assert persisted["decision_compute_elapsed_seconds"] == 17.25
+    assert persisted["slowest_phase"]["phase"] == "sec_industry_map"
+    assert persisted["phases"][0]["elapsed_seconds"] == 12.5
+    assert persisted["phases"][1]["status"] == "failed"
+    assert persisted["phases"][1]["context"]["error_type"] == "RuntimeError"
+    print("  [OK] decision phase timings persist both live progress and failed-stage evidence")
+
+
+def test_run_events_are_persisted_immediately_with_sequence_and_elapsed_time():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "run_events.jsonl"
+        started = time.monotonic()
+        events = _PersistentRunEvents(path=path, run_started_monotonic=started)
+        _mark_event(events, "first", {"value": 1})
+        first_disk = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        _mark_event(events, "second", {"value": 2})
+        second_disk = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert len(first_disk) == 1, first_disk
+    assert first_disk[0]["seq"] == 1, first_disk
+    assert first_disk[0]["name"] == "first", first_disk
+    assert first_disk[0]["run_elapsed_seconds"] is not None, first_disk
+    assert [row["seq"] for row in second_disk] == [1, 2], second_disk
+    assert second_disk[1]["payload"] == {"value": 2}, second_disk
+    print("  [OK] run events survive immediately on disk with sequence and relative timing")
+
+
+def test_target_capability_drift_explains_new_nonshortable_target():
+    raw_targets = {"LONG": 0.5, "TER": -0.5}
+    prior = _build_target_capability_snapshot(
+        raw_target_signed_weights=raw_targets,
+        projection={
+            "symbols": [
+                {
+                    "symbol": "LONG",
+                    "capacity_adjusted_target_signed_weight": 0.475,
+                    "executable_expected_signed_weight": 0.475,
+                },
+                {
+                    "symbol": "TER",
+                    "capacity_adjusted_target_signed_weight": -0.475,
+                    "executable_expected_signed_weight": -0.45,
+                    "target_lattice_signed_qty": -8,
+                    "constraint_reasons": ["short_target_integer"],
+                },
+            ]
+        },
+        assets_by_symbol={
+            "LONG": {"tradable": True, "fractionable": True},
+            "TER": {
+                "tradable": True,
+                "shortable": True,
+                "easy_to_borrow": True,
+                "borrow_status": "easy_to_borrow",
+            },
+        },
+        account_shorting_enabled=True,
+        run_role="decision",
+        input_target_path=None,
+    )
+    current = _build_target_capability_snapshot(
+        raw_target_signed_weights=raw_targets,
+        projection={
+            "symbols": [
+                {
+                    "symbol": "LONG",
+                    "capacity_adjusted_target_signed_weight": 0.475,
+                    "executable_expected_signed_weight": 0.475,
+                },
+                {
+                    "symbol": "TER",
+                    "capacity_adjusted_target_signed_weight": -0.475,
+                    "executable_expected_signed_weight": 0.0,
+                    "target_lattice_signed_qty": 0,
+                    "constraint_reasons": ["asset_not_shortable", "short_target_integer"],
+                },
+            ]
+        },
+        assets_by_symbol={
+            "LONG": {"tradable": True, "fractionable": True},
+            "TER": {
+                "tradable": True,
+                "shortable": False,
+                "easy_to_borrow": False,
+                "borrow_status": "hard_to_borrow",
+            },
+        },
+        account_shorting_enabled=True,
+        run_role="execute",
+        input_target_path="decision_targets.csv",
+    )
+    drift = _build_target_capability_drift(
+        current_snapshot=current,
+        prior_snapshot=prior,
+        prior_snapshot_path=Path("target_capability_snapshot.json"),
+    )
+
+    assert current["blocked_target_symbols"] == ["TER"], current
+    assert current["nonshortable_short_target_symbols"] == ["TER"], current
+    assert drift["status"] == "attention", drift
+    assert drift["became_nonshortable_symbols"] == ["TER"], drift
+    assert drift["projected_to_zero_now_symbols"] == ["TER"], drift
+    assert drift["execution_blocking_change_symbols"] == ["TER"], drift
+    print("  [OK] target capability drift explains a decision target becoming nonshortable")
+
+
+def test_quote_audit_prefers_immediate_post_submission_snapshot():
+    with TemporaryDirectory() as tmp:
+        run_dir = Path(tmp)
+        (run_dir / "execution_latest_quotes_snapshot.json").write_text(
+            json.dumps({"ok": True, "payload": {"X": {"bp": 99.0, "ap": 101.0}}}),
+            encoding="utf-8",
+        )
+        (run_dir / "execution_latest_quotes_snapshot_post_submission.json").write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "feed": "iex",
+                    "requested_symbols": ["X"],
+                    "payload": {"X": {"bp": 109.0, "ap": 111.0, "t": "2026-07-24T14:01:00Z"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "execution_latest_quotes_snapshot_after.json").write_text(
+            json.dumps({"ok": True, "payload": {"X": {"bp": 119.0, "ap": 121.0}}}),
+            encoding="utf-8",
+        )
+        rows, summary = _build_quote_evidence(
+            run_dir=run_dir,
+            market_price_evidence_rows=[{"symbol": "X", "execute_reference_price_used": 100.0}],
+            fill_rows=[],
+        )
+
+    assert len(rows) == 1, rows
+    assert rows[0]["source_used"] == "post_submission", rows[0]
+    assert rows[0]["mid_price"] == 110.0, rows[0]
+    assert rows[0]["post_submission_mid_price"] == 110.0, rows[0]
+    assert summary["sources"]["post_submission"]["requested_symbol_count"] == 1, summary
+    assert summary["sources"]["post_submission"]["quote_symbol_count"] == 1, summary
+    print("  [OK] quote audit uses the immediate post-submission snapshot for fill context")
+
+
 def main() -> int:
     tests = [
         ("Whole-share short target sizing", test_whole_share_short_delta_uses_target_shares),
@@ -997,8 +1544,11 @@ def main() -> int:
         ("Buying-power scenario diagnostics", test_projector_logs_buffer_scenarios),
         ("Lexicographic weight-error priority", test_projector_uses_buying_power_only_as_secondary_objective),
         ("Final gross capacity target", test_projector_enforces_final_gross_capacity_target),
+        ("Block missing short side", test_submission_guard_blocks_missing_short_side),
+        ("Allow complete long/short portfolio", test_submission_guard_allows_complete_long_short_projection),
         ("Total RegT capacity reconstruction", test_total_regt_capacity_reconstruction),
         ("Portfolio-history request parameters", test_portfolio_history_uses_explicit_range_without_period),
+        ("Intraday SIP fallback evidence", test_intraday_bar_capture_falls_back_for_primary_missing_symbols),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
         ("Min-trade short carry safety", test_min_trade_short_carry_cannot_emit_residual_order),
         ("Weight-based min-trade threshold", test_min_trade_threshold_scales_with_weight_error_budget),
@@ -1009,11 +1559,19 @@ def main() -> int:
         ("Concurrent symbol execution", test_order_batch_runs_symbols_concurrently),
         ("Per-symbol attempt budget", test_per_symbol_attempt_budget_bounds_requotes),
         ("Cross-round staged attempt budget", test_staged_release_attempt_budget_is_global_across_rounds),
+        ("Staged long-to-short zero boundary", test_staged_long_to_short_stops_at_zero_before_entry),
+        ("Staged short-to-long zero boundary", test_staged_short_to_long_stops_at_zero_before_entry),
+        ("Staged same-side reduction", test_staged_same_side_reduction_has_no_entry_leg),
+        ("Staged filled release position lag", test_staged_filled_release_is_not_rebuilt_from_lagged_position),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),
         ("Audit submit-error payload parsing", test_audit_parses_submit_error_payload),
         ("Audit not-submitted reason", test_audit_marks_not_submitted_reason),
         ("Audit staged rebuild fill merge", test_audit_merges_staged_rebuild_fill_after_cancel),
         ("Total RegT position-capacity audit", test_position_capacity_uses_total_regt_capacity),
+        ("Decision phase timing persistence", test_decision_phase_timings_persist_progress_and_failure),
+        ("Persistent run event logging", test_run_events_are_persisted_immediately_with_sequence_and_elapsed_time),
+        ("Target capability drift evidence", test_target_capability_drift_explains_new_nonshortable_target),
+        ("Post-submission quote audit", test_quote_audit_prefers_immediate_post_submission_snapshot),
     ]
     failed = 0
     for name, fn in tests:

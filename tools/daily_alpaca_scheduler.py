@@ -110,13 +110,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "session_date - 1). Default 'sip' for full-market liquidity. Free-tier compatible.",
     )
     parser.add_argument(
+        "--execution-quote-provider",
+        choices=("alpaca", "longbridge"),
+        default="longbridge",
+        help="Real-time quote provider used for execution sizing and limit prices.",
+    )
+    parser.add_argument(
+        "--longbridge-config-path",
+        default="configs/longbridge.local.json",
+        help="Ignored local JSON containing Longbridge OpenAPI credentials.",
+    )
+    parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=30.0)
+    parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
+    parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
+    parser.add_argument("--longbridge-coverage-chunk-size", type=int, default=500)
+    parser.add_argument(
         "--execution-price-feed",
         default="iex",
-        help="Feed for the latest-trade price refresh during execution (requires RECENT data). "
-             "Default 'iex' — free-tier SIP rejects recent-data queries with HTTP 403, so SIP "
-             "is NOT usable for execution pricing without a paid market-data subscription. "
-             "IEX gives single-exchange last-trade, which is acceptable for top-1000 liquid "
-             "names (all present on IEX). Set 'sip' only if you have an entitled subscription.",
+        help="Alpaca feed retained for intraday bar evidence and provider=alpaca.",
     )
 
     # NOTE: decision fires at 12:30 BJ (not 12:00). BJ 12:00 == US Eastern 00:00 which
@@ -378,6 +390,7 @@ def _resolve_config_paths(args: argparse.Namespace) -> None:
     args.output_root = _resolve_path(args.output_root, project_root)
     args.state_path = _resolve_path(args.state_path, project_root)
     args.accounts_json_path = _resolve_path(args.accounts_json_path, project_root)
+    args.longbridge_config_path = _resolve_path(args.longbridge_config_path, project_root)
 
 
 def _write_daemon_identity(args: argparse.Namespace) -> None:
@@ -929,6 +942,7 @@ def _build_scheduler_task_result(
         },
         "artifacts": {
             "execution_summary": _path_status(output_root / "execution_summary.json"),
+            "decision_phase_timings": _path_status(output_root / "decision_phase_timings.json"),
             "execution_quality": _path_status(output_root / "execution_quality.json"),
             "daily_audit_dir": _path_status(output_root / "audit"),
             "decision_targets": _path_status(output_root / "decision_targets.csv"),
@@ -949,8 +963,25 @@ def _build_scheduler_task_result(
             "executable_target_projection": _path_status(
                 output_root / "executable_target_projection.json"
             ),
+            "target_capability_snapshot": _path_status(output_root / "target_capability_snapshot.json"),
+            "target_capability_drift": _path_status(output_root / "target_capability_drift.json"),
+            "symbol_universe_intersection": _path_status(
+                output_root / "symbol_universe_intersection.json"
+            ),
+            "symbol_universe_intersection_csv": _path_status(
+                output_root / "symbol_universe_intersection.csv"
+            ),
             "execution_latest_trades_snapshot": _path_status(output_root / "execution_latest_trades_snapshot.json"),
+            "execution_quote_provider_health": _path_status(
+                output_root / "execution_quote_provider_health.json"
+            ),
+            "execution_quote_provider_health_after": _path_status(
+                output_root / "execution_quote_provider_health_after.json"
+            ),
             "execution_latest_quotes_snapshot": _path_status(output_root / "execution_latest_quotes_snapshot.json"),
+            "execution_latest_quotes_snapshot_post_submission": _path_status(
+                output_root / "execution_latest_quotes_snapshot_post_submission.json"
+            ),
             "execution_latest_quotes_snapshot_after": _path_status(
                 output_root / "execution_latest_quotes_snapshot_after.json"
             ),
@@ -1235,6 +1266,20 @@ def _build_command(
         args.dynamic_feed,
         "--execution-price-feed",
         args.execution_price_feed,
+        "--execution-quote-provider",
+        args.execution_quote_provider,
+        "--longbridge-config-path",
+        args.longbridge_config_path,
+        "--longbridge-warmup-timeout-seconds",
+        _num(args.longbridge_warmup_timeout_seconds),
+        "--longbridge-max-quote-age-seconds",
+        _num(args.longbridge_max_quote_age_seconds),
+        "--longbridge-max-spread-bps",
+        _num(args.longbridge_max_spread_bps),
+        "--longbridge-max-subscriptions",
+        str(int(args.longbridge_max_subscriptions)),
+        "--longbridge-coverage-chunk-size",
+        str(int(args.longbridge_coverage_chunk_size)),
         "--execution-mode",
         args.execution_mode,
         "--execution-order-style",

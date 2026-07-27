@@ -125,15 +125,27 @@ class DynamicSymbolPool:
     def candidate_symbols(self) -> tuple[str, ...]:
         return tuple(self._candidate_symbols)
 
-    def fresh(self, as_of_date: str | date | datetime) -> set[str]:
+    def fresh(
+        self,
+        as_of_date: str | date | datetime,
+        *,
+        assets: Sequence[dict[str, Any]] | None = None,
+    ) -> set[str]:
         # 1) 规范化日期输入，避免字符串/日期对象混用导致口径偏差。
         target_date = _normalize_date(as_of_date)
         target_date_str = target_date.isoformat()
 
         # 2) 先拿到 Alpaca 当前资产，动态计算 clean_core，再与可交易集合做交集。
-        print("[Alpaca] Step 1/3: fetching active us_equity assets ...", flush=True)
-        assets = self._client.list_assets(status="active", asset_class="us_equity")
-        print(f"[Alpaca] Step 1/3 done: assets={len(assets)}", flush=True)
+        if assets is None:
+            print("[Alpaca] Step 1/3: fetching active us_equity assets ...", flush=True)
+            assets = self._client.list_assets(status="active", asset_class="us_equity")
+            print(f"[Alpaca] Step 1/3 done: assets={len(assets)}", flush=True)
+        else:
+            assets = list(assets)
+            print(
+                f"[Alpaca] Step 1/3: reusing active us_equity snapshot, assets={len(assets)}",
+                flush=True,
+            )
         clean_core_symbols = _build_runtime_clean_core_symbol_set(assets)
         clean_core_candidates = sorted(set(self._candidate_symbols).intersection(clean_core_symbols))
         tradable_symbols = _build_tradable_symbol_set(assets)
