@@ -4827,6 +4827,8 @@ def _execution_attempt_outcome_summary(
     canceled_attempt_count = 0
     superseded_canceled_attempt_count = 0
     terminal_canceled_attempt_count = 0
+    canceled_attempt_reason_counts: Counter[str] = Counter()
+    canceled_attempts: list[dict[str, Any]] = []
     for index, record in enumerate(execution_records):
         key = _execution_logical_key(record)
         record_is_final = final_record_index_by_key.get(key) == index
@@ -4836,10 +4838,34 @@ def _execution_attempt_outcome_summary(
             if str(attempt.get("status_latest") or "").lower() != "canceled":
                 continue
             canceled_attempt_count += 1
+            cancel_reason = str(attempt.get("cancel_reason") or "legacy_unspecified")
             if record_finally_filled or not record_is_final:
                 superseded_canceled_attempt_count += 1
+                outcome = "superseded_requote"
             else:
                 terminal_canceled_attempt_count += 1
+                outcome = "terminal_unfilled"
+            canceled_attempt_reason_counts[cancel_reason] += 1
+            canceled_attempts.append(
+                {
+                    "symbol": str(record.get("symbol") or "").upper(),
+                    "side": str(record.get("side") or "").lower(),
+                    "stage": str(record.get("stage") or "single_pass"),
+                    "order_id": str(attempt.get("order_id") or ""),
+                    "attempt_no": int(attempt.get("attempt_no") or 0),
+                    "cancel_reason": cancel_reason,
+                    "outcome": outcome,
+                    "cancel_requested_at_utc": str(
+                        attempt.get("cancel_requested_at_utc") or ""
+                    ),
+                    "limit_price": _safe_float(attempt.get("limit_price")),
+                    "offset_bps": _safe_float(attempt.get("offset_bps")),
+                    "live_reference_price": _safe_float(
+                        attempt.get("live_reference_price")
+                    ),
+                    "quote_age_ms": _safe_float(attempt.get("quote_age_ms")),
+                }
+            )
 
     final_records = _final_logical_execution_records(execution_records)
     terminal_unfilled_records = [
@@ -4867,6 +4893,10 @@ def _execution_attempt_outcome_summary(
             superseded_canceled_attempt_count
         ),
         "terminal_canceled_attempt_count": int(terminal_canceled_attempt_count),
+        "canceled_attempt_reason_counts": dict(
+            sorted(canceled_attempt_reason_counts.items())
+        ),
+        "canceled_attempts": canceled_attempts,
         "terminal_unfilled_record_count": int(len(terminal_unfilled_records)),
         "terminal_unfilled_symbols": sorted(
             {
@@ -5117,6 +5147,10 @@ def _submit_and_track_orders(
                 )
                 latest_order = placed_order
                 attempt_poll_events: list[dict[str, Any]] = []
+                cancel_reason = ""
+                cancel_requested_at_utc = ""
+                cancel_error_type = ""
+                cancel_error = ""
                 _append_order_timeline_event(
                     attempt_poll_events,
                     event="submitted",
@@ -5148,6 +5182,11 @@ def _submit_and_track_orders(
                 status = _order_status(latest_order)
                 need_cancel = remaining_qty > EPS and status not in TERMINAL_ORDER_STATUSES
                 if need_cancel and order_id:
+                    cancel_reason = (
+                        "global_order_timeout"
+                        if time.monotonic() >= global_deadline - 1e-6
+                        else "requote_wait_elapsed"
+                    )
                     cancel_requested_at_utc = _utc_now()
                     try:
                         client.cancel_order(order_id)
@@ -5156,9 +5195,14 @@ def _submit_and_track_orders(
                             event="cancel_requested",
                             order_id=order_id,
                             order=latest_order,
-                            extra={"cancel_requested_at_utc": cancel_requested_at_utc},
+                            extra={
+                                "cancel_requested_at_utc": cancel_requested_at_utc,
+                                "cancel_reason": cancel_reason,
+                            },
                         )
                     except AlpacaRequestError as exc:
+                        cancel_error_type = type(exc).__name__
+                        cancel_error = str(exc)
                         _append_order_timeline_event(
                             attempt_poll_events,
                             event="cancel_error",
@@ -5166,8 +5210,9 @@ def _submit_and_track_orders(
                             order=latest_order,
                             extra={
                                 "cancel_requested_at_utc": cancel_requested_at_utc,
-                                "error_type": type(exc).__name__,
-                                "error": str(exc),
+                                "cancel_reason": cancel_reason,
+                                "error_type": cancel_error_type,
+                                "error": cancel_error,
                             },
                         )
                         pass
@@ -5208,6 +5253,10 @@ def _submit_and_track_orders(
                         "quote_refresh_error": quote_error,
                         **quote_evidence,
                         "status_latest": latest_status,
+                        "cancel_reason": cancel_reason,
+                        "cancel_requested_at_utc": cancel_requested_at_utc,
+                        "cancel_error_type": cancel_error_type,
+                        "cancel_error": cancel_error,
                         "filled_qty": float(filled_qty_this_attempt),
                         "filled_avg_price": latest_filled_avg_price,
                         "updated_at": latest_updated_at,

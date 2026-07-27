@@ -143,6 +143,10 @@ def _build_execution_attempt_outcome_audit(
     for key in ["terminal_unfilled_symbols", "terminal_unfilled_records", "repaired_entry_symbols"]:
         if not isinstance(payload.get(key), list):
             payload[key] = []
+    if not isinstance(payload.get("canceled_attempts"), list):
+        payload["canceled_attempts"] = []
+    if not isinstance(payload.get("canceled_attempt_reason_counts"), dict):
+        payload["canceled_attempt_reason_counts"] = {}
     if not payload["repaired_entry_symbol_count"]:
         payload["repaired_entry_symbol_count"] = len(payload["repaired_entry_symbols"])
 
@@ -432,6 +436,12 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
                         else "",
                         "max_offset_bps": _attempt_max_offset_bps(attempt),
                         "status_latest": str(attempt.get("status_latest") or ""),
+                        "cancel_reason": str(attempt.get("cancel_reason") or ""),
+                        "cancel_requested_at_utc": str(
+                            attempt.get("cancel_requested_at_utc") or ""
+                        ),
+                        "cancel_error_type": str(attempt.get("cancel_error_type") or ""),
+                        "cancel_error": str(attempt.get("cancel_error") or ""),
                         "filled_qty": _safe_float(attempt.get("filled_qty")),
                         "remaining_qty_estimate": max(
                             0.0,
@@ -484,6 +494,10 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
                     "requote_cycle": "",
                     "max_offset_bps": _optional_float(record.get("marketable_limit_max_offset_bps")),
                     "status_latest": str(record.get("status_latest") or ""),
+                    "cancel_reason": "",
+                    "cancel_requested_at_utc": "",
+                    "cancel_error_type": "",
+                    "cancel_error": "",
                     "filled_qty": _safe_float(record.get("filled_qty")),
                     "remaining_qty_estimate": _safe_float(record.get("remaining_qty")),
                     "filled_avg_price": _safe_float(record.get("filled_avg_price")),
@@ -11126,6 +11140,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
         "attempt_no", "attempt_client_order_id", "attempt_order_id", "qty_submitted", "limit_price",
         "offset_bps", "requote_step_index", "requote_cycle", "max_offset_bps", "status_latest",
+        "cancel_reason", "cancel_requested_at_utc", "cancel_error_type", "cancel_error",
         "live_reference_price", "reference_price_source", "quote_refresh_error",
         "quote_observed_at_utc", "quote_timestamp_utc", "quote_age_ms",
         "live_bid_price", "live_ask_price", "live_mid_price", "live_spread", "live_spread_bps",

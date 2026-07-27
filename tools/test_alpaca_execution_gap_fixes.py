@@ -802,8 +802,11 @@ def test_marketable_limit_requotes_until_timeout():
     )
     attempts = records[0]["attempts"]
     offsets = [attempt["offset_bps"] for attempt in attempts]
+    cancel_reasons = [attempt["cancel_reason"] for attempt in attempts]
     assert len(attempts) > 2, f"expected repeated requotes beyond one pass, got offsets={offsets}"
     assert max(offsets) <= 50.0, f"max offset cap violated: {offsets}"
+    assert all(reason in {"requote_wait_elapsed", "global_order_timeout"} for reason in cancel_reasons)
+    assert all(attempt["cancel_requested_at_utc"] for attempt in attempts)
     assert records[0]["remaining_qty"] == 1.0
     print(f"  [OK] repeated requotes: attempts={len(attempts)}, offsets={offsets}")
 
@@ -858,6 +861,8 @@ def test_marketable_limit_uses_live_quote_side():
     assert abs(attempt["live_mid_price"] - 90.5) < 1e-12, attempt
     assert abs(attempt["live_spread_bps"] - (1.0 / 90.5 * 10000.0)) < 1e-9, attempt
     assert attempt["marketable_reference_field"] == "bp", attempt
+    assert attempt["cancel_reason"] == "requote_wait_elapsed", attempt
+    assert attempt["cancel_requested_at_utc"], attempt
     assert records[0]["attempt_count"] == 1, records[0]
     audit_row = _build_order_attempt_rows(records, [])[0]
     assert audit_row["live_reference_price"] == 90.0, audit_row
@@ -867,6 +872,8 @@ def test_marketable_limit_uses_live_quote_side():
     assert audit_row["live_bid_price"] == 90.0, audit_row
     assert audit_row["live_ask_price"] == 91.0, audit_row
     assert audit_row["live_spread_bps"] == attempt["live_spread_bps"], audit_row
+    assert audit_row["cancel_reason"] == "requote_wait_elapsed", audit_row
+    assert audit_row["cancel_requested_at_utc"] == attempt["cancel_requested_at_utc"], audit_row
     print("  [OK] sell limit refreshes from live bid and obeys one-attempt cap")
 
 
@@ -1293,7 +1300,12 @@ def test_attempt_outcome_summary_separates_requotes_from_terminal_misses():
             "qty": 5.0,
             "filled_qty": 0.0,
             "remaining_qty": 5.0,
-            "attempts": [{"status_latest": "canceled"}],
+            "attempts": [
+                {
+                    "status_latest": "canceled",
+                    "cancel_reason": "requote_wait_elapsed",
+                }
+            ],
         },
         {
             "symbol": "X",
@@ -1311,7 +1323,12 @@ def test_attempt_outcome_summary_separates_requotes_from_terminal_misses():
             "qty": 1.0,
             "filled_qty": 0.0,
             "remaining_qty": 1.0,
-            "attempts": [{"status_latest": "canceled"}],
+            "attempts": [
+                {
+                    "status_latest": "canceled",
+                    "cancel_reason": "global_order_timeout",
+                }
+            ],
         },
     ]
     summary = _execution_attempt_outcome_summary(records)
@@ -1320,6 +1337,14 @@ def test_attempt_outcome_summary_separates_requotes_from_terminal_misses():
     assert summary["canceled_attempt_count"] == 2, summary
     assert summary["superseded_requote_canceled_attempt_count"] == 1, summary
     assert summary["terminal_canceled_attempt_count"] == 1, summary
+    assert summary["canceled_attempt_reason_counts"] == {
+        "global_order_timeout": 1,
+        "requote_wait_elapsed": 1,
+    }, summary
+    assert [attempt["outcome"] for attempt in summary["canceled_attempts"]] == [
+        "superseded_requote",
+        "terminal_unfilled",
+    ], summary
     assert summary["terminal_unfilled_record_count"] == 1, summary
     assert summary["terminal_unfilled_symbols"] == ["Y"], summary
     assert summary["repaired_entry_symbols"] == ["X"], summary
@@ -1355,6 +1380,8 @@ def test_audit_keeps_requote_fields():
                     "offset_bps": 10.0,
                     "requote_step_index": 1,
                     "requote_cycle": 1,
+                    "cancel_reason": "requote_wait_elapsed",
+                    "cancel_requested_at_utc": "2026-07-27T14:00:01Z",
                     "status_latest": "canceled",
                     "filled_qty": 0.0,
                     "poll_events": [{"event": "submitted", "max_offset_bps": 50.0}],
@@ -1379,6 +1406,8 @@ def test_audit_keeps_requote_fields():
     assert attempt_rows[1]["requote_step_index"] == 2
     assert attempt_rows[1]["requote_cycle"] == 3
     assert attempt_rows[1]["max_offset_bps"] == 50.0
+    assert attempt_rows[0]["cancel_reason"] == "requote_wait_elapsed"
+    assert attempt_rows[0]["cancel_requested_at_utc"] == "2026-07-27T14:00:01Z"
 
     execution_rows, summary = _build_execution_attribution_outputs(records, [])
     assert execution_rows[1]["requote_step_index"] == 2
