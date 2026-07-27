@@ -121,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Ignored local JSON containing Longbridge OpenAPI credentials.",
     )
     parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
-    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=30.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=5.0)
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
     parser.add_argument("--longbridge-coverage-chunk-size", type=int, default=500)
@@ -173,6 +173,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--order-poll-seconds", type=float, default=2.0)
     parser.add_argument("--staged-release-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--staged-entry-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--staged-entry-repair-rounds", type=int, default=1)
+    parser.add_argument("--staged-entry-repair-max-attempts", type=int, default=1)
+    parser.add_argument("--staged-entry-repair-wait-seconds", type=float, default=10.0)
     parser.add_argument("--cancel-open-orders-before-submit", action="store_true")
     parser.add_argument("--no-submit", action="store_true", help="Pass --no-submit to the execution phase.")
 
@@ -1318,6 +1321,16 @@ def _build_command(
     _append_optional_float(command, "--sizing-adverse-offset-bps", args.sizing_adverse_offset_bps)
     _append_optional_float(command, "--staged-release-timeout-seconds", args.staged_release_timeout_seconds)
     _append_optional_float(command, "--staged-entry-timeout-seconds", args.staged_entry_timeout_seconds)
+    command.extend(
+        [
+            "--staged-entry-repair-rounds",
+            str(int(args.staged_entry_repair_rounds)),
+            "--staged-entry-repair-max-attempts",
+            str(int(args.staged_entry_repair_max_attempts)),
+            "--staged-entry-repair-wait-seconds",
+            _num(args.staged_entry_repair_wait_seconds),
+        ]
+    )
 
     if task == "decision":
         command.extend(

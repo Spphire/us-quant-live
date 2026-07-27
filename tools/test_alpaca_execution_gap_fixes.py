@@ -28,6 +28,8 @@ from src.alpaca_executor import (  # noqa: E402
     _collect_intraday_bars_snapshot,
     _collect_portfolio_history_snapshot,
     _effective_min_trade_notional,
+    _execution_attempt_outcome_summary,
+    _final_logical_execution_records,
     _is_insufficient_buying_power_error,
     _is_insufficient_qty_available_error,
     _marketable_offset_ladder,
@@ -38,6 +40,7 @@ from src.alpaca_executor import (  # noqa: E402
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
 from tools.daily_audit_report import (  # noqa: E402
+    _build_execution_attempt_outcome_audit,
     _build_executable_target_projection_outputs,
     _build_execution_attribution_outputs,
     _build_order_attempt_rows,
@@ -271,6 +274,43 @@ class _StatefulStagedFillClient:
             }
             for symbol in symbols
         }
+
+
+class _EntryRepairFillClient(_StatefulStagedFillClient):
+    def submit_order(self, **kwargs):
+        client_order_id = str(kwargs.get("client_order_id") or "")
+        if "_ent_" not in client_order_id or "_erp_" in client_order_id:
+            return super().submit_order(**kwargs)
+
+        qty = float(kwargs.get("qty") or 0.0)
+        side = str(kwargs.get("side") or "")
+        order = {
+            "id": client_order_id,
+            "client_order_id": client_order_id,
+            "symbol": str(kwargs.get("symbol") or "X"),
+            "side": side,
+            "type": str(kwargs.get("type") or "limit"),
+            "time_in_force": str(kwargs.get("time_in_force") or "day"),
+            "qty": str(qty),
+            "limit_price": kwargs.get("limit_price"),
+            "status": "canceled",
+            "filled_qty": "0",
+            "filled_avg_price": None,
+            "updated_at": "2026-07-27T14:00:00Z",
+        }
+        self.orders[client_order_id] = dict(order)
+        self.submissions.append(
+            {
+                "client_order_id": client_order_id,
+                "side": side,
+                "qty": qty,
+                "signed_qty_before": float(self.signed_qty),
+                "signed_qty_after": float(self.signed_qty),
+                "is_release": False,
+                "forced_unfilled_entry": True,
+            }
+        )
+        return dict(order)
 
 
 class _PortfolioHistoryClient:
@@ -1146,6 +1186,148 @@ def test_staged_filled_release_is_not_rebuilt_from_lagged_position():
     print("  [OK] filled release is not resubmitted when Alpaca positions briefly lag")
 
 
+def test_staged_entry_residual_repair_fills_weight_priority_gap():
+    client = _EntryRepairFillClient(0.0, stale_position_reads_after_fill=3)
+    weights = {"X": 0.05}
+    assets = {
+        "X": {
+            "symbol": "X",
+            "tradable": True,
+            "fractionable": True,
+            "shortable": True,
+        }
+    }
+    instructions, skipped = _build_order_instructions(
+        target_signed_weights=weights,
+        current_signed_notional={"X": 0.0},
+        current_signed_qty={"X": 0.0},
+        account_equity=10000.0,
+        reference_prices={"X": 100.0},
+        assets_by_symbol=assets,
+        min_trade_notional=1.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+    )
+    assert not skipped, skipped
+    snapshots: list[dict[str, object]] = []
+    records, diagnostics = _submit_staged_regt_orders(
+        client=client,
+        initial_instructions=instructions,
+        target_signed_weights=weights,
+        raw_target_signed_weights=weights,
+        assets_by_symbol=assets,
+        fallback_prices={"X": 100.0},
+        session_token="entry-repair",
+        execution_price_feed="iex",
+        account_equity=10000.0,
+        min_trade_notional_floor=1.0,
+        min_trade_weight_bps=1.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        buying_power_buffer=0.95,
+        gross_capacity_target_ratio=0.95,
+        short_buying_power_adverse_offset_bps=300.0,
+        release_timeout_seconds=2.0,
+        entry_timeout_seconds=2.0,
+        entry_repair_rounds=1,
+        entry_repair_max_attempts=1,
+        entry_repair_wait_seconds=0.1,
+        poll_seconds=0.01,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=0.0,
+        marketable_limit_max_offset_bps=50.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.01,
+        marketable_limit_max_attempts=1,
+        execution_workers=2,
+        release_max_rounds=3,
+        release_round_extra_bps=5.0,
+        release_round_sleep_seconds=0.0,
+        stage_snapshots=snapshots,
+        initial_current_signed_qty={"X": 0.0},
+    )
+
+    assert len(client.submissions) == 2, client.submissions
+    assert client.submissions[0].get("forced_unfilled_entry") is True
+    assert "_erp_r01_" in str(client.submissions[1]["client_order_id"])
+    assert client.signed_qty == 5.0, client.signed_qty
+    assert [record["status_latest"] for record in records] == ["canceled", "filled"], records
+    assert [record["stage"] for record in records] == ["entry", "entry_repair"], records
+    assert diagnostics["entry_repair_rounds_completed"] == 1, diagnostics
+    assert diagnostics["entry_repair_records"] == 1, diagnostics
+    assert diagnostics["entry_repair_final_unfilled_symbols"] == [], diagnostics
+    assert diagnostics["entry_final_position_reconciliation"]["status"] == "pass"
+    assert diagnostics["entry_final_position_reconciliation"]["poll_count"] == 3
+    repair_snapshots = [
+        row for row in snapshots if row.get("snapshot_type") == "entry_repair"
+    ]
+    assert len(repair_snapshots) == 1, repair_snapshots
+    assert repair_snapshots[0]["candidate_symbols"] == ["X"], repair_snapshots[0]
+    assert repair_snapshots[0]["priority_rule"] == "absolute_weight_gap_bps_descending"
+    assert repair_snapshots[0]["max_attempts_per_symbol"] == 1
+    assert repair_snapshots[0]["limit_offset_bps"] == 50.0
+    final_reconciliation = [
+        row
+        for row in snapshots
+        if row.get("snapshot_type") == "entry_final_position_reconciliation"
+    ]
+    assert len(final_reconciliation) == 1, final_reconciliation
+    assert final_reconciliation[0]["status"] == "pass", final_reconciliation[0]
+    print("  [OK] canceled entry is repaired once in descending weight-gap priority")
+
+
+def test_attempt_outcome_summary_separates_requotes_from_terminal_misses():
+    records = [
+        {
+            "symbol": "X",
+            "stage": "entry",
+            "status_latest": "canceled",
+            "qty": 5.0,
+            "filled_qty": 0.0,
+            "remaining_qty": 5.0,
+            "attempts": [{"status_latest": "canceled"}],
+        },
+        {
+            "symbol": "X",
+            "stage": "entry_repair",
+            "status_latest": "filled",
+            "qty": 5.0,
+            "filled_qty": 5.0,
+            "remaining_qty": 0.0,
+            "attempts": [{"status_latest": "filled"}],
+        },
+        {
+            "symbol": "Y",
+            "stage": "entry",
+            "status_latest": "canceled",
+            "qty": 1.0,
+            "filled_qty": 0.0,
+            "remaining_qty": 1.0,
+            "attempts": [{"status_latest": "canceled"}],
+        },
+    ]
+    summary = _execution_attempt_outcome_summary(records)
+    final_records = _final_logical_execution_records(records)
+    assert summary["broker_attempt_count"] == 3, summary
+    assert summary["canceled_attempt_count"] == 2, summary
+    assert summary["superseded_requote_canceled_attempt_count"] == 1, summary
+    assert summary["terminal_canceled_attempt_count"] == 1, summary
+    assert summary["terminal_unfilled_record_count"] == 1, summary
+    assert summary["terminal_unfilled_symbols"] == ["Y"], summary
+    assert summary["repaired_entry_symbols"] == ["X"], summary
+    assert [record["symbol"] for record in final_records] == ["X", "Y"], final_records
+    assert [record["status_latest"] for record in final_records] == ["filled", "canceled"]
+    print("  [OK] audit separates superseded requotes from final unfilled instructions")
+
+
 def test_audit_keeps_requote_fields():
     records = [
         {
@@ -1332,6 +1514,75 @@ def test_audit_merges_staged_rebuild_fill_after_cancel():
     assert logical[0]["raw_record_count"] == 2
     assert logical[0]["filled_qty"] == 1.0023
     print("  [OK] staged rebuild fill supersedes earlier canceled audit record")
+
+
+def test_execution_quality_merges_entry_repair_with_initial_entry():
+    records = [
+        {
+            "symbol": "SEZL",
+            "side": "sell",
+            "stage": "entry",
+            "status_latest": "canceled",
+            "qty": 3.0,
+            "filled_qty": 0.0,
+            "remaining_qty": 3.0,
+            "reference_price": 154.55,
+            "attempt_count": 1,
+        },
+        {
+            "symbol": "SEZL",
+            "side": "sell",
+            "stage": "entry_repair",
+            "status_latest": "filled",
+            "qty": 3.0,
+            "filled_qty": 3.0,
+            "remaining_qty": 0.0,
+            "reference_price": 154.55,
+            "filled_avg_price": 154.01,
+            "attempt_count": 1,
+        },
+    ]
+
+    logical = _logical_records(records)
+
+    assert len(logical) == 1, logical
+    assert logical[0]["stage"] == "entry", logical
+    assert logical[0]["status_latest"] == "filled", logical
+    assert logical[0]["raw_record_count"] == 2, logical
+    assert logical[0]["raw_status_counts"] == {"canceled": 1, "filled": 1}, logical
+    assert logical[0]["filled_qty"] == 3.0, logical
+    assert logical[0]["remaining_qty"] == 0.0, logical
+    print("  [OK] entry repair is one filled logical order, not a separate cancel")
+
+
+def test_audit_exposes_attempt_outcomes_without_treating_requotes_as_misses():
+    with TemporaryDirectory() as tmp:
+        run_dir = Path(tmp)
+        (run_dir / "execution_attempt_outcome_summary.json").write_text(
+            json.dumps(
+                {
+                    "broker_attempt_count": 2,
+                    "canceled_attempt_count": 1,
+                    "superseded_requote_canceled_attempt_count": 1,
+                    "terminal_canceled_attempt_count": 0,
+                    "terminal_unfilled_record_count": 0,
+                    "terminal_unfilled_symbols": [],
+                    "repaired_entry_symbol_count": 1,
+                    "repaired_entry_symbols": ["SEZL"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        outcome = _build_execution_attempt_outcome_audit(run_dir, {})
+
+    assert outcome["available"] is True, outcome
+    assert outcome["status"] == "pass", outcome
+    assert outcome["canceled_attempt_count"] == 1, outcome
+    assert outcome["superseded_requote_canceled_attempt_count"] == 1, outcome
+    assert outcome["repaired_entry_symbol_count"] == 1, outcome
+    assert outcome["terminal_unfilled_record_count"] == 0, outcome
+    print("  [OK] audit separates repaired requote cancels from terminal misses")
 
 
 def test_position_capacity_uses_total_regt_capacity():
@@ -1563,10 +1814,14 @@ def main() -> int:
         ("Staged short-to-long zero boundary", test_staged_short_to_long_stops_at_zero_before_entry),
         ("Staged same-side reduction", test_staged_same_side_reduction_has_no_entry_leg),
         ("Staged filled release position lag", test_staged_filled_release_is_not_rebuilt_from_lagged_position),
+        ("Staged entry residual repair", test_staged_entry_residual_repair_fills_weight_priority_gap),
+        ("Attempt outcome classification", test_attempt_outcome_summary_separates_requotes_from_terminal_misses),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),
         ("Audit submit-error payload parsing", test_audit_parses_submit_error_payload),
         ("Audit not-submitted reason", test_audit_marks_not_submitted_reason),
         ("Audit staged rebuild fill merge", test_audit_merges_staged_rebuild_fill_after_cancel),
+        ("Execution-quality entry repair merge", test_execution_quality_merges_entry_repair_with_initial_entry),
+        ("Audit attempt-outcome propagation", test_audit_exposes_attempt_outcomes_without_treating_requotes_as_misses),
         ("Total RegT position-capacity audit", test_position_capacity_uses_total_regt_capacity),
         ("Decision phase timing persistence", test_decision_phase_timings_persist_progress_and_failure),
         ("Persistent run event logging", test_run_events_are_persisted_immediately_with_sequence_and_elapsed_time),

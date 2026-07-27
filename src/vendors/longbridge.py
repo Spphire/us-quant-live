@@ -74,7 +74,7 @@ class LongbridgeQuoteClient:
         credentials: LongbridgeCredentials,
         *,
         warmup_timeout_seconds: float = 8.0,
-        max_quote_age_seconds: float = 30.0,
+        max_quote_age_seconds: float = 5.0,
         max_spread_bps: float = 150.0,
         max_subscriptions: int = 500,
         context_factory: Callable[[LongbridgeCredentials], Any] | None = None,

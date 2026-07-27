@@ -114,6 +114,61 @@ def _read_json(path: Path, default: Any) -> Any:
     return default
 
 
+def _build_execution_attempt_outcome_audit(
+    run_dir: Path,
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_path = run_dir / "execution_attempt_outcome_summary.json"
+    raw = _read_json(source_path, {})
+    source = "execution_attempt_outcome_summary.json"
+    if not isinstance(raw, dict) or not raw:
+        embedded = summary.get("execution_attempt_outcome_summary")
+        raw = dict(embedded) if isinstance(embedded, Mapping) else {}
+        source = "execution_summary.execution_attempt_outcome_summary" if raw else "unavailable"
+
+    available = bool(raw)
+    payload = dict(raw)
+    count_fields = [
+        "raw_record_count",
+        "logical_record_count",
+        "broker_attempt_count",
+        "canceled_attempt_count",
+        "superseded_requote_canceled_attempt_count",
+        "terminal_canceled_attempt_count",
+        "terminal_unfilled_record_count",
+        "repaired_entry_symbol_count",
+    ]
+    for key in count_fields:
+        payload[key] = _safe_int(payload.get(key))
+    for key in ["terminal_unfilled_symbols", "terminal_unfilled_records", "repaired_entry_symbols"]:
+        if not isinstance(payload.get(key), list):
+            payload[key] = []
+    if not payload["repaired_entry_symbol_count"]:
+        payload["repaired_entry_symbol_count"] = len(payload["repaired_entry_symbols"])
+
+    payload.update(
+        {
+            "schema_version": str(payload.get("schema_version") or "1.0"),
+            "available": available,
+            "source": source,
+            "source_path": source_path.as_posix() if source_path.exists() else None,
+            "status": (
+                "attention"
+                if payload["terminal_unfilled_record_count"] > 0
+                else "pass"
+                if available
+                else "historical_limited"
+            ),
+            "note": (
+                "Canceled attempts are not terminal misses when a later requote or entry repair filled the logical instruction."
+                if available
+                else "This run predates explicit attempt-outcome classification."
+            ),
+        }
+    )
+    return payload
+
+
 def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -7635,6 +7690,7 @@ def _build_audit_checks(
     attribution_dossier_summary: dict[str, Any] | None = None,
     startup_binding_summary: dict[str, Any] | None = None,
     run_failure_summary: dict[str, Any] | None = None,
+    execution_attempt_outcome_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -7799,6 +7855,42 @@ def _build_audit_checks(
             detail="Attempt-level order trace should have at least one row per execution record.",
             expected=f">={len(records)}",
             observed=len(attempt_rows),
+        )
+
+    attempt_outcomes = execution_attempt_outcome_summary or {}
+    if attempt_outcomes.get("available"):
+        terminal_unfilled = _safe_int(attempt_outcomes.get("terminal_unfilled_record_count"))
+        canceled_attempts = _safe_int(attempt_outcomes.get("canceled_attempt_count"))
+        classified_cancels = _safe_int(
+            attempt_outcomes.get("superseded_requote_canceled_attempt_count")
+        ) + _safe_int(attempt_outcomes.get("terminal_canceled_attempt_count"))
+        add_check(
+            "logical_execution_has_no_terminal_unfilled_records",
+            "pass" if terminal_unfilled == 0 else "fail",
+            severity="error",
+            detail="Canceled requote attempts are acceptable only when the logical instruction eventually fills.",
+            expected=0,
+            observed={
+                "terminal_unfilled_records": terminal_unfilled,
+                "terminal_unfilled_symbols": attempt_outcomes.get("terminal_unfilled_symbols", []),
+                "repaired_entry_symbols": attempt_outcomes.get("repaired_entry_symbols", []),
+            },
+        )
+        add_check(
+            "canceled_attempts_have_terminal_attribution",
+            "pass" if classified_cancels == canceled_attempts else "warning",
+            severity="warning",
+            detail="Every canceled broker attempt should be classified as superseded or terminal.",
+            expected=canceled_attempts,
+            observed=classified_cancels,
+        )
+    else:
+        add_check(
+            "execution_attempt_outcome_summary_available",
+            "not_applicable",
+            detail="Historical runs may predate explicit canceled-attempt outcome classification.",
+            expected="present for upgraded execute runs",
+            observed=False,
         )
 
     activity_summary = broker_activity_summary or {}
@@ -9600,7 +9692,14 @@ def _top(rows: list[dict[str, Any]], key: str, n: int = 8, reverse: bool = True)
     return sorted(rows, key=lambda r: _safe_float(r.get(key)), reverse=reverse)[:n]
 
 
-def _risk_snapshot(summary: dict[str, Any], quality: dict[str, Any], decision_diag: dict[str, Any], decision_rows: list[dict[str, Any]], lot_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _risk_snapshot(
+    summary: dict[str, Any],
+    quality: dict[str, Any],
+    decision_diag: dict[str, Any],
+    decision_rows: list[dict[str, Any]],
+    lot_rows: list[dict[str, Any]],
+    execution_attempt_outcomes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     long_mv = sum(max(0.0, _safe_float(r.get("after_market_value"))) for r in decision_rows)
     short_mv_abs = sum(abs(min(0.0, _safe_float(r.get("after_market_value")))) for r in decision_rows)
     equity = _safe_float(summary.get("account_equity_post_trade") or summary.get("account_equity"), 0.0)
@@ -9635,6 +9734,7 @@ def _risk_snapshot(summary: dict[str, Any], quality: dict[str, Any], decision_di
             "unfilled_notional": quality.get("unfilled_notional"),
             "slippage_bps": quality.get("slippage_bps"),
             "counts": quality.get("counts"),
+            "attempt_outcomes": execution_attempt_outcomes or {},
         },
         "snapshot_intraday_pnl_by_side": dict(sorted(side_pnl.items())),
         "snapshot_intraday_pnl_by_sector": dict(sorted(sector_pnl.items(), key=lambda kv: kv[1])),
@@ -9722,6 +9822,7 @@ def _write_review(
     evidence = evidence_completeness or {}
     strict_checklist = strict_attribution_checklist_summary or {}
     execution_attr = execution_attribution_summary or {}
+    attempt_outcomes = risk.get("execution_quality", {}).get("attempt_outcomes", {})
     top_check_issues = [
         {
             "severity": item.get("severity", ""),
@@ -9742,6 +9843,8 @@ def _write_review(
         f"- Equity before/after: `{risk.get('account_equity_before')}` → `{risk.get('account_equity_after')}`\n",
         f"- Execute fill rate: `{risk.get('execution_quality', {}).get('fill_rate_count')}` count / `{risk.get('execution_quality', {}).get('fill_rate_notional')}` notional\n",
         f"- Avg notional-weighted slippage bps: `{(risk.get('execution_quality', {}).get('slippage_bps') or {}).get('avg_notional_weighted')}`\n",
+        f"- Broker attempts/canceled: `{attempt_outcomes.get('broker_attempt_count')}` / `{attempt_outcomes.get('canceled_attempt_count')}`\n",
+        f"- Superseded requote cancels / repaired entries / terminal unfilled: `{attempt_outcomes.get('superseded_requote_canceled_attempt_count')}` / `{attempt_outcomes.get('repaired_entry_symbol_count')}` / `{attempt_outcomes.get('terminal_unfilled_record_count')}`\n",
         "\n## Exposure Snapshot\n",
         f"- Gross exposure/equity: `{risk.get('gross_exposure_to_equity')}`\n",
         f"- Net exposure/equity: `{risk.get('net_exposure_to_equity')}`\n",
@@ -10091,6 +10194,7 @@ def _write_review(
         "- `80_executable_target_projection.csv` — raw weights, executable target shares/weights, per-symbol gaps, and binding constraints\n",
         "- `81_executable_target_projection_summary.json` — optimizer priority, buying-power use, integer-short gap, and 85/90/95% scenarios\n",
         "- `82_position_capacity_summary.json` — gross-position use versus the 95% target and total RegT capacity\n",
+        "- `83_execution_attempt_outcome_summary.json` — canceled attempts split into superseded requotes, repaired entries, and terminal misses\n",
         "- `70_account_config_diff.csv` — Alpaca account trading configuration before/after diff\n",
         "- `71_account_config_summary.json` — account configuration change summary for constraint attribution\n",
         "- Source run dir `run_evidence_digest.json` — semantic digest of raw broker, execution, market, API, source, and scheduler evidence\n",
@@ -10226,6 +10330,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "80_executable_target_projection.csv",
         "81_executable_target_projection_summary.json",
         "82_position_capacity_summary.json",
+        "83_execution_attempt_outcome_summary.json",
         "daily_review.md",
     ]:
         try:
@@ -10235,6 +10340,10 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
 
     summary = _read_json(run_dir / "execution_summary.json", {})
     quality = _read_json(run_dir / "execution_quality.json", {})
+    execution_attempt_outcomes = _build_execution_attempt_outcome_audit(
+        run_dir,
+        summary if isinstance(summary, dict) else {},
+    )
     plan = _read_json(run_dir / "order_plan.json", {})
     records = _read_json(run_dir / "execution_records.json", [])
     broker_fills = _read_json(run_dir / "broker_fill_activities.json", {})
@@ -10479,6 +10588,11 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             else None,
             "execution_summary": (run_dir / "execution_summary.json").as_posix(),
             "execution_quality": (run_dir / "execution_quality.json").as_posix(),
+            "execution_attempt_outcome_summary": (
+                run_dir / "execution_attempt_outcome_summary.json"
+            ).as_posix()
+            if (run_dir / "execution_attempt_outcome_summary.json").exists()
+            else None,
             "order_plan": (run_dir / "order_plan.json").as_posix(),
             "execution_records": (run_dir / "execution_records.json").as_posix(),
             "order_poll_timeline": (run_dir / "order_poll_timeline.json").as_posix()
@@ -10704,6 +10818,14 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
                 "symbols_with_material_unexplained_qty"
             ),
             "order_attempt_rows": len(order_attempt_rows),
+            "canceled_order_attempts": execution_attempt_outcomes.get("canceled_attempt_count"),
+            "superseded_requote_canceled_attempts": execution_attempt_outcomes.get(
+                "superseded_requote_canceled_attempt_count"
+            ),
+            "terminal_unfilled_execution_records": execution_attempt_outcomes.get(
+                "terminal_unfilled_record_count"
+            ),
+            "repaired_entry_symbols": execution_attempt_outcomes.get("repaired_entry_symbol_count"),
             "broker_activity_rows": len(broker_activity_rows),
             "account_activity_attribution_rows": len(account_activity_attribution_rows),
             "broker_order_universe_rows": len(broker_order_universe_rows),
@@ -10755,7 +10877,14 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     context["artifact_counts"]["run_failure_diagnosis_rows"] = len(run_failure_rows)
     context["artifact_counts"]["run_failure_diagnosis_issues"] = run_failure_summary.get("issue_count")
     context["artifact_counts"]["run_failure_class"] = run_failure_summary.get("failure_class")
-    risk = _risk_snapshot(summary, quality, decision_diag, decision_rows, lot_rows)
+    risk = _risk_snapshot(
+        summary,
+        quality,
+        decision_diag,
+        decision_rows,
+        lot_rows,
+        execution_attempt_outcomes,
+    )
     equity_pnl_bridge = _build_equity_pnl_bridge(
         summary=summary if isinstance(summary, dict) else {},
         risk=risk,
@@ -10909,6 +11038,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         attribution_dossier_summary=attribution_dossier_summary,
         startup_binding_summary=startup_binding_summary,
         run_failure_summary=run_failure_summary,
+        execution_attempt_outcome_summary=execution_attempt_outcomes,
     )
 
     _write_json(audit_dir / "00_run_context.json", context)
@@ -11289,6 +11419,10 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         executable_projection_summary,
     )
     _write_json(audit_dir / "82_position_capacity_summary.json", position_capacity_summary)
+    _write_json(
+        audit_dir / "83_execution_attempt_outcome_summary.json",
+        execution_attempt_outcomes,
+    )
     intraday_bar_fields = [
         "symbol", "status", "source_used", "capture_feeds", "capture_sources",
         "fallback_capture_used", "before_bar_count", "after_bar_count", "bar_count",
@@ -11918,6 +12052,10 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             {},
         )
         position_capacity = _read_json(audit_dir / "82_position_capacity_summary.json", {})
+        execution_attempt_outcomes = _read_json(
+            audit_dir / "83_execution_attempt_outcome_summary.json",
+            {},
+        )
         account_config = _read_json(audit_dir / "71_account_config_summary.json", {})
         run_evidence_digest = _read_json(audit_dir / "72_run_evidence_digest_summary.json", {})
         startup_binding = _read_json(audit_dir / "75_startup_binding_summary.json", {})
@@ -12294,6 +12432,51 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "submitted_orders": _safe_int(summary.get("submitted_orders")),
                 "order_plan_count": _safe_int(summary.get("order_plan_count")),
                 "staged_rebuild_snapshot_count": _safe_int(summary.get("staged_rebuild_snapshot_count")),
+                "execution_attempt_outcome_status": execution_attempt_outcomes.get("status")
+                if isinstance(execution_attempt_outcomes, dict)
+                else "",
+                "execution_broker_attempt_count": _safe_int(
+                    execution_attempt_outcomes.get("broker_attempt_count")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_canceled_attempt_count": _safe_int(
+                    execution_attempt_outcomes.get("canceled_attempt_count")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_superseded_requote_canceled_attempt_count": _safe_int(
+                    execution_attempt_outcomes.get(
+                        "superseded_requote_canceled_attempt_count"
+                    )
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_terminal_canceled_attempt_count": _safe_int(
+                    execution_attempt_outcomes.get("terminal_canceled_attempt_count")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_terminal_unfilled_record_count": _safe_int(
+                    execution_attempt_outcomes.get("terminal_unfilled_record_count")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_terminal_unfilled_symbols": _json_cell(
+                    execution_attempt_outcomes.get("terminal_unfilled_symbols")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else "",
+                "execution_repaired_entry_symbol_count": _safe_int(
+                    execution_attempt_outcomes.get("repaired_entry_symbol_count")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else 0,
+                "execution_repaired_entry_symbols": _json_cell(
+                    execution_attempt_outcomes.get("repaired_entry_symbols")
+                )
+                if isinstance(execution_attempt_outcomes, dict)
+                else "",
                 "execution_attempt_rows": _safe_int(exec_attr.get("attempt_row_count")) if isinstance(exec_attr, dict) else 0,
                 "fill_attempt_rows": _safe_int(exec_attr.get("filled_attempt_row_count")) if isinstance(exec_attr, dict) else 0,
                 "implementation_shortfall_bps_weighted": _safe_float(
@@ -12955,6 +13138,25 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 _safe_float(row.get("ideal_actual_gap_pnl_loss_abs")) for row in rows
             ),
             "execution_attempt_rows": sum(_safe_int(row.get("execution_attempt_rows")) for row in rows),
+            "execution_broker_attempt_count": sum(
+                _safe_int(row.get("execution_broker_attempt_count")) for row in rows
+            ),
+            "execution_canceled_attempt_count": sum(
+                _safe_int(row.get("execution_canceled_attempt_count")) for row in rows
+            ),
+            "execution_superseded_requote_canceled_attempt_count": sum(
+                _safe_int(row.get("execution_superseded_requote_canceled_attempt_count"))
+                for row in rows
+            ),
+            "execution_terminal_canceled_attempt_count": sum(
+                _safe_int(row.get("execution_terminal_canceled_attempt_count")) for row in rows
+            ),
+            "execution_terminal_unfilled_record_count": sum(
+                _safe_int(row.get("execution_terminal_unfilled_record_count")) for row in rows
+            ),
+            "execution_repaired_entry_symbol_count": sum(
+                _safe_int(row.get("execution_repaired_entry_symbol_count")) for row in rows
+            ),
             "execution_multi_attempt_records": sum(
                 _safe_int(row.get("execution_multi_attempt_records")) for row in rows
             ),
@@ -13068,7 +13270,14 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "gross_error_vs_target_notional", "gross_error_vs_target_pct_points",
             "gross_error_vs_total_notional", "gross_error_vs_total_pct_points",
             "submitted_orders",
-            "order_plan_count", "staged_rebuild_snapshot_count", "execution_attempt_rows",
+            "order_plan_count", "staged_rebuild_snapshot_count",
+            "execution_attempt_outcome_status", "execution_broker_attempt_count",
+            "execution_canceled_attempt_count",
+            "execution_superseded_requote_canceled_attempt_count",
+            "execution_terminal_canceled_attempt_count",
+            "execution_terminal_unfilled_record_count", "execution_terminal_unfilled_symbols",
+            "execution_repaired_entry_symbol_count", "execution_repaired_entry_symbols",
+            "execution_attempt_rows",
             "fill_attempt_rows", "implementation_shortfall_bps_weighted",
             "execution_multi_attempt_records", "execution_max_attempt_count",
             "execution_max_configured_attempt_count", "execution_max_stage_symbol_attempt_cap",

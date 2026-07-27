@@ -519,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Ignored local JSON containing Longbridge OpenAPI credentials.",
     )
     parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
-    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=30.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=5.0)
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
     parser.add_argument(
@@ -695,6 +695,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=None,
         help="Optional order timeout for staged_regt entry legs. Defaults to --order-timeout-seconds.",
+    )
+    parser.add_argument(
+        "--staged-entry-repair-rounds",
+        type=int,
+        default=1,
+        help="Residual entry repair rounds after final positions reconcile.",
+    )
+    parser.add_argument(
+        "--staged-entry-repair-max-attempts",
+        type=int,
+        default=1,
+        help="Maximum aggressive limit attempts per symbol in each entry repair round.",
+    )
+    parser.add_argument(
+        "--staged-entry-repair-wait-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for each final entry repair limit before canceling it.",
     )
     parser.add_argument(
         "--staged-release-max-rounds",
@@ -2035,6 +2053,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
                     release_timeout_seconds=release_timeout,
                     entry_timeout_seconds=entry_timeout,
+                    entry_repair_rounds=int(args.staged_entry_repair_rounds),
+                    entry_repair_max_attempts=int(args.staged_entry_repair_max_attempts),
+                    entry_repair_wait_seconds=float(args.staged_entry_repair_wait_seconds),
                     poll_seconds=float(args.order_poll_seconds),
                     execution_order_style=str(args.execution_order_style),
                     marketable_limit_base_offset_bps=float(marketable_limit_base_offset_bps),
@@ -2084,9 +2105,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         execution_quote_client if active_quote_provider == "longbridge" else None
                     ),
                 )
+            final_logical_execution_records = _final_logical_execution_records(
+                execution_records
+            )
             submit_error_records = [
                 record
-                for record in execution_records
+                for record in final_logical_execution_records
                 if str(record.get("status_latest") or "").lower()
                 in {"submit_error", "quote_unavailable"}
             ]
@@ -2102,6 +2126,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "order_submission_finished",
                 {
                     "execution_record_count": len(execution_records),
+                    "logical_execution_record_count": len(
+                        final_logical_execution_records
+                    ),
                     "submit_error_count": submit_error_count,
                     "submit_abort_reason": submit_abort_reason,
                 },
@@ -2350,6 +2377,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_fill_activities_path = output_root / "broker_fill_activities.json"
         raw_order_snapshots_path = output_root / "broker_order_snapshots.json"
         order_poll_timeline_path = output_root / "order_poll_timeline.json"
+        execution_attempt_outcome_summary_path = (
+            output_root / "execution_attempt_outcome_summary.json"
+        )
         broker_fill_activities = _collect_broker_fill_activities(
             client=client,
             session_date=decision_date,
@@ -2378,6 +2408,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         order_poll_timeline = _build_order_poll_timeline(execution_records)
         _write_json_file(order_poll_timeline_path, order_poll_timeline)
+        execution_attempt_outcome_summary = _execution_attempt_outcome_summary(
+            execution_records
+        )
+        _write_json_file(
+            execution_attempt_outcome_summary_path,
+            execution_attempt_outcome_summary,
+        )
 
         alignment_after = _alignment_to_target(
             target_signed_weights=executable_expected_signed_weights,
@@ -2451,6 +2488,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.marketable_limit_requote_wait_seconds
             ),
             "marketable_limit_max_attempts": int(args.marketable_limit_max_attempts),
+            "staged_entry_repair_rounds": int(args.staged_entry_repair_rounds),
+            "staged_entry_repair_max_attempts": int(args.staged_entry_repair_max_attempts),
+            "staged_entry_repair_wait_seconds": float(args.staged_entry_repair_wait_seconds),
             "execution_workers": int(args.execution_workers),
             "sizing_adverse_offset_bps": float(sizing_adverse_offset_bps),
             "short_buying_power_adverse_offset_bps": float(short_buying_power_adverse_offset_bps),
@@ -2506,6 +2546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "submitted": bool(should_submit),
             "submitted_orders": int(len(execution_records)),
             "order_poll_event_count": int(order_poll_timeline.get("event_count") or 0),
+            "execution_attempt_outcome_summary": execution_attempt_outcome_summary,
             "staged_rebuild_snapshot_count": int(len(staged_rebuild_snapshots)),
             "submit_error_count": int(submit_error_count),
             "submit_abort_reason": submit_abort_reason,
@@ -2526,6 +2567,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "run_context_json": run_context_path.as_posix(),
                 "run_events_jsonl": (output_root / "run_events.jsonl").as_posix(),
                 "decision_phase_timings_json": phase_timings.path.as_posix(),
+                "execution_attempt_outcome_summary_json": (
+                    execution_attempt_outcome_summary_path.as_posix()
+                ),
                 "target_capability_snapshot_json": target_capability_snapshot_path.as_posix(),
                 "target_capability_snapshot_csv": target_capability_snapshot_csv_path.as_posix(),
                 "target_capability_drift_json": target_capability_drift_path.as_posix(),
@@ -4747,6 +4791,104 @@ def _order_batch_summary(
     }
 
 
+def _execution_logical_key(record: Mapping[str, Any]) -> tuple[str, str, str]:
+    symbol = str(record.get("symbol") or "").upper()
+    side = str(record.get("side") or "").lower()
+    stage = str(record.get("stage") or "single_pass")
+    if stage in {"entry", "entry_repair"}:
+        stage = "entry"
+    return symbol, side, stage
+
+
+def _final_logical_execution_records(
+    execution_records: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    final_record_index_by_key: dict[tuple[str, str, str], int] = {}
+    for index, record in enumerate(execution_records):
+        final_record_index_by_key[_execution_logical_key(record)] = index
+    return [
+        execution_records[index]
+        for index in sorted(final_record_index_by_key.values())
+    ]
+
+
+def _execution_attempt_outcome_summary(
+    execution_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+
+    final_record_index_by_key: dict[tuple[str, str, str], int] = {}
+    record_count_by_key: Counter[tuple[str, str, str]] = Counter()
+    for index, record in enumerate(execution_records):
+        key = _execution_logical_key(record)
+        final_record_index_by_key[key] = index
+        record_count_by_key[key] += 1
+
+    attempt_count = 0
+    canceled_attempt_count = 0
+    superseded_canceled_attempt_count = 0
+    terminal_canceled_attempt_count = 0
+    for index, record in enumerate(execution_records):
+        key = _execution_logical_key(record)
+        record_is_final = final_record_index_by_key.get(key) == index
+        record_finally_filled = _order_record_fully_filled(record)
+        for attempt in record.get("attempts") or []:
+            attempt_count += 1
+            if str(attempt.get("status_latest") or "").lower() != "canceled":
+                continue
+            canceled_attempt_count += 1
+            if record_finally_filled or not record_is_final:
+                superseded_canceled_attempt_count += 1
+            else:
+                terminal_canceled_attempt_count += 1
+
+    final_records = _final_logical_execution_records(execution_records)
+    terminal_unfilled_records = [
+        record for record in final_records if not _order_record_fully_filled(record)
+    ]
+    repaired_entry_symbols = sorted(
+        {
+            key[0]
+            for key, count in record_count_by_key.items()
+            if key[2] == "entry"
+            and count > 1
+            and _order_record_fully_filled(
+                execution_records[final_record_index_by_key[key]]
+            )
+        }
+    )
+    return {
+        "schema_version": "1.0",
+        "generated_at_utc": _utc_now(),
+        "raw_record_count": int(len(execution_records)),
+        "logical_record_count": int(len(final_records)),
+        "broker_attempt_count": int(attempt_count),
+        "canceled_attempt_count": int(canceled_attempt_count),
+        "superseded_requote_canceled_attempt_count": int(
+            superseded_canceled_attempt_count
+        ),
+        "terminal_canceled_attempt_count": int(terminal_canceled_attempt_count),
+        "terminal_unfilled_record_count": int(len(terminal_unfilled_records)),
+        "terminal_unfilled_symbols": sorted(
+            {
+                str(record.get("symbol") or "").upper()
+                for record in terminal_unfilled_records
+                if str(record.get("symbol") or "").strip()
+            }
+        ),
+        "terminal_unfilled_records": [dict(record) for record in terminal_unfilled_records],
+        "repaired_entry_symbol_count": int(len(repaired_entry_symbols)),
+        "repaired_entry_symbols": repaired_entry_symbols,
+        "interpretation": {
+            "superseded_requote_canceled_attempts": (
+                "Expected cancel-and-reprice attempts whose logical instruction later filled."
+            ),
+            "terminal_unfilled_records": (
+                "Logical instructions still incomplete after all configured repair attempts."
+            ),
+        },
+    }
+
+
 def _submit_and_track_orders(
     *,
     client: AlpacaHttpClient,
@@ -5179,20 +5321,85 @@ def _wait_for_release_position_reconciliation(
         signed_order_qty = float(item.qty) if item.side == "buy" else -float(item.qty)
         expected_signed_qty[symbol] = float(current_qty) + signed_order_qty
 
+    return _wait_for_expected_position_reconciliation(
+        client=client,
+        expected_signed_qty=expected_signed_qty,
+        qty_decimals=int(qty_decimals),
+        timeout_seconds=float(timeout_seconds),
+        poll_seconds=float(poll_seconds),
+    )
+
+
+def _wait_for_order_position_reconciliation(
+    *,
+    client: AlpacaHttpClient,
+    instructions: Sequence[OrderInstruction],
+    execution_records: Sequence[Mapping[str, Any]],
+    qty_decimals: int,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    instructions_by_symbol = {
+        str(item.symbol).upper(): item for item in instructions
+    }
+    filled_qty_by_symbol: Counter[str] = Counter()
+    for record in execution_records:
+        symbol = str(record.get("symbol") or "").upper()
+        filled_qty = max(0.0, float(_safe_float(record.get("filled_qty")) or 0.0))
+        if symbol in instructions_by_symbol and filled_qty > EPS:
+            filled_qty_by_symbol[symbol] += filled_qty
+
+    expected_signed_qty: dict[str, float] = {}
+    for symbol, filled_qty in filled_qty_by_symbol.items():
+        item = instructions_by_symbol[symbol]
+        current_qty = _safe_float(item.current_signed_qty)
+        if current_qty is None:
+            current_qty = math.copysign(
+                abs(float(item.current_notional)) / max(float(item.reference_price), 1e-9),
+                float(item.current_notional),
+            )
+        signed_fill_qty = float(filled_qty) if item.side == "buy" else -float(filled_qty)
+        expected_signed_qty[symbol] = float(current_qty) + signed_fill_qty
+
+    positions, diagnostics = _wait_for_expected_position_reconciliation(
+        client=client,
+        expected_signed_qty=expected_signed_qty,
+        qty_decimals=int(qty_decimals),
+        timeout_seconds=float(timeout_seconds),
+        poll_seconds=float(poll_seconds),
+    )
+    diagnostics["filled_qty_by_symbol"] = dict(sorted(filled_qty_by_symbol.items()))
+    diagnostics["instruction_symbols"] = _instruction_symbols(instructions)
+    return positions, diagnostics
+
+
+def _wait_for_expected_position_reconciliation(
+    *,
+    client: AlpacaHttpClient,
+    expected_signed_qty: Mapping[str, float],
+    qty_decimals: int,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_expected_signed_qty = {
+        str(symbol).upper(): float(qty)
+        for symbol, qty in expected_signed_qty.items()
+    }
+
     started = time.monotonic()
     deadline = started + max(0.0, float(timeout_seconds))
     tolerance = max(1e-8, 1.5 * (10.0 ** -max(0, int(qty_decimals))))
     polls = 0
     positions: list[dict[str, Any]] = []
     actual_signed_qty: dict[str, float] = {}
-    pending_symbols: list[str] = sorted(expected_signed_qty)
+    pending_symbols: list[str] = sorted(normalized_expected_signed_qty)
     while True:
         polls += 1
         positions = [dict(item) for item in client.list_positions()]
         actual_signed_qty = _signed_qty_from_positions(positions)
         pending_symbols = sorted(
             symbol
-            for symbol, expected in expected_signed_qty.items()
+            for symbol, expected in normalized_expected_signed_qty.items()
             if abs(float(actual_signed_qty.get(symbol, 0.0)) - float(expected)) > tolerance
         )
         if not pending_symbols or time.monotonic() >= deadline:
@@ -5207,10 +5414,10 @@ def _wait_for_release_position_reconciliation(
         "elapsed_seconds": float(elapsed),
         "poll_count": int(polls),
         "qty_tolerance": float(tolerance),
-        "expected_signed_qty": dict(sorted(expected_signed_qty.items())),
+        "expected_signed_qty": dict(sorted(normalized_expected_signed_qty.items())),
         "actual_signed_qty": {
             symbol: float(actual_signed_qty.get(symbol, 0.0))
-            for symbol in sorted(expected_signed_qty)
+            for symbol in sorted(normalized_expected_signed_qty)
         },
         "pending_symbols": pending_symbols,
     }
@@ -5241,6 +5448,9 @@ def _submit_staged_regt_orders(
     short_buying_power_adverse_offset_bps: float,
     release_timeout_seconds: float,
     entry_timeout_seconds: float,
+    entry_repair_rounds: int = 1,
+    entry_repair_max_attempts: int = 1,
+    entry_repair_wait_seconds: float = 10.0,
     poll_seconds: float,
     execution_order_style: str,
     marketable_limit_base_offset_bps: float,
@@ -5279,6 +5489,10 @@ def _submit_staged_regt_orders(
         "entry_aborted": False,
         "entry_abort_reason": None,
         "entry_records": 0,
+        "entry_repair_rounds_configured": int(max(0, entry_repair_rounds)),
+        "entry_repair_rounds_completed": 0,
+        "entry_repair_records": 0,
+        "entry_repair_final_unfilled_symbols": [],
         "entry_rebuild_skipped_orders": [],
         "entry_buying_power_cap": {},
         "entry_projection": {},
@@ -5767,6 +5981,7 @@ def _submit_staged_regt_orders(
     }
     snapshots.append(entry_snapshot)
 
+    entry_records: list[dict[str, Any]] = []
     if entry_instructions:
         entry_batch_started = time.monotonic()
         entry_records = _submit_and_track_orders(
@@ -5801,6 +6016,261 @@ def _submit_staged_regt_orders(
     else:
         entry_snapshot["entry_submission_skipped_reason"] = "no_entry_instructions_after_rebuild_or_buying_power_cap"
         entry_snapshot["submitted_record_count"] = 0
+
+    latest_entry_instructions = list(entry_instructions)
+    latest_entry_records = list(entry_records)
+    for repair_round in range(1, max(0, int(entry_repair_rounds)) + 1):
+        repair_candidate_symbols = sorted(
+            {
+                str(record.get("symbol") or "").upper()
+                for record in latest_entry_records
+                if str(record.get("symbol") or "").strip()
+                and not _order_record_fully_filled(record)
+            }
+        )
+        if not repair_candidate_symbols:
+            break
+
+        repair_positions, repair_position_reconciliation = (
+            _wait_for_order_position_reconciliation(
+                client=client,
+                instructions=latest_entry_instructions,
+                execution_records=latest_entry_records,
+                qty_decimals=int(qty_decimals),
+                timeout_seconds=min(20.0, max(5.0, float(entry_timeout_seconds) / 4.0)),
+                poll_seconds=float(poll_seconds),
+            )
+        )
+        _, repair_signed_notional = _positions_to_frame_and_notional(repair_positions)
+        repair_signed_qty = _signed_qty_from_positions(repair_positions)
+        repair_account = client.get_account()
+        repair_buying_power, repair_buying_power_source = _buying_power(repair_account)
+        (
+            repair_total_regt_capacity,
+            repair_gross_position,
+            repair_regt_buying_power,
+            repair_total_regt_capacity_source,
+        ) = _total_regt_buying_power_capacity(
+            account=repair_account,
+            signed_notional=repair_signed_notional,
+        )
+        repair_equity, repair_equity_source = _resolve_account_equity(
+            account=repair_account,
+            signed_notional=repair_signed_notional,
+        )
+        repair_prices = _resolve_reference_prices(
+            client=execution_quote_client or client,
+            symbols=sorted(set(target_signed_weights) | set(repair_signed_notional)),
+            fallback_prices=refreshed_prices,
+            feed=execution_price_feed,
+            prefer_live=True,
+            allow_fallback=execution_quote_client is None,
+            require_fresh=execution_quote_client is not None,
+        )
+        repair_min_trade_notional = _effective_min_trade_notional(
+            account_equity=float(repair_equity),
+            absolute_floor=float(min_trade_notional_floor),
+            weight_bps=float(min_trade_weight_bps),
+        )
+        (
+            repair_target_signed_weights,
+            repair_target_lattice_signed_qty,
+            repair_projection,
+        ) = project_executable_targets(
+            raw_target_signed_weights=raw_target_signed_weights,
+            current_signed_qty=repair_signed_qty,
+            current_signed_notional=repair_signed_notional,
+            reference_prices=repair_prices,
+            assets_by_symbol=assets_by_symbol,
+            account_equity=float(repair_equity),
+            buying_power=float(repair_buying_power),
+            buying_power_buffer=float(buying_power_buffer),
+            min_trade_notional=float(repair_min_trade_notional),
+            qty_decimals=int(qty_decimals),
+            whole_shares_only=bool(whole_shares_only),
+            short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
+            shorting_enabled=bool(shorting_enabled),
+            sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
+            short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
+            total_buying_power_capacity=float(repair_total_regt_capacity),
+            gross_capacity_target_ratio=float(gross_capacity_target_ratio),
+        )
+        rebuilt_repair_instructions, repair_skipped = _build_order_instructions(
+            target_signed_weights=repair_target_signed_weights,
+            current_signed_notional=repair_signed_notional,
+            current_signed_qty=repair_signed_qty,
+            account_equity=float(repair_equity),
+            reference_prices=repair_prices,
+            assets_by_symbol=assets_by_symbol,
+            min_trade_notional=float(repair_min_trade_notional),
+            sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
+            qty_decimals=int(qty_decimals),
+            whole_shares_only=bool(whole_shares_only),
+            opening_shorts_whole_shares_only=bool(opening_shorts_whole_shares_only),
+            short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
+            shorting_enabled=bool(shorting_enabled),
+        )
+        repair_release_residual, repair_entry_instructions = _split_release_entry_instructions(
+            rebuilt_repair_instructions,
+            current_signed_qty=repair_signed_qty,
+        )
+        candidate_symbol_set = set(repair_candidate_symbols)
+        repair_entry_instructions = [
+            item
+            for item in repair_entry_instructions
+            if str(item.symbol).upper() in candidate_symbol_set
+        ]
+        repair_weight_gap_bps = {
+            str(item.symbol).upper(): float(
+                abs(float(item.target_notional) - float(item.current_notional))
+                / max(float(repair_equity), 1e-9)
+                * 10_000.0
+            )
+            for item in repair_entry_instructions
+        }
+        repair_entry_instructions.sort(
+            key=lambda item: (
+                -float(repair_weight_gap_bps.get(str(item.symbol).upper(), 0.0)),
+                str(item.symbol).upper(),
+            )
+        )
+        repair_instructions_before_cap = list(repair_entry_instructions)
+        repair_entry_instructions, repair_cap_diag = _scale_entry_instructions_to_buying_power(
+            repair_entry_instructions,
+            buying_power=float(repair_buying_power),
+            buffer=float(buying_power_buffer),
+            min_trade_notional=float(repair_min_trade_notional),
+            qty_decimals=int(qty_decimals),
+            whole_shares_only=bool(whole_shares_only),
+            short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
+            short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
+        )
+        repair_offset_bps = float(max(0.0, marketable_limit_max_offset_bps))
+        repair_snapshot = {
+            "schema_version": "1.0",
+            "snapshot_type": "entry_repair",
+            "captured_at_utc": _utc_now(),
+            "stage": "entry_repair",
+            "round": int(repair_round),
+            "session_token": f"{session_token}_erp_r{repair_round:02d}",
+            "candidate_symbols": repair_candidate_symbols,
+            "candidate_weight_gap_bps": dict(sorted(repair_weight_gap_bps.items())),
+            "priority_rule": "absolute_weight_gap_bps_descending",
+            "position_reconciliation": repair_position_reconciliation,
+            "positions_raw": _raw_dict_list(repair_positions),
+            "signed_notional": dict(sorted(repair_signed_notional.items())),
+            "signed_qty": dict(sorted(repair_signed_qty.items())),
+            "account_raw": dict(repair_account)
+            if isinstance(repair_account, dict)
+            else repair_account,
+            "account_equity": float(repair_equity),
+            "account_equity_source": str(repair_equity_source),
+            "buying_power": float(repair_buying_power),
+            "buying_power_source": str(repair_buying_power_source),
+            "gross_position": float(repair_gross_position),
+            "regt_buying_power": float(repair_regt_buying_power),
+            "total_regt_capacity": float(repair_total_regt_capacity),
+            "total_regt_capacity_source": str(repair_total_regt_capacity_source),
+            "reference_prices": dict(sorted(repair_prices.items())),
+            "target_signed_weights": dict(sorted(repair_target_signed_weights.items())),
+            "target_lattice_signed_qty": dict(sorted(repair_target_lattice_signed_qty.items())),
+            "executable_target_projection": repair_projection,
+            "rebuilt_all_instructions": _instruction_payloads(rebuilt_repair_instructions),
+            "release_residual_instructions_not_retried": _instruction_payloads(
+                repair_release_residual
+            ),
+            "candidate_instructions_before_buying_power_cap": _instruction_payloads(
+                repair_instructions_before_cap
+            ),
+            "repair_instructions": _instruction_payloads(repair_entry_instructions),
+            "repair_skipped_orders": repair_skipped,
+            "buying_power_cap": repair_cap_diag,
+            "limit_offset_bps": float(repair_offset_bps),
+            "max_attempts_per_symbol": int(max(1, entry_repair_max_attempts)),
+            "wait_seconds": float(max(0.1, entry_repair_wait_seconds)),
+            "submitted_records": [],
+        }
+        snapshots.append(repair_snapshot)
+        diagnostics["entry_projection"] = repair_projection
+        diagnostics["entry_repair_rounds_completed"] = int(repair_round)
+
+        if not repair_entry_instructions:
+            repair_snapshot["submission_skipped_reason"] = (
+                "no_candidate_entry_residual_after_reconciliation_projection_or_cap"
+            )
+            break
+
+        repair_batch_started = time.monotonic()
+        repair_records = _submit_and_track_orders(
+            client=client,
+            instructions=repair_entry_instructions,
+            session_token=f"{session_token}_erp_r{repair_round:02d}",
+            timeout_seconds=float(entry_timeout_seconds),
+            poll_seconds=float(poll_seconds),
+            execution_order_style=execution_order_style,
+            marketable_limit_base_offset_bps=float(repair_offset_bps),
+            marketable_limit_max_offset_bps=float(repair_offset_bps),
+            marketable_limit_requote_steps_bps=[float(repair_offset_bps)],
+            marketable_limit_requote_wait_seconds=float(
+                max(0.1, entry_repair_wait_seconds)
+            ),
+            marketable_limit_max_attempts=int(max(1, entry_repair_max_attempts)),
+            max_workers=int(execution_workers),
+            execution_price_feed=str(execution_price_feed),
+            execution_quote_client=execution_quote_client,
+        )
+        repair_batch_summary = _order_batch_summary(
+            repair_records,
+            requested_workers=int(execution_workers),
+            elapsed_seconds=float(time.monotonic() - repair_batch_started),
+        )
+        for record in repair_records:
+            record["stage"] = "entry_repair"
+            record["entry_repair_round"] = int(repair_round)
+            record["repair_priority_weight_gap_bps"] = repair_weight_gap_bps.get(
+                str(record.get("symbol") or "").upper()
+            )
+        records.extend(repair_records)
+        diagnostics["entry_repair_records"] = int(
+            diagnostics["entry_repair_records"]
+        ) + int(len(repair_records))
+        repair_snapshot["submitted_records"] = repair_records
+        repair_snapshot["submitted_record_count"] = int(len(repair_records))
+        repair_snapshot["execution_batch_summary"] = repair_batch_summary
+        latest_entry_instructions = list(repair_entry_instructions)
+        latest_entry_records = list(repair_records)
+
+    diagnostics["entry_repair_final_unfilled_symbols"] = sorted(
+        {
+            str(record.get("symbol") or "").upper()
+            for record in latest_entry_records
+            if str(record.get("symbol") or "").strip()
+            and not _order_record_fully_filled(record)
+        }
+    )
+    if latest_entry_records:
+        final_entry_positions, final_entry_position_reconciliation = (
+            _wait_for_order_position_reconciliation(
+                client=client,
+                instructions=latest_entry_instructions,
+                execution_records=latest_entry_records,
+                qty_decimals=int(qty_decimals),
+                timeout_seconds=min(20.0, max(5.0, float(entry_timeout_seconds) / 4.0)),
+                poll_seconds=float(poll_seconds),
+            )
+        )
+        diagnostics["entry_final_position_reconciliation"] = (
+            final_entry_position_reconciliation
+        )
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "entry_final_position_reconciliation",
+                "captured_at_utc": _utc_now(),
+                **final_entry_position_reconciliation,
+                "positions_raw": _raw_dict_list(final_entry_positions),
+            }
+        )
 
     return records, diagnostics
 
@@ -6536,6 +7006,7 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
             "order_plan.json",
             "execution_records.json",
             "order_poll_timeline.json",
+            "execution_attempt_outcome_summary.json",
             "broker_open_orders_before.json",
             "broker_orders_all_before.json",
             "broker_open_orders_after.json",
@@ -6818,6 +7289,9 @@ def _execution_evidence_digest(output_root: Path) -> dict[str, Any]:
             "status_counts": dict(sorted(status_counts.items())),
         },
         "order_poll_timeline": _json_artifact_status(output_root / "order_poll_timeline.json"),
+        "execution_attempt_outcome_summary": _json_artifact_status(
+            output_root / "execution_attempt_outcome_summary.json"
+        ),
         "broker_order_snapshots": _json_artifact_status(output_root / "broker_order_snapshots.json"),
         "broker_fill_activities": _json_artifact_status(output_root / "broker_fill_activities.json"),
         "broker_account_activities": _json_artifact_status(output_root / "broker_account_activities.json"),
@@ -6903,6 +7377,7 @@ def _write_run_evidence_digest(output_root: Path) -> Path:
         "runtime_environment_snapshot.json",
         "order_plan.json",
         "execution_records.json",
+        "execution_attempt_outcome_summary.json",
         "broker_account_before.json",
         "broker_account_after.json",
         "broker_positions_before_raw.json",

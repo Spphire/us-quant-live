@@ -60,10 +60,13 @@ def _signed_slippage_bps(side: str, reference_price: float, filled_avg_price: fl
 
 
 def _logical_order_key(rec: dict[str, Any]) -> tuple[str, str, str]:
+    stage = str(rec.get("stage", "single_pass"))
+    if stage == "entry_repair":
+        stage = "entry"
     return (
         str(rec.get("symbol", "?")).upper(),
         str(rec.get("side", "?")).lower(),
-        str(rec.get("stage", "single_pass")),
+        stage,
     )
 
 

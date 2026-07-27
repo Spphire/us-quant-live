@@ -387,6 +387,9 @@ class DataAggregator:
                     "position_capacity": self._read_json_file(
                         audit_dir / "82_position_capacity_summary.json"
                     ),
+                    "execution_attempt_outcomes": self._read_json_file(
+                        audit_dir / "83_execution_attempt_outcome_summary.json"
+                    ),
                 }
             return {
                 "rollup": rollup,
