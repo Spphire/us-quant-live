@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,14 +257,25 @@ class LongbridgeQuoteClient:
         *,
         feed: str | None = None,
         require_fresh: bool = False,
+        allow_wide_spread: bool = False,
     ) -> dict[str, dict[str, Any]]:
         del feed
         requested = _normalize_symbols(symbols)
         if require_fresh and requested:
             with self._refresh_lock:
-                refresh_symbols = self._snapshot_refresh_candidates(requested)
-                if refresh_symbols:
-                    self._last_snapshot_refresh = self._refresh_snapshots(refresh_symbols)
+                refresh_history: list[dict[str, Any]] = []
+                for refresh_round in range(1, 4):
+                    refresh_symbols = self._snapshot_refresh_candidates(requested)
+                    if not refresh_symbols:
+                        break
+                    refresh_result = self._refresh_snapshots(refresh_symbols)
+                    refresh_result["refresh_round"] = int(refresh_round)
+                    refresh_history.append(refresh_result)
+                if refresh_history:
+                    latest = dict(refresh_history[-1])
+                    latest["refresh_round_count"] = int(len(refresh_history))
+                    latest["refresh_history"] = refresh_history
+                    self._last_snapshot_refresh = latest
         out: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
         now_monotonic = time.monotonic()
@@ -303,7 +315,10 @@ class LongbridgeQuoteClient:
                     "c": [],
                     "z": "",
                 }
-                validation_error = self._validation_error(row)
+                validation_error = self._validation_error(
+                    row,
+                    allow_wide_spread=bool(allow_wide_spread),
+                )
                 if validation_error:
                     row["validation_error"] = validation_error
                     if require_fresh:
@@ -344,7 +359,11 @@ class LongbridgeQuoteClient:
         return out
 
     def get_reference_prices(self, symbols: Sequence[str]) -> dict[str, float]:
-        quotes = self.get_latest_quotes(symbols, require_fresh=True)
+        quotes = self.get_latest_quotes(
+            symbols,
+            require_fresh=True,
+            allow_wide_spread=True,
+        )
         out: dict[str, float] = {}
         for symbol, quote in quotes.items():
             bid = _positive_float(quote.get("bp"))
@@ -521,7 +540,12 @@ class LongbridgeQuoteClient:
         with self._lock:
             self._depths[symbol] = payload
 
-    def _validation_error(self, quote: Mapping[str, Any]) -> str | None:
+    def _validation_error(
+        self,
+        quote: Mapping[str, Any],
+        *,
+        allow_wide_spread: bool = False,
+    ) -> str | None:
         bid = _positive_float(quote.get("bp"))
         ask = _positive_float(quote.get("ap"))
         if bid is None or ask is None:
@@ -534,7 +558,11 @@ class LongbridgeQuoteClient:
         spread_bps = _spread_bps(quote)
         if spread_bps is None:
             return "invalid_spread"
-        if self._max_spread_bps > 0.0 and spread_bps > self._max_spread_bps:
+        if (
+            not allow_wide_spread
+            and self._max_spread_bps > 0.0
+            and spread_bps > self._max_spread_bps
+        ):
             return f"spread_bps={spread_bps:.3f}_exceeds_{self._max_spread_bps:.3f}"
         trade_status = str(quote.get("trade_status") or "")
         if trade_status and trade_status != "TradeStatus.Normal":
@@ -566,6 +594,7 @@ class LongbridgeQuoteClient:
         requested = _normalize_symbols(symbols)
         provider_symbols = [_provider_symbol(symbol) for symbol in requested]
         started_at_utc = _utc_now(milliseconds=True)
+        started_monotonic = time.monotonic()
         errors: list[dict[str, str]] = []
         quote_refreshed: set[str] = set()
         depth_refreshed: set[str] = set()
@@ -593,23 +622,36 @@ class LongbridgeQuoteClient:
                 }
             )
 
-        for symbol, provider_symbol in zip(requested, provider_symbols):
+        def fetch_depth(symbol: str, provider_symbol: str) -> tuple[str, str, Any, Exception | None]:
             try:
                 event = self._context.depth(provider_symbol)
+                return symbol, provider_symbol, event, None
+            except Exception as exc:
+                return symbol, provider_symbol, None, exc
+
+        depth_worker_count = min(8, max(1, len(provider_symbols)))
+        with ThreadPoolExecutor(max_workers=depth_worker_count) as executor:
+            futures = [
+                executor.submit(fetch_depth, symbol, provider_symbol)
+                for symbol, provider_symbol in zip(requested, provider_symbols)
+            ]
+            for future in as_completed(futures):
+                symbol, provider_symbol, event, error = future.result()
+                if error is not None:
+                    errors.append(
+                        {
+                            "scope": "depth",
+                            "symbol": symbol,
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        }
+                    )
+                    continue
                 self._on_depth(provider_symbol, event)
                 with self._lock:
                     self._depths[symbol]["source"] = "snapshot_refresh"
                     self._depths[symbol]["snapshot_refreshed_at_utc"] = started_at_utc
                 depth_refreshed.add(symbol)
-            except Exception as exc:
-                errors.append(
-                    {
-                        "scope": "depth",
-                        "symbol": symbol,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
 
         missing_quote = sorted(set(requested) - quote_refreshed)
         missing_depth = sorted(set(requested) - depth_refreshed)
@@ -625,6 +667,8 @@ class LongbridgeQuoteClient:
             "quote_refreshed_symbols": sorted(quote_refreshed),
             "depth_refreshed_symbols": sorted(depth_refreshed),
             "errors": errors,
+            "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
+            "depth_worker_count": int(depth_worker_count),
             "status": "pass" if not errors else "error",
         }
 

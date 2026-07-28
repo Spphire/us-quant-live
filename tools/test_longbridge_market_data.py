@@ -40,12 +40,14 @@ class _FakeContext:
         stream_trade_status: str = "TradeStatus.Normal",
         static_quotes: dict[str, tuple[float, str]] | None = None,
         snapshot_depth_error: bool = False,
+        snapshot_depth_delay_seconds: float = 0.0,
     ) -> None:
         self.bid = bid
         self.ask = ask
         self.stream_trade_status = stream_trade_status
         self.static_quotes = static_quotes or {}
         self.snapshot_depth_error = bool(snapshot_depth_error)
+        self.snapshot_depth_delay_seconds = max(0.0, float(snapshot_depth_delay_seconds))
         self.on_quote = None
         self.on_depth = None
         self.subscribed: list[str] = []
@@ -112,6 +114,8 @@ class _FakeContext:
 
     def depth(self, symbol):
         self.depth_calls.append(str(symbol))
+        if self.snapshot_depth_delay_seconds > 0.0:
+            time.sleep(self.snapshot_depth_delay_seconds)
         if self.snapshot_depth_error:
             raise RuntimeError("snapshot depth unavailable")
         return SimpleNamespace(
@@ -181,6 +185,27 @@ def test_stale_stream_quote_is_refreshed_from_snapshot() -> None:
     assert health["snapshot_refresh_failure_count"] == 0, health
 
 
+def test_stale_depth_snapshots_are_refreshed_concurrently() -> None:
+    symbols = [f"S{index}" for index in range(16)]
+    context = _FakeContext(snapshot_depth_delay_seconds=0.05)
+    client = LongbridgeQuoteClient(
+        _credentials(),
+        max_quote_age_seconds=0.2,
+        context_factory=lambda credentials: context,
+    )
+    client.start(symbols)
+    time.sleep(0.22)
+    started = time.monotonic()
+    quotes = client.get_latest_quotes(symbols, require_fresh=True)
+    elapsed = time.monotonic() - started
+    assert len(quotes) == len(symbols), quotes
+    assert elapsed < 0.45, elapsed
+    health = client.health_snapshot(requested_symbols=symbols)
+    refresh = health["last_snapshot_refresh"]
+    assert refresh["depth_worker_count"] == 8, refresh
+    assert refresh["refresh_round_count"] == 1, refresh
+
+
 def test_stale_quote_is_rejected_when_snapshot_refresh_fails() -> None:
     context = _FakeContext(snapshot_depth_error=True)
     client = LongbridgeQuoteClient(
@@ -197,7 +222,7 @@ def test_stale_quote_is_rejected_when_snapshot_refresh_fails() -> None:
     else:
         raise AssertionError("stale Longbridge quote was accepted")
     health = client.health_snapshot(requested_symbols=["AAPL"])
-    assert health["snapshot_refresh_failure_count"] == 1, health
+    assert health["snapshot_refresh_failure_count"] == 3, health
 
 
 def test_wide_quote_is_rejected() -> None:
@@ -214,6 +239,23 @@ def test_wide_quote_is_rejected() -> None:
         assert "spread_bps" in str(exc)
     else:
         raise AssertionError("over-wide Longbridge quote was accepted")
+
+
+def test_wide_quote_can_value_portfolio_but_cannot_price_order() -> None:
+    context = _FakeContext(bid=100.0, ask=102.0)
+    client = LongbridgeQuoteClient(
+        _credentials(),
+        max_spread_bps=150.0,
+        context_factory=lambda credentials: context,
+    )
+    client.start(["AAPL"])
+    assert client.get_reference_prices(["AAPL"]) == {"AAPL": 101.0}
+    try:
+        client.get_marketable_quote("AAPL")
+    except LongbridgeQuoteError as exc:
+        assert "spread_bps" in str(exc)
+    else:
+        raise AssertionError("wide quote reached order pricing")
 
 
 def test_subscription_limit_is_enforced() -> None:
@@ -439,8 +481,10 @@ def main() -> int:
         test_credentials_are_loaded_without_repr_leak,
         test_stream_warmup_and_class_symbol_mapping,
         test_stale_stream_quote_is_refreshed_from_snapshot,
+        test_stale_depth_snapshots_are_refreshed_concurrently,
         test_stale_quote_is_rejected_when_snapshot_refresh_fails,
         test_wide_quote_is_rejected,
+        test_wide_quote_can_value_portfolio_but_cannot_price_order,
         test_subscription_limit_is_enforced,
         test_coverage_batches_and_classifies_static_statuses,
         test_halted_is_covered_but_rejected_for_execution,

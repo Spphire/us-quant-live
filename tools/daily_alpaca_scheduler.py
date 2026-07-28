@@ -121,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Ignored local JSON containing Longbridge OpenAPI credentials.",
     )
     parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
-    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=5.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=10.0)
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
     parser.add_argument("--longbridge-coverage-chunk-size", type=int, default=500)

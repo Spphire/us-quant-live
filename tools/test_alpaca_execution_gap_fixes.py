@@ -39,6 +39,7 @@ from src.alpaca_executor import (  # noqa: E402
     _total_regt_buying_power_capacity,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
+from vendors import LongbridgeQuoteError  # noqa: E402
 from tools.daily_audit_report import (  # noqa: E402
     _build_execution_attempt_outcome_audit,
     _build_executable_target_projection_outputs,
@@ -1038,6 +1039,7 @@ def _run_stateful_staged_case(
     initial_signed_qty: float,
     target_signed_weight: float,
     stale_position_reads_after_fill: int = 0,
+    execution_quote_client: object | None = None,
 ) -> tuple[_StatefulStagedFillClient, list[dict[str, object]], dict[str, object], list[dict[str, object]]]:
     client = _StatefulStagedFillClient(
         initial_signed_qty,
@@ -1074,6 +1076,7 @@ def _run_stateful_staged_case(
     snapshots: list[dict[str, object]] = []
     records, diagnostics = _submit_staged_regt_orders(
         client=client,
+        execution_quote_client=execution_quote_client,
         initial_instructions=instructions,
         target_signed_weights=weights,
         raw_target_signed_weights=weights,
@@ -1191,6 +1194,28 @@ def test_staged_filled_release_is_not_rebuilt_from_lagged_position():
     assert diagnostics["entry_aborted"] is False, diagnostics
     assert all(record.get("status_latest") == "filled" for record in records), records
     print("  [OK] filled release is not resubmitted when Alpaca positions briefly lag")
+
+
+def test_staged_quote_failure_after_release_is_controlled_abort():
+    class _FailingReferenceQuoteClient:
+        def get_reference_prices(self, symbols):
+            raise LongbridgeQuoteError("X: stale quote after release")
+
+    client, records, diagnostics, snapshots = _run_stateful_staged_case(
+        initial_signed_qty=10.0,
+        target_signed_weight=-0.05,
+        execution_quote_client=_FailingReferenceQuoteClient(),
+    )
+    assert len(client.submissions) == 1, client.submissions
+    assert len(records) == 1 and records[0]["status_latest"] == "filled", records
+    assert diagnostics["entry_aborted"] is True, diagnostics
+    assert diagnostics["entry_abort_reason"] == (
+        "release_sell_long_rebuild_quote_validation_failed_after_broker_mutation"
+    )
+    assert diagnostics["quote_validation_failure_symbols"] == ["X"], diagnostics
+    aborts = [row for row in snapshots if row.get("snapshot_type") == "entry_abort"]
+    assert len(aborts) == 1 and aborts[0]["broker_mutation_record_count"] == 1, aborts
+    print("  [OK] post-release quote failure records a controlled abort without retrying entry")
 
 
 def test_staged_entry_residual_repair_fills_weight_priority_gap():
@@ -1843,6 +1868,7 @@ def main() -> int:
         ("Staged short-to-long zero boundary", test_staged_short_to_long_stops_at_zero_before_entry),
         ("Staged same-side reduction", test_staged_same_side_reduction_has_no_entry_leg),
         ("Staged filled release position lag", test_staged_filled_release_is_not_rebuilt_from_lagged_position),
+        ("Controlled post-release quote abort", test_staged_quote_failure_after_release_is_controlled_abort),
         ("Staged entry residual repair", test_staged_entry_residual_repair_fills_weight_priority_gap),
         ("Attempt outcome classification", test_attempt_outcome_summary_separates_requotes_from_terminal_misses),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),

@@ -519,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Ignored local JSON containing Longbridge OpenAPI credentials.",
     )
     parser.add_argument("--longbridge-warmup-timeout-seconds", type=float, default=8.0)
-    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=5.0)
+    parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=10.0)
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
     parser.add_argument(
@@ -5547,6 +5547,47 @@ def _submit_staged_regt_orders(
         "entry_projection": {},
     }
 
+    def abort_after_quote_failure(
+        *,
+        stage: str,
+        error: LongbridgeQuoteError,
+        affected_symbols: Sequence[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        broker_mutation_record_count = sum(
+            bool(str(record.get("order_id") or "").strip())
+            or any(
+                str(attempt.get("order_id") or "").strip()
+                for attempt in (record.get("attempts") or [])
+                if isinstance(attempt, Mapping)
+            )
+            for record in records
+        )
+        if broker_mutation_record_count <= 0:
+            raise error
+        reason = f"{stage}_quote_validation_failed_after_broker_mutation"
+        diagnostics["entry_aborted"] = True
+        diagnostics["entry_abort_reason"] = reason
+        diagnostics["quote_validation_failure_stage"] = str(stage)
+        diagnostics["quote_validation_failure_error_type"] = type(error).__name__
+        diagnostics["quote_validation_failure_error"] = str(error)
+        diagnostics["quote_validation_failure_symbols"] = sorted(
+            {str(symbol).upper() for symbol in affected_symbols if str(symbol).strip()}
+        )
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "entry_abort",
+                "captured_at_utc": _utc_now(),
+                "stage": str(stage),
+                "entry_abort_reason": reason,
+                "quote_validation_failure_error_type": type(error).__name__,
+                "quote_validation_failure_error": str(error),
+                "affected_symbols": list(diagnostics["quote_validation_failure_symbols"]),
+                "broker_mutation_record_count": int(broker_mutation_record_count),
+            }
+        )
+        return records, diagnostics
+
     release_reference_prices = dict(fallback_prices)
     release_target_signed_weights = {
         str(item.symbol).upper(): float(item.target_notional) / max(float(account_equity), 1e-9)
@@ -5650,15 +5691,25 @@ def _submit_staged_regt_orders(
                 account=refreshed_substage_account,
                 signed_notional=refreshed_substage_signed_notional,
             )
-            release_reference_prices = _resolve_reference_prices(
-                client=execution_quote_client or client,
-                symbols=sorted(set(stage_symbols) | set(refreshed_substage_signed_notional)),
-                fallback_prices=release_reference_prices,
-                feed=execution_price_feed,
-                prefer_live=True,
-                allow_fallback=execution_quote_client is None,
-                require_fresh=execution_quote_client is not None,
+            release_price_symbols = sorted(
+                set(stage_symbols) | set(refreshed_substage_signed_notional)
             )
+            try:
+                release_reference_prices = _resolve_reference_prices(
+                    client=execution_quote_client or client,
+                    symbols=release_price_symbols,
+                    fallback_prices=release_reference_prices,
+                    feed=execution_price_feed,
+                    prefer_live=True,
+                    allow_fallback=execution_quote_client is None,
+                    require_fresh=execution_quote_client is not None,
+                )
+            except LongbridgeQuoteError as exc:
+                return abort_after_quote_failure(
+                    stage=f"{stage_name}_rebuild",
+                    error=exc,
+                    affected_symbols=release_price_symbols,
+                )
             release_min_trade_notional = _effective_min_trade_notional(
                 account_equity=float(refreshed_substage_equity),
                 absolute_floor=float(min_trade_notional_floor),
@@ -5904,15 +5955,23 @@ def _submit_staged_regt_orders(
         account=refreshed_account,
         signed_notional=refreshed_signed_notional,
     )
-    refreshed_prices = _resolve_reference_prices(
-        client=execution_quote_client or client,
-        symbols=sorted(set(target_signed_weights) | set(refreshed_signed_notional)),
-        fallback_prices=fallback_prices,
-        feed=execution_price_feed,
-        prefer_live=True,
-        allow_fallback=execution_quote_client is None,
-        require_fresh=execution_quote_client is not None,
-    )
+    entry_price_symbols = sorted(set(target_signed_weights) | set(refreshed_signed_notional))
+    try:
+        refreshed_prices = _resolve_reference_prices(
+            client=execution_quote_client or client,
+            symbols=entry_price_symbols,
+            fallback_prices=fallback_prices,
+            feed=execution_price_feed,
+            prefer_live=True,
+            allow_fallback=execution_quote_client is None,
+            require_fresh=execution_quote_client is not None,
+        )
+    except LongbridgeQuoteError as exc:
+        return abort_after_quote_failure(
+            stage="entry_rebuild",
+            error=exc,
+            affected_symbols=entry_price_symbols,
+        )
     entry_min_trade_notional = _effective_min_trade_notional(
         account_equity=float(refreshed_equity),
         absolute_floor=float(min_trade_notional_floor),
@@ -6107,15 +6166,26 @@ def _submit_staged_regt_orders(
             account=repair_account,
             signed_notional=repair_signed_notional,
         )
-        repair_prices = _resolve_reference_prices(
-            client=execution_quote_client or client,
-            symbols=sorted(set(target_signed_weights) | set(repair_signed_notional)),
-            fallback_prices=refreshed_prices,
-            feed=execution_price_feed,
-            prefer_live=True,
-            allow_fallback=execution_quote_client is None,
-            require_fresh=execution_quote_client is not None,
-        )
+        repair_price_symbols = sorted(set(target_signed_weights) | set(repair_signed_notional))
+        try:
+            repair_prices = _resolve_reference_prices(
+                client=execution_quote_client or client,
+                symbols=repair_price_symbols,
+                fallback_prices=refreshed_prices,
+                feed=execution_price_feed,
+                prefer_live=True,
+                allow_fallback=execution_quote_client is None,
+                require_fresh=execution_quote_client is not None,
+            )
+        except LongbridgeQuoteError as exc:
+            diagnostics["entry_repair_final_unfilled_symbols"] = list(
+                repair_candidate_symbols
+            )
+            return abort_after_quote_failure(
+                stage=f"entry_repair_round_{repair_round}",
+                error=exc,
+                affected_symbols=repair_price_symbols,
+            )
         repair_min_trade_notional = _effective_min_trade_notional(
             account_equity=float(repair_equity),
             absolute_floor=float(min_trade_notional_floor),
