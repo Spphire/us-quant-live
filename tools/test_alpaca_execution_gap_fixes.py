@@ -39,7 +39,7 @@ from src.alpaca_executor import (  # noqa: E402
     _total_regt_buying_power_capacity,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
-from vendors import LongbridgeQuoteError  # noqa: E402
+from vendors import AlpacaRequestError, LongbridgeQuoteError  # noqa: E402
 from tools.daily_audit_report import (  # noqa: E402
     _build_execution_attempt_outcome_audit,
     _build_executable_target_projection_outputs,
@@ -151,6 +151,23 @@ class _QuoteNeverFillClient(_NeverFillClient):
             }
             for symbol in symbols
         }
+
+
+class _FractionalClosePrecisionClient(_ImmediateFillConcurrencyClient):
+    def __init__(self, error_message: str = "fractional orders cannot be sold short") -> None:
+        super().__init__(submit_delay_seconds=0.0)
+        self.submitted_qty: list[float] = []
+        self.error_message = str(error_message)
+
+    def submit_order(self, **kwargs):
+        qty = float(kwargs.get("qty") or 0.0)
+        self.submitted_qty.append(qty)
+        if len(self.submitted_qty) == 1:
+            raise AlpacaRequestError(
+                'Alpaca request failed with HTTP 422: {"code":42210000,'
+                f'"message":"{self.error_message}"}}'
+            )
+        return super().submit_order(**kwargs)
 
 
 class _StagedNeverFillClient(_QuoteNeverFillClient):
@@ -919,6 +936,112 @@ def test_order_batch_runs_symbols_concurrently():
         f"  [OK] six symbols completed with max_concurrency={client.max_active_submits} "
         f"elapsed={elapsed:.3f}s"
     )
+
+
+def test_order_batch_caps_workers_at_empirical_rate_limit_boundary():
+    client = _ImmediateFillConcurrencyClient(submit_delay_seconds=0.05)
+    instructions = [
+        OrderInstruction(
+            symbol=f"C{index}",
+            side="buy",
+            qty=1.0,
+            reference_price=100.0,
+            sizing_price=101.0,
+            current_notional=0.0,
+            target_notional=100.0,
+            delta_notional=100.0,
+            opening_short=False,
+        )
+        for index in range(14)
+    ]
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=instructions,
+        session_token="worker-cap",
+        timeout_seconds=5.0,
+        poll_seconds=0.1,
+        execution_order_style="market",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=1,
+        max_workers=14,
+    )
+    assert client.max_active_submits == 10, client.max_active_submits
+    assert all(row["batch_requested_workers"] == 14 for row in records), records
+    assert all(row["batch_worker_safety_cap"] == 10 for row in records), records
+    assert all(row["batch_effective_workers"] == 10 for row in records), records
+    print("  [OK] requested concurrency above ten is capped before broker submission")
+
+
+def test_fractional_long_close_retries_one_minimum_unit_lower():
+    client = _FractionalClosePrecisionClient()
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=[
+            OrderInstruction(
+                symbol="HALO",
+                side="sell",
+                qty=30.7241,
+                reference_price=84.265,
+                sizing_price=84.265,
+                current_notional=2588.966287,
+                target_notional=0.0,
+                delta_notional=-2588.966287,
+                opening_short=False,
+                current_signed_qty=30.7241,
+                target_signed_qty=0.0,
+            )
+        ],
+        session_token="fractional-close",
+        timeout_seconds=5.0,
+        poll_seconds=0.1,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=1.0,
+        marketable_limit_max_attempts=1,
+    )
+    assert client.submitted_qty == [30.7241, 30.724], client.submitted_qty
+    assert records[0]["status_latest"] == "filled", records[0]
+    assert records[0]["fractional_close_retry_count"] == 1, records[0]
+    assert abs(records[0]["fractional_close_residual_qty"] - 0.0001) < 1e-10, records[0]
+
+    insufficient_client = _FractionalClosePrecisionClient(
+        "insufficient qty available for order (requested: 30.7242, available: 30.7241)"
+    )
+    instruction = OrderInstruction(
+        symbol="HALO",
+        side="sell",
+        qty=30.7242,
+        reference_price=84.265,
+        sizing_price=84.265,
+        current_notional=2588.966287,
+        target_notional=0.0,
+        delta_notional=-2588.966287,
+        opening_short=False,
+        current_signed_qty=30.7241,
+        target_signed_qty=0.0,
+    )
+    insufficient_records = _submit_and_track_orders(
+        client=insufficient_client,
+        instructions=[instruction],
+        session_token="fractional-close-available",
+        timeout_seconds=5.0,
+        poll_seconds=0.1,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=1.0,
+        marketable_limit_max_attempts=1,
+    )
+    assert insufficient_client.submitted_qty == [30.7242, 30.724], insufficient_client.submitted_qty
+    assert insufficient_records[0]["status_latest"] == "filled", insufficient_records[0]
+    assert abs(insufficient_records[0]["fractional_close_residual_qty"] - 0.0001) < 1e-10
+    print("  [OK] rejected exact fractional close retries 0.0001 share lower")
 
 
 def test_per_symbol_attempt_budget_bounds_requotes():
@@ -1862,6 +1985,8 @@ def main() -> int:
         ("Bounded marketable-limit ladder", test_marketable_limit_ladder_is_bounded_and_unique),
         ("Live quote marketable-limit reference", test_marketable_limit_uses_live_quote_side),
         ("Concurrent symbol execution", test_order_batch_runs_symbols_concurrently),
+        ("Empirical execution worker safety cap", test_order_batch_caps_workers_at_empirical_rate_limit_boundary),
+        ("Fractional long-close precision fallback", test_fractional_long_close_retries_one_minimum_unit_lower),
         ("Per-symbol attempt budget", test_per_symbol_attempt_budget_bounds_requotes),
         ("Cross-round staged attempt budget", test_staged_release_attempt_budget_is_global_across_rounds),
         ("Staged long-to-short zero boundary", test_staged_long_to_short_stops_at_zero_before_entry),

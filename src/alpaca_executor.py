@@ -61,6 +61,7 @@ DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "artifacts" / "alpaca_executor"
 DEFAULT_LEDGER_PATH = PROJECT_ROOT / "artifacts" / "alpaca_executor" / "lot_ledger.json"
 DEFAULT_LONGBRIDGE_CONFIG_PATH = PROJECT_ROOT / "configs" / "longbridge.local.json"
 EPS = 1e-10
+MAX_SAFE_EXECUTION_WORKERS = 10
 TERMINAL_ORDER_STATUSES = {
     "filled",
     "canceled",
@@ -595,8 +596,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--execution-workers",
         type=int,
-        default=6,
-        help="Maximum symbols submitted and tracked concurrently within each execution stage.",
+        default=MAX_SAFE_EXECUTION_WORKERS,
+        help=(
+            "Maximum symbols submitted and tracked concurrently within each execution stage. "
+            f"Values above {MAX_SAFE_EXECUTION_WORKERS} are capped to avoid Alpaca rate limits."
+        ),
     )
     parser.add_argument(
         "--marketable-limit-max-offset-bps",
@@ -4772,10 +4776,15 @@ def _order_batch_summary(
 ) -> dict[str, Any]:
     status_counts = Counter(str(item.get("status_latest") or "unknown") for item in records)
     work_seconds = sum(max(0.0, float(item.get("order_wall_time_seconds") or 0.0)) for item in records)
+    effective_workers = max(
+        (int(item.get("batch_effective_workers") or 0) for item in records),
+        default=0,
+    )
     return {
         "record_count": int(len(records)),
         "requested_workers": int(max(1, requested_workers)),
-        "effective_workers": int(min(max(1, requested_workers), max(1, len(records)))) if records else 0,
+        "worker_safety_cap": int(MAX_SAFE_EXECUTION_WORKERS),
+        "effective_workers": int(effective_workers),
         "elapsed_seconds": float(max(0.0, elapsed_seconds)),
         "aggregate_order_work_seconds": float(work_seconds),
         "parallel_speedup_ratio": (
@@ -4946,7 +4955,11 @@ def _submit_and_track_orders(
 ) -> list[dict[str, Any]]:
     instruction_list = list(instructions)
     requested_workers = max(1, int(max_workers))
-    effective_workers = min(requested_workers, max(1, len(instruction_list)))
+    effective_workers = min(
+        requested_workers,
+        MAX_SAFE_EXECUTION_WORKERS,
+        max(1, len(instruction_list)),
+    )
     symbol_attempt_limits = {
         str(symbol).upper(): max(1, int(limit))
         for symbol, limit in (max_attempts_by_symbol or {}).items()
@@ -4983,6 +4996,7 @@ def _submit_and_track_orders(
                     "dispatch_rank": int(index),
                     "batch_instruction_count": int(len(instruction_list)),
                     "batch_requested_workers": int(requested_workers),
+                    "batch_worker_safety_cap": int(MAX_SAFE_EXECUTION_WORKERS),
                     "batch_effective_workers": int(effective_workers),
                     "batch_wave_index": int((index - 1) // effective_workers + 1),
                     "batch_wave_count": int(math.ceil(len(instruction_list) / effective_workers)),
@@ -5028,6 +5042,7 @@ def _submit_and_track_orders(
             "dispatch_rank": int(idx),
             "batch_instruction_count": int(len(instruction_list)),
             "batch_requested_workers": int(requested_workers),
+            "batch_worker_safety_cap": int(MAX_SAFE_EXECUTION_WORKERS),
             "batch_effective_workers": int(effective_workers),
             "batch_wave_index": int((idx - 1) // effective_workers + 1),
             "batch_wave_count": int(math.ceil(len(instruction_list) / effective_workers)),
@@ -5088,6 +5103,10 @@ def _submit_and_track_orders(
                 continue
 
             remaining_qty = float(item.qty)
+            fractional_close_retry_count = 0
+            fractional_close_retry_original_qty: float | None = None
+            fractional_close_retry_qty: float | None = None
+            fractional_close_residual_qty = 0.0
             total_filled_qty = 0.0
             attempts: list[dict[str, Any]] = []
             latest_status = ""
@@ -5138,15 +5157,48 @@ def _submit_and_track_orders(
                     symbol=item.symbol,
                     attempt_no=attempt_no,
                 )
-                placed_order = client.submit_order(
-                    symbol=item.symbol,
-                    side=item.side,
-                    type="limit",
-                    time_in_force="day",
-                    qty=_format_qty(remaining_qty),
-                    limit_price=_format_limit_price(limit_price),
-                    client_order_id=client_order_id,
-                )
+                try:
+                    placed_order = client.submit_order(
+                        symbol=item.symbol,
+                        side=item.side,
+                        type="limit",
+                        time_in_force="day",
+                        qty=_format_qty(remaining_qty),
+                        limit_price=_format_limit_price(limit_price),
+                        client_order_id=client_order_id,
+                    )
+                except AlpacaRequestError as exc:
+                    retry_qty = _fractional_long_close_retry_qty(
+                        instruction=item,
+                        rejected_qty=remaining_qty,
+                        exc=exc,
+                    )
+                    if retry_qty is None:
+                        raise
+                    fractional_close_retry_count += 1
+                    fractional_close_retry_original_qty = float(remaining_qty)
+                    fractional_close_retry_qty = float(retry_qty)
+                    current_available_qty = _safe_float(item.current_signed_qty)
+                    fractional_close_residual_qty += max(
+                        0.0,
+                        min(
+                            float(remaining_qty),
+                            float(current_available_qty)
+                            if current_available_qty is not None
+                            else float(remaining_qty),
+                        )
+                        - float(retry_qty),
+                    )
+                    remaining_qty = float(retry_qty)
+                    placed_order = client.submit_order(
+                        symbol=item.symbol,
+                        side=item.side,
+                        type="limit",
+                        time_in_force="day",
+                        qty=_format_qty(remaining_qty),
+                        limit_price=_format_limit_price(limit_price),
+                        client_order_id=client_order_id,
+                    )
                 order_id = str(placed_order.get("id") or "")
                 attempt_deadline = min(
                     global_deadline,
@@ -5285,6 +5337,10 @@ def _submit_and_track_orders(
                 "filled_avg_price": latest_filled_avg_price,
                 "updated_at": latest_updated_at,
                 "attempt_count": int(len(attempts)),
+                "fractional_close_retry_count": int(fractional_close_retry_count),
+                "fractional_close_retry_original_qty": fractional_close_retry_original_qty,
+                "fractional_close_retry_qty": fractional_close_retry_qty,
+                "fractional_close_residual_qty": float(fractional_close_residual_qty),
                 "offset_ladder_bps": [float(value) for value in offset_ladder],
                 "attempts": attempts,
             }
@@ -6417,6 +6473,41 @@ def _alpaca_error_payload(exc: Exception) -> dict[str, Any]:
 def _is_insufficient_qty_available_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "insufficient qty available" in text
+
+
+def _fractional_long_close_retry_qty(
+    *,
+    instruction: OrderInstruction,
+    rejected_qty: float,
+    exc: Exception,
+    qty_decimals: int = 4,
+) -> float | None:
+    """Back off one minimum unit when Alpaca rejects a fractional long close at zero."""
+    text = str(exc).lower()
+    error_payload = _alpaca_error_payload(exc)
+    broker_available_qty = _safe_float(error_payload.get("available"))
+    current_qty = _safe_float(instruction.current_signed_qty)
+    target_qty = _safe_float(instruction.target_signed_qty)
+    if (
+        not (
+            "fractional orders cannot be sold short" in text
+            or "insufficient qty available" in text
+        )
+        or str(instruction.side).lower() != "sell"
+        or current_qty is None
+        or current_qty <= EPS
+        or (target_qty is not None and target_qty < -EPS)
+        or _is_effectively_whole_qty(rejected_qty, decimals=qty_decimals)
+    ):
+        return None
+    scale = 10 ** max(0, int(qty_decimals))
+    available_candidates = [float(rejected_qty), float(current_qty)]
+    if broker_available_qty is not None and broker_available_qty > EPS:
+        available_candidates.append(float(broker_available_qty))
+    retry_qty = math.floor((min(available_candidates) * scale) - 1.0) / scale
+    if retry_qty <= EPS or retry_qty >= float(rejected_qty) - EPS:
+        return None
+    return float(retry_qty)
 
 
 def _is_insufficient_buying_power_error(exc: Exception) -> bool:

@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--min-reference-price", type=float, default=10.0)
     parser.add_argument("--max-reference-price", type=float, default=300.0)
-    parser.add_argument("--execution-workers", type=int, default=6)
+    parser.add_argument("--execution-workers", type=int, default=10)
     parser.add_argument("--max-quote-age-seconds", type=float, default=10.0)
     parser.add_argument("--between-round-seconds", type=float, default=5.0)
     parser.add_argument("--output-root", default=None)

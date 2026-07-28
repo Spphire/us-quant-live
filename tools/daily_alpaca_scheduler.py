@@ -157,7 +157,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--marketable-limit-requote-steps-bps", default="0,25,75,150")
     parser.add_argument("--marketable-limit-requote-wait-seconds", type=float, default=6.0)
     parser.add_argument("--marketable-limit-max-attempts", type=int, default=4)
-    parser.add_argument("--execution-workers", type=int, default=6)
+    parser.add_argument("--execution-workers", type=int, default=10)
     parser.add_argument("--sizing-adverse-offset-bps", type=float, default=None)
     parser.add_argument("--short-buying-power-adverse-offset-bps", type=float, default=300.0)
     parser.add_argument(

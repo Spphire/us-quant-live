@@ -1264,7 +1264,10 @@ class DataAggregator:
                         "queue_wait_ms": round(queue_wait_ms, 3),
                         "attempt_count": len(attempts),
                         "batch_wave_index": record.get("batch_wave_index"),
+                        "batch_worker_safety_cap": record.get("batch_worker_safety_cap"),
                         "batch_effective_workers": record.get("batch_effective_workers"),
+                        "fractional_close_retry_count": record.get("fractional_close_retry_count"),
+                        "fractional_close_residual_qty": record.get("fractional_close_residual_qty"),
                     },
                     "children": children,
                 }
