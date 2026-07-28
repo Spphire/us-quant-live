@@ -207,8 +207,13 @@ def test_latest_run_and_execution_only_scope() -> None:
         names = [row["run_name"] for row in payload["available_runs"]]
         assert names == ["20260729_execute", "20260728_execute"], names
         assert all(name.endswith("_execute") for name in names), names
-        assert payload["run"]["elapsed_seconds"] == 10.0, payload["run"]
+        assert payload["run"]["elapsed_seconds"] == 6.0, payload["run"]
+        assert payload["run"]["started_at_utc"] == "2026-07-29T14:00:01+00:00", payload["run"]
         assert any(track["id"] == "pipeline" for track in payload["tracks"]), payload["tracks"]
+        pipeline = next(track for track in payload["tracks"] if track["id"] == "pipeline")
+        assert [item["detail"]["phase"] for item in pipeline["items"]] == [
+            "order_submission_and_tracking"
+        ], pipeline
 
 
 def test_order_attempts_concurrency_and_summary() -> None:
@@ -224,7 +229,8 @@ def test_order_attempts_concurrency_and_summary() -> None:
         assert summary["order_count"] == 3, summary
         assert summary["attempt_count"] == 2, summary
         assert summary["max_order_concurrency"] == 2, summary
-        assert summary["trading_complete_seconds"] == 7.0, summary
+        assert summary["total_process_seconds"] == 6.0, summary
+        assert summary["trading_complete_seconds"] == 6.0, summary
 
 
 def test_api_window_classification_and_redaction() -> None:
@@ -241,6 +247,15 @@ def test_api_window_classification_and_redaction() -> None:
         assert payload["summary"]["api_call_count"] == 3, payload["summary"]
         assert payload["summary"]["max_api_concurrency"] == 2, payload["summary"]
         assert {item["label"] for item in api_items} == {"Account", "Submit order", "Poll order"}
+        milestones = [
+            item
+            for track in payload["tracks"]
+            if track["kind"] == "milestone"
+            for item in track["items"]
+        ]
+        assert [item["detail"]["event"] for item in milestones] == [
+            "order_submission_finished"
+        ], milestones
         serialized = json.dumps(payload).lower()
         for forbidden in (
             "paper-api.example",

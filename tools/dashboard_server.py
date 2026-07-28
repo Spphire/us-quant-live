@@ -1118,34 +1118,40 @@ class DataAggregator:
                 "tracks": [],
             }
 
-        total_seconds = max(0.0, self._safe_timeline_float(timing.get("elapsed_seconds")) or 0.0)
-        event_elapsed = [
-            value
-            for value in (
-                self._safe_timeline_float(row.get("run_elapsed_seconds")) for row in events
-            )
-            if value is not None
-        ]
-        if event_elapsed:
-            total_seconds = max(total_seconds, max(event_elapsed))
-
         phase_items: list[dict[str, Any]] = []
-        trading_phase_start = None
-        trading_phase_end = None
-        phase_colors = {
-            "startup_evidence": "preparation",
-            "broker_preflight_and_lot_sync": "broker",
-            "dynamic_symbol_pool": "optimizer",
-            "sec_industry_map": "optimizer",
-            "alpha_core_build": "optimizer",
-            "portfolio_decision": "optimizer",
-            "market_and_price_evidence": "market_data",
-            "account_sizing_and_projection": "optimizer",
-            "order_submission_and_tracking": "trading",
-            "post_run_audit_and_finalize": "audit",
-        }
+        trading_phase_start_run = None
+        trading_phase_end_run = None
+        for phase in timing.get("phases", []):
+            if not isinstance(phase, dict) or phase.get("phase") != "order_submission_and_tracking":
+                continue
+            trading_phase_start_run = self._safe_timeline_float(
+                phase.get("run_elapsed_start_seconds")
+            )
+            trading_phase_end_run = self._safe_timeline_float(
+                phase.get("run_elapsed_end_seconds")
+            )
+            duration = self._safe_timeline_float(phase.get("elapsed_seconds"))
+            if trading_phase_start_run is not None and trading_phase_end_run is None:
+                trading_phase_end_run = trading_phase_start_run + max(0.0, duration or 0.0)
+            break
+
+        if trading_phase_start_run is None:
+            trading_phase_start_run = 0.0
+        if trading_phase_end_run is None:
+            trading_phase_end_run = max(
+                trading_phase_start_run,
+                self._safe_timeline_float(timing.get("elapsed_seconds")) or 0.0,
+            )
+        timeline_start_epoch = run_start_epoch + trading_phase_start_run
+        total_seconds = max(0.0, trading_phase_end_run - trading_phase_start_run)
+        trading_phase_start = 0.0
+        trading_phase_end = total_seconds
+
         for index, phase in enumerate(timing.get("phases", [])):
             if not isinstance(phase, dict):
+                continue
+            name = str(phase.get("phase") or f"phase_{index + 1}")
+            if name != "order_submission_and_tracking":
                 continue
             start = self._safe_timeline_float(phase.get("run_elapsed_start_seconds"))
             end = self._safe_timeline_float(phase.get("run_elapsed_end_seconds"))
@@ -1156,10 +1162,8 @@ class DataAggregator:
                 end = start + max(0.0, duration or 0.0)
             if end <= start + 1e-6:
                 continue
-            name = str(phase.get("phase") or f"phase_{index + 1}")
-            if name == "order_submission_and_tracking":
-                trading_phase_start = start
-                trading_phase_end = end
+            start = max(0.0, start - trading_phase_start_run)
+            end = min(total_seconds, max(start, end - trading_phase_start_run))
             phase_items.append(
                 {
                     "id": f"phase-{index + 1}",
@@ -1168,7 +1172,7 @@ class DataAggregator:
                     "end_seconds": round(max(start, end), 6),
                     "duration_seconds": round(max(0.0, end - start), 6),
                     "status": str(phase.get("status") or "unknown"),
-                    "color_key": phase_colors.get(name, "preparation"),
+                    "color_key": "trading",
                     "detail": {
                         "phase": name,
                         "share_of_run_pct": self._safe_timeline_float(phase.get("share_of_run_pct")),
@@ -1192,8 +1196,10 @@ class DataAggregator:
             )
             if batch_epoch is None:
                 continue
-            start = max(0.0, batch_epoch - run_start_epoch + queue_wait_ms / 1000.0)
-            end = start + max(wall_seconds, 0.001)
+            start = max(0.0, batch_epoch - timeline_start_epoch + queue_wait_ms / 1000.0)
+            end = min(total_seconds, start + max(wall_seconds, 0.001))
+            if start > total_seconds + 1e-6 or end <= start:
+                continue
             status = str(record.get("status_latest") or "unknown")
             side = str(record.get("side") or "").lower()
             attempts = record.get("attempts") if isinstance(record.get("attempts"), list) else []
@@ -1214,7 +1220,7 @@ class DataAggregator:
                     if isinstance(event, dict)
                 )
                 relative = sorted(
-                    max(start, min(end, timestamp - run_start_epoch))
+                    max(start, min(end, timestamp - timeline_start_epoch))
                     for timestamp in timestamps
                     if timestamp is not None
                 )
@@ -1340,7 +1346,9 @@ class DataAggregator:
             if elapsed is None:
                 event_epoch = self._parse_timeline_timestamp(event.get("at_utc"))
                 elapsed = event_epoch - run_start_epoch if event_epoch is not None else None
-            if elapsed is None or elapsed < -0.5 or elapsed > total_seconds + 5.0:
+            if elapsed is not None:
+                elapsed -= trading_phase_start_run
+            if elapsed is None or elapsed < -0.001 or elapsed > total_seconds + 0.001:
                 continue
             name = str(event.get("name") or f"Event {index + 1}")
             milestone_items.append(
@@ -1357,14 +1365,16 @@ class DataAggregator:
             )
 
         api_items: list[dict[str, Any]] = []
-        api_window_end = run_start_epoch + total_seconds + 5.0
+        api_window_end = timeline_start_epoch + total_seconds
         for index, row in enumerate(api_rows):
             started_epoch = self._parse_timeline_timestamp(row.get("started_at_utc"))
             elapsed_ms = max(0.0, self._safe_timeline_float(row.get("elapsed_ms")) or 0.0)
-            if started_epoch is None or started_epoch < run_start_epoch - 0.5 or started_epoch > api_window_end:
+            if started_epoch is None or started_epoch < timeline_start_epoch or started_epoch > api_window_end:
                 continue
-            start = max(0.0, started_epoch - run_start_epoch)
-            end = start + max(elapsed_ms / 1000.0, 0.001)
+            start = max(0.0, started_epoch - timeline_start_epoch)
+            end = min(total_seconds, start + max(elapsed_ms / 1000.0, 0.001))
+            if end <= start:
+                continue
             parsed_path = urlparse(str(row.get("url") or "")).path
             operation = self._timeline_api_operation(str(row.get("method") or "GET"), parsed_path)
             ok = bool(row.get("ok"))
@@ -1388,12 +1398,6 @@ class DataAggregator:
                 }
             )
         api_lanes = self._partition_timeline_lanes(api_items)
-        if api_items:
-            total_seconds = max(
-                total_seconds,
-                max(float(item["end_seconds"]) for item in api_items),
-            )
-
         tracks: list[dict[str, Any]] = [
             {
                 "id": "pipeline",
@@ -1446,7 +1450,7 @@ class DataAggregator:
         trading_complete_seconds = trading_phase_end
         if trading_complete_seconds is None and order_items:
             trading_complete_seconds = max(float(item["end_seconds"]) for item in order_items)
-        ended_at = datetime.fromtimestamp(run_start_epoch + total_seconds, tz=timezone.utc).isoformat()
+        ended_at = datetime.fromtimestamp(timeline_start_epoch + total_seconds, tz=timezone.utc).isoformat()
         return {
             "schema_version": "1.0",
             "scope": "execution_only",
@@ -1456,7 +1460,7 @@ class DataAggregator:
             "run": {
                 "run_name": run_dir.name,
                 "session_date": self._run_dir_session_date(run_dir),
-                "started_at_utc": datetime.fromtimestamp(run_start_epoch, tz=timezone.utc).isoformat(),
+                "started_at_utc": datetime.fromtimestamp(timeline_start_epoch, tz=timezone.utc).isoformat(),
                 "ended_at_utc": ended_at,
                 "elapsed_seconds": round(total_seconds, 6),
                 "status": str(timing.get("status") or "unknown"),

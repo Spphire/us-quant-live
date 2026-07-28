@@ -746,7 +746,7 @@
                 executionOrders: 'Orders',
                 executionApi: 'API',
                 executionMilestones: 'Milestones',
-                executionTotal: 'Process total',
+                executionTotal: 'Execution total',
                 executionTradingComplete: 'Trading complete',
                 executionOrderCount: 'Orders',
                 executionAttemptCount: 'Attempts',
@@ -902,7 +902,7 @@
                 executionOrders: '订单',
                 executionApi: 'API',
                 executionMilestones: '里程碑',
-                executionTotal: '进程总耗时',
+                executionTotal: '执行总耗时',
                 executionTradingComplete: '交易完成',
                 executionOrderCount: '订单数',
                 executionAttemptCount: '尝试次数',
@@ -2687,7 +2687,6 @@
             const summary = data.summary || {};
             const summaryItems = [
                 [t('executionTotal'), formatTimelineSeconds(summary.total_process_seconds)],
-                [t('executionTradingComplete'), formatTimelineSeconds(summary.trading_complete_seconds)],
                 [t('executionOrderCount'), formatNumber(summary.order_count || 0)],
                 [t('executionAttemptCount'), formatNumber(summary.attempt_count || 0)],
                 [t('executionOrderConcurrency'), formatNumber(summary.max_order_concurrency || 0)],
