@@ -78,15 +78,20 @@ class LongbridgeQuoteClient:
         max_quote_age_seconds: float = 5.0,
         max_spread_bps: float = 150.0,
         max_subscriptions: int = 500,
+        snapshot_context_count: int = 4,
         context_factory: Callable[[LongbridgeCredentials], Any] | None = None,
+        snapshot_context_factory: Callable[[LongbridgeCredentials], Any] | None = None,
     ) -> None:
         self._credentials = credentials
         self._warmup_timeout_seconds = max(0.1, float(warmup_timeout_seconds))
         self._max_quote_age_seconds = max(0.1, float(max_quote_age_seconds))
         self._max_spread_bps = max(0.0, float(max_spread_bps))
         self._max_subscriptions = max(1, int(max_subscriptions))
+        self._snapshot_context_count = max(1, int(snapshot_context_count))
         self._context_factory = context_factory
+        self._snapshot_context_factory = snapshot_context_factory
         self._context: Any | None = None
+        self._aux_snapshot_contexts: list[Any] = []
         self._sub_type: Any | None = None
         self._lock = threading.RLock()
         self._refresh_lock = threading.Lock()
@@ -107,6 +112,10 @@ class LongbridgeQuoteClient:
         self._snapshot_refresh_multi_symbol_depth_work_seconds = 0.0
         self._snapshot_refresh_max_requested_symbols = 0
         self._snapshot_refresh_max_depth_workers = 0
+        self._snapshot_refresh_max_contexts = 0
+        self._snapshot_context_warmup_attempt_count = 0
+        self._snapshot_context_warmup_elapsed_seconds = 0.0
+        self._snapshot_context_creation_errors: list[dict[str, str]] = []
         self._snapshot_refresh_failure_history: list[dict[str, Any]] = []
         self._last_snapshot_refresh: dict[str, Any] = {}
 
@@ -242,6 +251,16 @@ class LongbridgeQuoteClient:
             )
             with self._lock:
                 self._subscribed.update(_base_symbol(symbol) for symbol in new_provider_symbols)
+
+        snapshot_warmup_started = time.monotonic()
+        self._snapshot_context_warmup_attempt_count += 1
+        _, context_creation_errors = self._snapshot_contexts_for_batch(len(requested))
+        self._snapshot_context_warmup_elapsed_seconds += (
+            time.monotonic() - snapshot_warmup_started
+        )
+        if context_creation_errors:
+            self._snapshot_context_creation_errors.extend(context_creation_errors)
+            self._snapshot_context_creation_errors = self._snapshot_context_creation_errors[-20:]
 
         deadline = time.monotonic() + self._warmup_timeout_seconds
         while time.monotonic() < deadline:
@@ -490,6 +509,16 @@ class LongbridgeQuoteClient:
             "snapshot_refresh_max_depth_workers": int(
                 self._snapshot_refresh_max_depth_workers
             ),
+            "snapshot_refresh_max_contexts": int(self._snapshot_refresh_max_contexts),
+            "snapshot_context_warmup_attempt_count": int(
+                self._snapshot_context_warmup_attempt_count
+            ),
+            "snapshot_context_warmup_elapsed_seconds": round(
+                float(self._snapshot_context_warmup_elapsed_seconds), 6
+            ),
+            "snapshot_context_creation_errors": [
+                dict(item) for item in self._snapshot_context_creation_errors
+            ],
             "snapshot_refresh_failure_history": [
                 dict(item) for item in self._snapshot_refresh_failure_history
             ],
@@ -504,6 +533,8 @@ class LongbridgeQuoteClient:
             ),
             "max_spread_bps": self._max_spread_bps,
             "max_subscriptions": self._max_subscriptions,
+            "snapshot_context_count": self._snapshot_context_count,
+            "snapshot_aux_context_count": len(self._aux_snapshot_contexts),
             "status": (
                 "pass" if validation_ok and not entitlement_attention else "attention"
             ),
@@ -511,14 +542,20 @@ class LongbridgeQuoteClient:
 
     def close(self) -> None:
         context = self._context
-        if context is None:
-            return
-        provider_symbols = [_provider_symbol(symbol) for symbol in sorted(self._subscribed)]
-        if provider_symbols:
-            try:
-                context.unsubscribe(provider_symbols, [self._sub_type.Quote, self._sub_type.Depth])
-            except Exception:
-                pass
+        if context is not None:
+            provider_symbols = [_provider_symbol(symbol) for symbol in sorted(self._subscribed)]
+            if provider_symbols:
+                try:
+                    context.unsubscribe(
+                        provider_symbols,
+                        [self._sub_type.Quote, self._sub_type.Depth],
+                    )
+                except Exception:
+                    pass
+        for snapshot_context in self._aux_snapshot_contexts:
+            self._release_context(snapshot_context)
+        self._aux_snapshot_contexts = []
+        self._release_context(context)
         self._context = None
 
     def _ensure_context(self) -> None:
@@ -530,21 +567,7 @@ class LongbridgeQuoteClient:
             if sub_type is None:
                 raise LongbridgeQuoteError("Test/context factory must expose sub_type.")
         else:
-            try:
-                from longport.openapi import Config, QuoteContext, SubType
-            except ImportError as exc:
-                raise LongbridgeQuoteError(
-                    "The longport package is required for Longbridge execution quotes."
-                ) from exc
-            config = Config.from_apikey(
-                self._credentials.app_key,
-                self._credentials.app_secret,
-                self._credentials.access_token,
-                enable_overnight=bool(self._credentials.enable_overnight),
-                enable_print_quote_packages=False,
-            )
-            context = QuoteContext(config)
-            sub_type = SubType
+            context, sub_type = self._new_sdk_context()
         context.set_on_quote(self._on_quote)
         context.set_on_depth(self._on_depth)
         self._context = context
@@ -562,6 +585,83 @@ class LongbridgeQuoteClient:
             self._packages = [_package_payload(item) for item in context.quote_package_details()]
         except Exception:
             self._packages = []
+
+    def _new_sdk_context(self) -> tuple[Any, Any]:
+        try:
+            from longport.openapi import Config, QuoteContext, SubType
+        except ImportError as exc:
+            raise LongbridgeQuoteError(
+                "The longport package is required for Longbridge execution quotes."
+            ) from exc
+        config = Config.from_apikey(
+            self._credentials.app_key,
+            self._credentials.app_secret,
+            self._credentials.access_token,
+            enable_overnight=bool(self._credentials.enable_overnight),
+            enable_print_quote_packages=False,
+        )
+        return QuoteContext(config), SubType
+
+    def _new_snapshot_context(self) -> Any:
+        if self._snapshot_context_factory is not None:
+            context = self._snapshot_context_factory(self._credentials)
+        else:
+            context, _ = self._new_sdk_context()
+        try:
+            quote_level = str(context.quote_level())
+        except Exception:
+            self._release_context(context)
+            raise
+        if "USAA" not in quote_level or "NBBO" not in quote_level:
+            self._release_context(context)
+            raise LongbridgeQuoteError(
+                "Longbridge snapshot context does not report the required US NBBO entitlement."
+            )
+        return context
+
+    @staticmethod
+    def _release_context(context: Any | None) -> None:
+        if context is None:
+            return
+        close = getattr(context, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _snapshot_contexts_for_batch(
+        self,
+        symbol_count: int,
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        if self._context is None:
+            raise LongbridgeQuoteError("Longbridge quote context is not initialized.")
+
+        # Existing injected test contexts are safe for concurrent calls and preserve
+        # the legacy single-context worker-pool test path unless an auxiliary factory
+        # is explicitly supplied.
+        if self._context_factory is not None and self._snapshot_context_factory is None:
+            return [self._context], []
+
+        desired_count = min(
+            self._snapshot_context_count,
+            max(1, (max(1, int(symbol_count)) + 7) // 8),
+        )
+        creation_errors: list[dict[str, str]] = []
+        while len(self._aux_snapshot_contexts) < desired_count - 1:
+            try:
+                self._aux_snapshot_contexts.append(self._new_snapshot_context())
+            except Exception as exc:
+                creation_errors.append(
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                break
+        contexts = [self._context]
+        contexts.extend(self._aux_snapshot_contexts[: desired_count - 1])
+        return contexts, creation_errors
 
     def _on_quote(self, provider_symbol: str, event: Any) -> None:
         symbol = _base_symbol(provider_symbol)
@@ -690,12 +790,13 @@ class LongbridgeQuoteClient:
         quote_batch_elapsed_seconds = time.monotonic() - quote_batch_started_monotonic
 
         def fetch_depth(
+            context: Any,
             symbol: str,
             provider_symbol: str,
         ) -> tuple[str, str, Any, Exception | None, float]:
             depth_started_monotonic = time.monotonic()
             try:
-                event = self._context.depth(provider_symbol)
+                event = context.depth(provider_symbol)
                 return (
                     symbol,
                     provider_symbol,
@@ -712,32 +813,76 @@ class LongbridgeQuoteClient:
                     time.monotonic() - depth_started_monotonic,
                 )
 
-        depth_worker_count = min(8, max(1, len(provider_symbols)))
+        snapshot_contexts, context_creation_errors = self._snapshot_contexts_for_batch(
+            len(provider_symbols)
+        )
+        use_legacy_worker_pool = (
+            self._context_factory is not None and self._snapshot_context_factory is None
+        )
+        depth_context_count = min(len(snapshot_contexts), max(1, len(provider_symbols)))
+        if use_legacy_worker_pool:
+            depth_worker_count = min(8, max(1, len(provider_symbols)))
+            depth_execution_mode = "single_context_thread_pool"
+        else:
+            depth_worker_count = depth_context_count
+            depth_execution_mode = (
+                "sharded_quote_contexts"
+                if depth_context_count > 1
+                else "single_quote_context_sequential"
+            )
         depth_started_monotonic = time.monotonic()
         depth_request_elapsed_seconds: list[float] = []
-        with ThreadPoolExecutor(max_workers=depth_worker_count) as executor:
-            futures = [
-                executor.submit(fetch_depth, symbol, provider_symbol)
-                for symbol, provider_symbol in zip(requested, provider_symbols)
+
+        if use_legacy_worker_pool:
+            with ThreadPoolExecutor(max_workers=depth_worker_count) as executor:
+                futures = [
+                    executor.submit(fetch_depth, self._context, symbol, provider_symbol)
+                    for symbol, provider_symbol in zip(requested, provider_symbols)
+                ]
+                depth_results = [future.result() for future in as_completed(futures)]
+        else:
+            shards: list[list[tuple[str, str]]] = [
+                [] for _ in range(depth_context_count)
             ]
-            for future in as_completed(futures):
-                symbol, provider_symbol, event, error, request_elapsed = future.result()
-                depth_request_elapsed_seconds.append(float(request_elapsed))
-                if error is not None:
-                    errors.append(
-                        {
-                            "scope": "depth",
-                            "symbol": symbol,
-                            "error_type": type(error).__name__,
-                            "error": str(error),
-                        }
-                    )
-                    continue
-                self._on_depth(provider_symbol, event)
-                with self._lock:
-                    self._depths[symbol]["source"] = "snapshot_refresh"
-                    self._depths[symbol]["snapshot_refreshed_at_utc"] = started_at_utc
-                depth_refreshed.add(symbol)
+            for index, pair in enumerate(zip(requested, provider_symbols)):
+                shards[index % depth_context_count].append(pair)
+
+            def fetch_depth_shard(
+                context: Any,
+                shard: Sequence[tuple[str, str]],
+            ) -> list[tuple[str, str, Any, Exception | None, float]]:
+                return [
+                    fetch_depth(context, symbol, provider_symbol)
+                    for symbol, provider_symbol in shard
+                ]
+
+            with ThreadPoolExecutor(max_workers=depth_context_count) as executor:
+                futures = [
+                    executor.submit(fetch_depth_shard, context, shard)
+                    for context, shard in zip(snapshot_contexts, shards)
+                    if shard
+                ]
+                depth_results = []
+                for future in as_completed(futures):
+                    depth_results.extend(future.result())
+
+        for symbol, provider_symbol, event, error, request_elapsed in depth_results:
+            depth_request_elapsed_seconds.append(float(request_elapsed))
+            if error is not None:
+                errors.append(
+                    {
+                        "scope": "depth",
+                        "symbol": symbol,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+                continue
+            self._on_depth(provider_symbol, event)
+            with self._lock:
+                self._depths[symbol]["source"] = "snapshot_refresh"
+                self._depths[symbol]["snapshot_refreshed_at_utc"] = started_at_utc
+            depth_refreshed.add(symbol)
         depth_elapsed_seconds = time.monotonic() - depth_started_monotonic
         depth_work_seconds = float(sum(depth_request_elapsed_seconds))
 
@@ -756,6 +901,9 @@ class LongbridgeQuoteClient:
         )
         self._snapshot_refresh_max_depth_workers = max(
             int(self._snapshot_refresh_max_depth_workers), int(depth_worker_count)
+        )
+        self._snapshot_refresh_max_contexts = max(
+            int(self._snapshot_refresh_max_contexts), int(depth_context_count)
         )
         if len(requested) > 1:
             self._snapshot_refresh_multi_symbol_count += 1
@@ -793,6 +941,10 @@ class LongbridgeQuoteClient:
                 else None
             ),
             "depth_worker_count": int(depth_worker_count),
+            "depth_context_count": int(depth_context_count),
+            "depth_execution_mode": depth_execution_mode,
+            "snapshot_context_count_configured": int(self._snapshot_context_count),
+            "snapshot_context_creation_errors": context_creation_errors,
             "status": "pass" if not errors else "error",
         }
         if errors:
@@ -804,6 +956,8 @@ class LongbridgeQuoteClient:
                     "errors": [dict(item) for item in errors],
                     "elapsed_seconds": result["elapsed_seconds"],
                     "depth_worker_count": int(depth_worker_count),
+                    "depth_context_count": int(depth_context_count),
+                    "depth_execution_mode": depth_execution_mode,
                 }
             )
             self._snapshot_refresh_failure_history = self._snapshot_refresh_failure_history[-20:]

@@ -41,6 +41,7 @@ def main() -> int:
     expected_values = {
         "--execution-quote-provider": "longbridge",
         "--longbridge-max-quote-age-seconds": "10",
+        "--longbridge-snapshot-contexts": "4",
         "--staged-entry-repair-rounds": "1",
         "--staged-entry-repair-max-attempts": "1",
         "--staged-entry-repair-wait-seconds": "10",

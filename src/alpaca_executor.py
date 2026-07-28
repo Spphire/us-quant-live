@@ -523,6 +523,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
     parser.add_argument(
+        "--longbridge-snapshot-contexts",
+        type=int,
+        default=4,
+        help="Maximum independent Longbridge contexts used for snapshot refresh sharding.",
+    )
+    parser.add_argument(
         "--longbridge-coverage-chunk-size",
         type=int,
         default=500,
@@ -2905,6 +2911,7 @@ def _new_longbridge_quote_client(args: argparse.Namespace) -> LongbridgeQuoteCli
         max_quote_age_seconds=float(args.longbridge_max_quote_age_seconds),
         max_spread_bps=float(args.longbridge_max_spread_bps),
         max_subscriptions=int(args.longbridge_max_subscriptions),
+        snapshot_context_count=int(args.longbridge_snapshot_contexts),
     )
 
 

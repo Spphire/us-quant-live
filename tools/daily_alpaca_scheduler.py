@@ -124,6 +124,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--longbridge-max-quote-age-seconds", type=float, default=10.0)
     parser.add_argument("--longbridge-max-spread-bps", type=float, default=150.0)
     parser.add_argument("--longbridge-max-subscriptions", type=int, default=500)
+    parser.add_argument("--longbridge-snapshot-contexts", type=int, default=4)
     parser.add_argument("--longbridge-coverage-chunk-size", type=int, default=500)
     parser.add_argument(
         "--execution-price-feed",
@@ -1281,6 +1282,8 @@ def _build_command(
         _num(args.longbridge_max_spread_bps),
         "--longbridge-max-subscriptions",
         str(int(args.longbridge_max_subscriptions)),
+        "--longbridge-snapshot-contexts",
+        str(int(args.longbridge_snapshot_contexts)),
         "--longbridge-coverage-chunk-size",
         str(int(args.longbridge_coverage_chunk_size)),
         "--execution-mode",

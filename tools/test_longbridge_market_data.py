@@ -54,6 +54,7 @@ class _FakeContext:
         self.unsubscribed: list[str] = []
         self.quote_calls: list[list[str]] = []
         self.depth_calls: list[str] = []
+        self.closed = False
 
     def set_on_quote(self, callback):
         self.on_quote = callback
@@ -91,6 +92,9 @@ class _FakeContext:
 
     def unsubscribe(self, symbols, sub_types):
         self.unsubscribed.extend(symbols)
+
+    def close(self):
+        self.closed = True
 
     def quote(self, symbols):
         self.quote_calls.append(list(symbols))
@@ -211,6 +215,48 @@ def test_stale_depth_snapshots_are_refreshed_concurrently() -> None:
     assert health["snapshot_refresh_max_requested_symbols"] == len(symbols), health
     assert health["snapshot_refresh_max_depth_workers"] == 8, health
     assert health["snapshot_refresh_multi_symbol_parallel_speedup_ratio"] >= 3.0, health
+
+
+def test_stale_depth_snapshots_are_sharded_across_contexts() -> None:
+    symbols = [f"S{index}" for index in range(32)]
+    main_context = _FakeContext(snapshot_depth_delay_seconds=0.05)
+    auxiliary_contexts: list[_FakeContext] = []
+
+    def new_snapshot_context(credentials):
+        del credentials
+        context = _FakeContext(snapshot_depth_delay_seconds=0.05)
+        auxiliary_contexts.append(context)
+        return context
+
+    client = LongbridgeQuoteClient(
+        _credentials(),
+        max_quote_age_seconds=0.2,
+        snapshot_context_count=4,
+        context_factory=lambda credentials: main_context,
+        snapshot_context_factory=new_snapshot_context,
+    )
+    client.start(symbols)
+    assert len(auxiliary_contexts) == 3, auxiliary_contexts
+    time.sleep(0.22)
+    started = time.monotonic()
+    quotes = client.get_latest_quotes(symbols, require_fresh=True)
+    elapsed = time.monotonic() - started
+    assert len(quotes) == len(symbols), quotes
+    assert elapsed < 0.75, elapsed
+    assert sorted(
+        len(context.depth_calls) for context in [main_context, *auxiliary_contexts]
+    ) == [8, 8, 8, 8]
+    health = client.health_snapshot(requested_symbols=symbols)
+    refresh = health["last_snapshot_refresh"]
+    assert refresh["depth_context_count"] == 4, refresh
+    assert refresh["depth_worker_count"] == 4, refresh
+    assert refresh["depth_execution_mode"] == "sharded_quote_contexts", refresh
+    assert refresh["snapshot_context_creation_errors"] == [], refresh
+    assert health["snapshot_refresh_max_contexts"] == 4, health
+    assert health["snapshot_aux_context_count"] == 3, health
+    client.close()
+    assert main_context.closed
+    assert all(context.closed for context in auxiliary_contexts)
 
 
 def test_near_expiry_depth_is_refreshed_before_hard_limit() -> None:
@@ -508,6 +554,7 @@ def main() -> int:
         test_stream_warmup_and_class_symbol_mapping,
         test_stale_stream_quote_is_refreshed_from_snapshot,
         test_stale_depth_snapshots_are_refreshed_concurrently,
+        test_stale_depth_snapshots_are_sharded_across_contexts,
         test_near_expiry_depth_is_refreshed_before_hard_limit,
         test_stale_quote_is_rejected_when_snapshot_refresh_fails,
         test_wide_quote_is_rejected,
