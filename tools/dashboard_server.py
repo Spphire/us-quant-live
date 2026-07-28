@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -397,6 +397,49 @@ class DataAggregator:
                 "latest_details": latest_details,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
+
+    def get_execution_timeline(self, run_name: str | None = None) -> dict[str, Any]:
+        """Build a multi-track timeline for one 22:00 execution run."""
+        with self.cache_lock:
+            run_dirs = [
+                path
+                for path in self._iter_run_dirs()
+                if path.name.endswith("_execute")
+                and (path / "decision_phase_timings.json").exists()
+            ]
+            available_runs = []
+            for path in run_dirs:
+                timing = self._read_json_file(path / "decision_phase_timings.json")
+                records = self._read_json_value(path / "execution_records.json", [])
+                available_runs.append(
+                    {
+                        "run_name": path.name,
+                        "session_date": self._run_dir_session_date(path),
+                        "status": str(timing.get("status") or "unknown"),
+                        "elapsed_seconds": self._safe_timeline_float(
+                            timing.get("elapsed_seconds")
+                        ),
+                        "order_count": len(records) if isinstance(records, list) else 0,
+                    }
+                )
+
+            requested = str(run_name or "").strip()
+            selected = next(
+                (path for path in run_dirs if path.name == requested),
+                None,
+            ) if requested else (run_dirs[0] if run_dirs else None)
+            if selected is None:
+                return {
+                    "schema_version": "1.0",
+                    "scope": "execution_only",
+                    "status": "not_found" if requested else "empty",
+                    "message": "Execution timeline run not found." if requested else "No execution run is available.",
+                    "selected_run": requested,
+                    "available_runs": available_runs,
+                    "groups": [],
+                    "tracks": [],
+                }
+            return self._build_execution_timeline(selected, available_runs)
 
     def get_logs(self, lines: int = 100, level: str = "all", source: str = "all") -> dict[str, Any]:
         """Get recent logs with parsed timestamp/level/source."""
@@ -935,6 +978,502 @@ class DataAggregator:
         except Exception:
             return {}
 
+    @staticmethod
+    def _read_json_value(path: Path, default: Any) -> Any:
+        if not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_json_lines(path: Path, max_rows: int | None = None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if not path.exists():
+            return rows
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if max_rows is not None and len(rows) >= max_rows:
+                        break
+                    try:
+                        value = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(value, dict):
+                        rows.append(value)
+        except Exception:
+            return []
+        return rows
+
+    @staticmethod
+    def _safe_timeline_float(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number
+
+    @staticmethod
+    def _parse_timeline_timestamp(value: Any) -> float | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        try:
+            normalized = token[:-1] + "+00:00" if token.endswith("Z") else token
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _partition_timeline_lanes(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        lanes: list[list[dict[str, Any]]] = []
+        lane_ends: list[float] = []
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                float(item.get("start_seconds") or 0.0),
+                float(item.get("end_seconds") or 0.0),
+                str(item.get("id") or ""),
+            ),
+        )
+        for item in ordered:
+            start = float(item.get("start_seconds") or 0.0)
+            end = max(start, float(item.get("end_seconds") or start))
+            lane_index = next(
+                (index for index, lane_end in enumerate(lane_ends) if lane_end <= start + 1e-6),
+                None,
+            )
+            if lane_index is None:
+                lanes.append([item])
+                lane_ends.append(end)
+            else:
+                lanes[lane_index].append(item)
+                lane_ends[lane_index] = end
+        return lanes
+
+    @staticmethod
+    def _timeline_api_operation(method: str, path: str) -> str:
+        method_token = str(method or "GET").upper()
+        path_token = str(path or "").lower().rstrip("/")
+        if "/orders" in path_token:
+            if method_token == "POST":
+                return "Submit order"
+            if method_token == "DELETE":
+                return "Cancel order"
+            return "Poll order" if path_token.count("/") >= 3 else "List orders"
+        if "/positions" in path_token:
+            return "Positions"
+        if "/account/portfolio/history" in path_token:
+            return "Portfolio history"
+        if "/account/configurations" in path_token:
+            return "Account settings"
+        if path_token.endswith("/account"):
+            return "Account"
+        if "/assets" in path_token:
+            return "Assets"
+        if "/calendar" in path_token:
+            return "Calendar"
+        if "/clock" in path_token:
+            return "Market clock"
+        if any(token in path_token for token in ("/bars", "/quotes", "/snapshots", "/trades")):
+            return "Market data"
+        if "corporate-actions" in path_token:
+            return "Corporate actions"
+        return "Other API"
+
+    def _build_execution_timeline(
+        self,
+        run_dir: Path,
+        available_runs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        timing = self._read_json_file(run_dir / "decision_phase_timings.json")
+        records_value = self._read_json_value(run_dir / "execution_records.json", [])
+        records = records_value if isinstance(records_value, list) else []
+        events = self._read_json_lines(run_dir / "run_events.jsonl", max_rows=5000)
+        api_rows = self._read_json_lines(run_dir / "alpaca_api_audit.jsonl", max_rows=50000)
+
+        run_start_epoch = self._parse_timeline_timestamp(timing.get("run_started_at_utc"))
+        if run_start_epoch is None:
+            event_starts = [
+                self._parse_timeline_timestamp(row.get("at_utc"))
+                for row in events
+            ]
+            run_start_epoch = next((value for value in event_starts if value is not None), None)
+        if run_start_epoch is None:
+            return {
+                "schema_version": "1.0",
+                "scope": "execution_only",
+                "status": "invalid",
+                "message": "Execution run has no valid start timestamp.",
+                "selected_run": run_dir.name,
+                "available_runs": available_runs,
+                "groups": [],
+                "tracks": [],
+            }
+
+        total_seconds = max(0.0, self._safe_timeline_float(timing.get("elapsed_seconds")) or 0.0)
+        event_elapsed = [
+            value
+            for value in (
+                self._safe_timeline_float(row.get("run_elapsed_seconds")) for row in events
+            )
+            if value is not None
+        ]
+        if event_elapsed:
+            total_seconds = max(total_seconds, max(event_elapsed))
+
+        phase_items: list[dict[str, Any]] = []
+        trading_phase_start = None
+        trading_phase_end = None
+        phase_colors = {
+            "startup_evidence": "preparation",
+            "broker_preflight_and_lot_sync": "broker",
+            "dynamic_symbol_pool": "optimizer",
+            "sec_industry_map": "optimizer",
+            "alpha_core_build": "optimizer",
+            "portfolio_decision": "optimizer",
+            "market_and_price_evidence": "market_data",
+            "account_sizing_and_projection": "optimizer",
+            "order_submission_and_tracking": "trading",
+            "post_run_audit_and_finalize": "audit",
+        }
+        for index, phase in enumerate(timing.get("phases", [])):
+            if not isinstance(phase, dict):
+                continue
+            start = self._safe_timeline_float(phase.get("run_elapsed_start_seconds"))
+            end = self._safe_timeline_float(phase.get("run_elapsed_end_seconds"))
+            duration = self._safe_timeline_float(phase.get("elapsed_seconds"))
+            if start is None:
+                continue
+            if end is None:
+                end = start + max(0.0, duration or 0.0)
+            if end <= start + 1e-6:
+                continue
+            name = str(phase.get("phase") or f"phase_{index + 1}")
+            if name == "order_submission_and_tracking":
+                trading_phase_start = start
+                trading_phase_end = end
+            phase_items.append(
+                {
+                    "id": f"phase-{index + 1}",
+                    "label": name.replace("_", " ").title(),
+                    "start_seconds": round(max(0.0, start), 6),
+                    "end_seconds": round(max(start, end), 6),
+                    "duration_seconds": round(max(0.0, end - start), 6),
+                    "status": str(phase.get("status") or "unknown"),
+                    "color_key": phase_colors.get(name, "preparation"),
+                    "detail": {
+                        "phase": name,
+                        "share_of_run_pct": self._safe_timeline_float(phase.get("share_of_run_pct")),
+                    },
+                }
+            )
+
+        order_items: list[dict[str, Any]] = []
+        attempt_count = 0
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            batch_epoch = self._parse_timeline_timestamp(record.get("batch_started_at_utc"))
+            wall_seconds = max(
+                0.0,
+                self._safe_timeline_float(record.get("order_wall_time_seconds")) or 0.0,
+            )
+            queue_wait_ms = max(
+                0.0,
+                self._safe_timeline_float(record.get("queue_wait_ms")) or 0.0,
+            )
+            if batch_epoch is None:
+                continue
+            start = max(0.0, batch_epoch - run_start_epoch + queue_wait_ms / 1000.0)
+            end = start + max(wall_seconds, 0.001)
+            status = str(record.get("status_latest") or "unknown")
+            side = str(record.get("side") or "").lower()
+            attempts = record.get("attempts") if isinstance(record.get("attempts"), list) else []
+            attempt_count += len(attempts)
+            children: list[dict[str, Any]] = []
+            for attempt_index, attempt in enumerate(attempts):
+                if not isinstance(attempt, dict):
+                    continue
+                timestamps = [
+                    self._parse_timeline_timestamp(attempt.get("quote_observed_at_utc")),
+                    self._parse_timeline_timestamp(attempt.get("cancel_requested_at_utc")),
+                    self._parse_timeline_timestamp(attempt.get("updated_at")),
+                ]
+                poll_events = attempt.get("poll_events") if isinstance(attempt.get("poll_events"), list) else []
+                timestamps.extend(
+                    self._parse_timeline_timestamp(event.get("at_utc"))
+                    for event in poll_events
+                    if isinstance(event, dict)
+                )
+                relative = sorted(
+                    max(start, min(end, timestamp - run_start_epoch))
+                    for timestamp in timestamps
+                    if timestamp is not None
+                )
+                child_start = relative[0] if relative else start
+                child_end = relative[-1] if relative else end
+                if child_end <= child_start + 1e-6:
+                    child_end = min(end, child_start + 0.05)
+                children.append(
+                    {
+                        "id": f"order-{index + 1}-attempt-{attempt_index + 1}",
+                        "label": f"Attempt {int(attempt.get('attempt_no') or attempt_index + 1)}",
+                        "start_seconds": round(child_start, 6),
+                        "end_seconds": round(max(child_start, child_end), 6),
+                        "duration_seconds": round(max(0.0, child_end - child_start), 6),
+                        "status": str(attempt.get("status_latest") or status),
+                        "detail": {
+                            "attempt_no": int(attempt.get("attempt_no") or attempt_index + 1),
+                            "quote_age_ms": self._safe_timeline_float(attempt.get("quote_age_ms")),
+                            "offset_bps": self._safe_timeline_float(attempt.get("offset_bps")),
+                            "spread_bps": self._safe_timeline_float(attempt.get("live_spread_bps")),
+                            "poll_event_count": len(poll_events),
+                            "reference_price_source": str(attempt.get("reference_price_source") or ""),
+                        },
+                    }
+                )
+            order_items.append(
+                {
+                    "id": f"order-{index + 1}",
+                    "label": str(record.get("symbol") or f"Order {index + 1}"),
+                    "start_seconds": round(start, 6),
+                    "end_seconds": round(end, 6),
+                    "duration_seconds": round(max(0.0, end - start), 6),
+                    "status": status,
+                    "color_key": "buy" if side == "buy" else "sell",
+                    "detail": {
+                        "symbol": str(record.get("symbol") or ""),
+                        "side": side,
+                        "qty": self._safe_timeline_float(record.get("qty")),
+                        "stage": str(record.get("stage") or ""),
+                        "status": status,
+                        "queue_wait_ms": round(queue_wait_ms, 3),
+                        "attempt_count": len(attempts),
+                        "batch_wave_index": record.get("batch_wave_index"),
+                        "batch_effective_workers": record.get("batch_effective_workers"),
+                    },
+                    "children": children,
+                }
+            )
+
+        order_lanes = self._partition_timeline_lanes(order_items)
+        stage_items: list[dict[str, Any]] = []
+        if order_items:
+            by_stage: dict[str, list[dict[str, Any]]] = {}
+            for item in order_items:
+                stage = str(item.get("detail", {}).get("stage") or "orders")
+                by_stage.setdefault(stage, []).append(item)
+            stage_rows = sorted(
+                by_stage.items(),
+                key=lambda pair: min(float(item["start_seconds"]) for item in pair[1]),
+            )
+            first_order_start = min(float(item["start_seconds"]) for item in order_items)
+            last_order_end = max(float(item["end_seconds"]) for item in order_items)
+            if trading_phase_start is not None and first_order_start > trading_phase_start + 0.05:
+                stage_items.append(
+                    {
+                        "id": "stage-prepare",
+                        "label": "Prepare submission",
+                        "start_seconds": round(trading_phase_start, 6),
+                        "end_seconds": round(first_order_start, 6),
+                        "duration_seconds": round(first_order_start - trading_phase_start, 6),
+                        "status": "completed",
+                        "color_key": "preparation",
+                        "detail": {"stage": "prepare_submission"},
+                    }
+                )
+            previous_end = first_order_start
+            for stage_index, (stage, items) in enumerate(stage_rows):
+                start = min(float(item["start_seconds"]) for item in items)
+                end = max(float(item["end_seconds"]) for item in items)
+                if start > previous_end + 0.05:
+                    stage_items.append(
+                        {
+                            "id": f"stage-gap-{stage_index + 1}",
+                            "label": "Reconcile / reproject",
+                            "start_seconds": round(previous_end, 6),
+                            "end_seconds": round(start, 6),
+                            "duration_seconds": round(start - previous_end, 6),
+                            "status": "completed",
+                            "color_key": "reconcile",
+                            "detail": {"stage": "inter_stage_gap"},
+                        }
+                    )
+                stage_items.append(
+                    {
+                        "id": f"stage-{stage_index + 1}",
+                        "label": stage.replace("_", " ").title(),
+                        "start_seconds": round(start, 6),
+                        "end_seconds": round(end, 6),
+                        "duration_seconds": round(end - start, 6),
+                        "status": "completed",
+                        "color_key": "repair" if "repair" in stage else "trading",
+                        "detail": {"stage": stage, "order_count": len(items)},
+                    }
+                )
+                previous_end = max(previous_end, end)
+            if trading_phase_end is not None and trading_phase_end > last_order_end + 0.05:
+                stage_items.append(
+                    {
+                        "id": "stage-finalize",
+                        "label": "Finalize trading",
+                        "start_seconds": round(last_order_end, 6),
+                        "end_seconds": round(trading_phase_end, 6),
+                        "duration_seconds": round(trading_phase_end - last_order_end, 6),
+                        "status": "completed",
+                        "color_key": "reconcile",
+                        "detail": {"stage": "finalize_trading"},
+                    }
+                )
+
+        milestone_items: list[dict[str, Any]] = []
+        for index, event in enumerate(events):
+            elapsed = self._safe_timeline_float(event.get("run_elapsed_seconds"))
+            if elapsed is None:
+                event_epoch = self._parse_timeline_timestamp(event.get("at_utc"))
+                elapsed = event_epoch - run_start_epoch if event_epoch is not None else None
+            if elapsed is None or elapsed < -0.5 or elapsed > total_seconds + 5.0:
+                continue
+            name = str(event.get("name") or f"Event {index + 1}")
+            milestone_items.append(
+                {
+                    "id": f"milestone-{index + 1}",
+                    "label": name.replace("_", " ").title(),
+                    "start_seconds": round(max(0.0, elapsed), 6),
+                    "end_seconds": round(max(0.0, elapsed), 6),
+                    "duration_seconds": 0.0,
+                    "status": "completed",
+                    "color_key": "milestone",
+                    "detail": {"event": name, "sequence": event.get("seq")},
+                }
+            )
+
+        api_items: list[dict[str, Any]] = []
+        api_window_end = run_start_epoch + total_seconds + 5.0
+        for index, row in enumerate(api_rows):
+            started_epoch = self._parse_timeline_timestamp(row.get("started_at_utc"))
+            elapsed_ms = max(0.0, self._safe_timeline_float(row.get("elapsed_ms")) or 0.0)
+            if started_epoch is None or started_epoch < run_start_epoch - 0.5 or started_epoch > api_window_end:
+                continue
+            start = max(0.0, started_epoch - run_start_epoch)
+            end = start + max(elapsed_ms / 1000.0, 0.001)
+            parsed_path = urlparse(str(row.get("url") or "")).path
+            operation = self._timeline_api_operation(str(row.get("method") or "GET"), parsed_path)
+            ok = bool(row.get("ok"))
+            api_items.append(
+                {
+                    "id": f"api-{index + 1}",
+                    "label": operation,
+                    "start_seconds": round(start, 6),
+                    "end_seconds": round(end, 6),
+                    "duration_seconds": round(max(0.0, end - start), 6),
+                    "status": "success" if ok else "failed",
+                    "color_key": "api" if ok else "failure",
+                    "detail": {
+                        "operation": operation,
+                        "method": str(row.get("method") or "GET").upper(),
+                        "elapsed_ms": round(elapsed_ms, 3),
+                        "ok": ok,
+                        "status_code": row.get("status_code"),
+                        "sequence": row.get("seq"),
+                    },
+                }
+            )
+        api_lanes = self._partition_timeline_lanes(api_items)
+        if api_items:
+            total_seconds = max(
+                total_seconds,
+                max(float(item["end_seconds"]) for item in api_items),
+            )
+
+        tracks: list[dict[str, Any]] = [
+            {
+                "id": "pipeline",
+                "group": "pipeline",
+                "label": "Pipeline",
+                "kind": "phase",
+                "items": phase_items,
+            },
+            {
+                "id": "execution-stages",
+                "group": "pipeline",
+                "label": "Execution stages",
+                "kind": "stage",
+                "items": stage_items,
+            },
+            {
+                "id": "milestones",
+                "group": "milestones",
+                "label": "Milestones",
+                "kind": "milestone",
+                "items": milestone_items,
+            },
+        ]
+        tracks.extend(
+            {
+                "id": f"order-lane-{index + 1}",
+                "group": "orders",
+                "label": f"Order lane {index + 1}",
+                "kind": "order",
+                "items": lane,
+            }
+            for index, lane in enumerate(order_lanes)
+        )
+        tracks.extend(
+            {
+                "id": f"api-lane-{index + 1}",
+                "group": "api",
+                "label": f"API lane {index + 1}",
+                "kind": "api",
+                "items": lane,
+            }
+            for index, lane in enumerate(api_lanes)
+        )
+        groups = [
+            {"id": "pipeline", "label": "Execution pipeline"},
+            {"id": "milestones", "label": "Milestones"},
+            {"id": "orders", "label": "Parallel orders"},
+            {"id": "api", "label": "Broker API calls"},
+        ]
+        trading_complete_seconds = trading_phase_end
+        if trading_complete_seconds is None and order_items:
+            trading_complete_seconds = max(float(item["end_seconds"]) for item in order_items)
+        ended_at = datetime.fromtimestamp(run_start_epoch + total_seconds, tz=timezone.utc).isoformat()
+        return {
+            "schema_version": "1.0",
+            "scope": "execution_only",
+            "status": "pass",
+            "selected_run": run_dir.name,
+            "available_runs": available_runs,
+            "run": {
+                "run_name": run_dir.name,
+                "session_date": self._run_dir_session_date(run_dir),
+                "started_at_utc": datetime.fromtimestamp(run_start_epoch, tz=timezone.utc).isoformat(),
+                "ended_at_utc": ended_at,
+                "elapsed_seconds": round(total_seconds, 6),
+                "status": str(timing.get("status") or "unknown"),
+            },
+            "summary": {
+                "total_process_seconds": round(total_seconds, 6),
+                "trading_complete_seconds": round(trading_complete_seconds, 6) if trading_complete_seconds is not None else None,
+                "order_count": len(order_items),
+                "attempt_count": attempt_count,
+                "max_order_concurrency": len(order_lanes),
+                "api_call_count": len(api_items),
+                "max_api_concurrency": len(api_lanes),
+            },
+            "groups": groups,
+            "tracks": tracks,
+        }
+
     def _read_audit_rollup(self) -> dict[str, Any]:
         """Read audit_rollup.json if available."""
         return self._read_json_file(self.artifacts_root / "audit_rollup.json")
@@ -1173,6 +1712,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(self.aggregator.get_history(limit))
         elif path == "/api/audit":
             self._send_json(self.aggregator.get_audit())
+        elif path == "/api/execution-timeline":
+            run_name = query.get("run", [None])[0]
+            self._send_json(self.aggregator.get_execution_timeline(run_name))
         elif path == "/api/logs":
             lines = int(query.get("lines", ["100"])[0])
             level = query.get("level", ["all"])[0]

@@ -452,6 +452,156 @@
         .scroll-style::-webkit-scrollbar-track { background: #0a0e27; }
         .scroll-style::-webkit-scrollbar-thumb { background: #1e2a4a; border-radius: 4px; }
         .scroll-style::-webkit-scrollbar-thumb:hover { background: #2a3658; }
+        .execution-toolbar {
+            display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+        .execution-toolbar label {
+            display: inline-flex; align-items: center; gap: 0.45rem;
+            color: #a8b0c3; font-size: 0.8rem; white-space: nowrap;
+        }
+        .execution-toolbar select {
+            min-width: 180px; padding: 0.45rem 0.65rem;
+            background: #0f1428; color: #e4e8f0;
+            border: 1px solid #2a3658; border-radius: 5px;
+            font-family: inherit; font-size: 0.82rem;
+        }
+        .execution-toolbar input[type="range"] { width: 126px; accent-color: #60a5fa; }
+        .execution-toolbar input[type="checkbox"] { accent-color: #60a5fa; }
+        .execution-toolbar-spacer { flex: 1 1 1rem; }
+        .execution-summary {
+            display: grid; grid-template-columns: repeat(6, minmax(100px, 1fr));
+            border-top: 1px solid #26314f; border-bottom: 1px solid #26314f;
+            margin-bottom: 1rem; background: rgba(7, 11, 27, 0.42);
+        }
+        .execution-summary-item { padding: 0.75rem 0.9rem; border-right: 1px solid #26314f; min-width: 0; }
+        .execution-summary-item:last-child { border-right: none; }
+        .execution-summary-label {
+            color: #7f899f; font-size: 0.68rem; text-transform: uppercase;
+            letter-spacing: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .execution-summary-value {
+            color: #f4f7fb; font-size: 1.02rem; font-weight: 650;
+            line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .execution-timeline-shell {
+            position: relative; border: 1px solid #26314f; border-radius: 6px;
+            overflow: hidden; background: #090d1d;
+        }
+        .execution-timeline-scroll { overflow: auto; max-height: 650px; }
+        .execution-timeline-grid { min-width: 100%; }
+        .execution-ruler-row, .execution-track-row, .execution-group-row {
+            display: grid; grid-template-columns: var(--timeline-label-width) var(--timeline-width);
+            min-width: calc(var(--timeline-label-width) + var(--timeline-width));
+        }
+        .execution-ruler-row { position: sticky; top: 0; z-index: 20; height: 34px; }
+        .execution-ruler-label, .execution-track-label, .execution-group-label {
+            position: sticky; left: 0; z-index: 12;
+            border-right: 1px solid #2a3658; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .execution-ruler-label {
+            z-index: 24; background: #11162a; color: #7f899f;
+            padding: 7px 10px; font-size: 0.7rem; font-variant-numeric: tabular-nums;
+        }
+        .execution-ruler-track { position: relative; background: #11162a; border-bottom: 1px solid #2a3658; }
+        .execution-ruler-tick {
+            position: absolute; top: 0; bottom: 0; border-left: 1px solid #394460;
+            color: #8993a9; font-size: 0.66rem; padding: 7px 0 0 5px;
+            font-variant-numeric: tabular-nums; pointer-events: none;
+        }
+        .execution-group-row { height: 25px; }
+        .execution-group-label, .execution-group-track {
+            background: #101527; border-bottom: 1px solid #222c47;
+            color: #8791a7; font-size: 0.66rem; font-weight: 650;
+            text-transform: uppercase; letter-spacing: 0;
+        }
+        .execution-group-label { padding: 4px 10px; }
+        .execution-track-row { height: 34px; }
+        .execution-track-label {
+            background: #0e1325; border-bottom: 1px solid #1d263e;
+            color: #aab3c6; padding: 7px 10px; font-size: 0.72rem;
+        }
+        .execution-track-lane {
+            position: relative; height: 34px; border-bottom: 1px solid #1d263e;
+            background-color: #090d1d;
+            background-image: linear-gradient(to right, rgba(69, 82, 112, 0.24) 1px, transparent 1px);
+            background-size: var(--timeline-tick-width) 100%;
+        }
+        .execution-bar {
+            position: absolute; top: 5px; height: 23px; min-width: 3px;
+            border-radius: 3px; padding: 2px 6px; overflow: hidden;
+            color: #f6f8fc; font-size: 0.68rem; line-height: 19px;
+            white-space: nowrap; text-overflow: ellipsis; cursor: pointer;
+            border: 1px solid rgba(255,255,255,0.16);
+        }
+        .execution-bar:hover, .execution-bar.selected { outline: 2px solid rgba(255,255,255,0.72); z-index: 5; }
+        .execution-bar.compact { padding-left: 0; padding-right: 0; }
+        .execution-bar.preparation { background: #3269a8; }
+        .execution-bar.broker { background: #64748b; }
+        .execution-bar.market_data { background: #087f8c; }
+        .execution-bar.optimizer { background: #a76b18; }
+        .execution-bar.trading { background: #16805d; }
+        .execution-bar.audit { background: #665b8e; }
+        .execution-bar.reconcile { background: #596579; }
+        .execution-bar.repair { background: #b07519; }
+        .execution-bar.buy { background: #087f78; }
+        .execution-bar.sell { background: #b6544b; }
+        .execution-bar.api { background: #52617d; }
+        .execution-bar.failure { background: #b33642; }
+        .execution-bar.kind-api { min-width: 0.5px; padding-left: 0; padding-right: 0; border-left-width: 0; border-right-width: 0; }
+        .execution-attempt {
+            position: absolute; bottom: 1px; height: 4px; min-width: 2px;
+            background: rgba(255,255,255,0.76); border-radius: 1px; cursor: pointer;
+        }
+        .execution-milestone {
+            position: absolute; top: 3px; bottom: 3px; width: 2px;
+            background: #e1b955; cursor: pointer; z-index: 3;
+        }
+        .execution-milestone::before {
+            content: ''; position: absolute; top: 0; left: -3px; width: 8px; height: 8px;
+            background: #e1b955; transform: rotate(45deg); border: 1px solid #fff0b5;
+        }
+        .execution-timeline-tooltip {
+            display: none; position: fixed; z-index: 1000; max-width: min(340px, calc(100vw - 24px));
+            padding: 0.65rem 0.75rem; background: #151b30; border: 1px solid #3b496d;
+            border-radius: 5px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+            color: #dce2ed; font-size: 0.75rem; pointer-events: none;
+        }
+        .execution-timeline-tooltip.show { display: block; }
+        .execution-tooltip-title { color: #fff; font-weight: 650; margin-bottom: 0.3rem; }
+        .execution-tooltip-row { display: flex; justify-content: space-between; gap: 1rem; }
+        .execution-tooltip-key { color: #8993a9; }
+        .execution-detail-panel {
+            display: none; margin-top: 1rem; border-top: 1px solid #2a3658;
+            padding-top: 1rem;
+        }
+        .execution-detail-panel.show { display: block; }
+        .execution-detail-title { color: #fff; font-weight: 650; margin-bottom: 0.65rem; }
+        .execution-detail-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+            border: 1px solid #26314f; border-radius: 5px; overflow: hidden;
+        }
+        .execution-detail-cell { padding: 0.6rem 0.75rem; border-right: 1px solid #26314f; border-bottom: 1px solid #26314f; min-width: 0; }
+        .execution-detail-key { color: #7f899f; font-size: 0.68rem; }
+        .execution-detail-value { color: #e4e8f0; font-size: 0.78rem; overflow-wrap: anywhere; }
+        @media (max-width: 760px) {
+            #execution-timeline .panel { padding: 0.85rem; }
+            .execution-summary { grid-template-columns: repeat(3, minmax(82px, 1fr)); }
+            .execution-summary-item { padding: 0.65rem 0.6rem; }
+            .execution-summary-value { font-size: 0.95rem; }
+            .execution-summary-item:nth-child(3) { border-right: none; }
+            .execution-summary-item:nth-child(-n+3) { border-bottom: 1px solid #26314f; }
+            .execution-summary-label {
+                white-space: normal; line-height: 1.2; min-height: 2.4em; font-size: 0.65rem;
+                display: flex; align-items: flex-end;
+            }
+            .execution-toolbar { align-items: flex-start; }
+            .execution-toolbar-spacer { display: none; }
+            .execution-toolbar select { min-width: 150px; max-width: 190px; }
+            .execution-timeline-scroll { max-height: 560px; }
+            .execution-track-label, .execution-group-label, .execution-ruler-label { padding-left: 7px; padding-right: 7px; }
+        }
     </style>
 </head>
 <body>
@@ -471,6 +621,7 @@
             <button class="tab" data-tab="positions">Positions</button>
             <button class="tab" data-tab="lots">Factor Lots</button>
             <button class="tab" data-tab="history">History</button>
+            <button class="tab" data-tab="execution-timeline">Execution Timeline</button>
             <button class="tab" data-tab="logs">Logs</button>
             <button class="tab" data-tab="settings">Settings</button>
         </div>
@@ -478,6 +629,7 @@
         <div id="positions" class="tab-content"></div>
         <div id="lots" class="tab-content"></div>
         <div id="history" class="tab-content"></div>
+        <div id="execution-timeline" class="tab-content"></div>
         <div id="logs" class="tab-content"></div>
         <div id="settings" class="tab-content"></div>
     </div>
@@ -504,6 +656,7 @@
                 tabPositions: 'Positions',
                 tabLots: 'Factor Lots',
                 tabHistory: 'History',
+                tabExecutionTimeline: 'Execution Timeline',
                 tabLogs: 'Logs',
                 tabSettings: 'Settings',
 
@@ -585,6 +738,24 @@
                 noHistory: 'No execution history yet',
                 modalTitleExecution: 'Execution Details',
 
+                // Execution timeline
+                executionTimelineTitle: 'Execution Stage Timeline',
+                executionRun: 'Run',
+                executionZoom: 'Zoom',
+                executionFit: 'Fit',
+                executionOrders: 'Orders',
+                executionApi: 'API',
+                executionMilestones: 'Milestones',
+                executionTotal: 'Process total',
+                executionTradingComplete: 'Trading complete',
+                executionOrderCount: 'Orders',
+                executionAttemptCount: 'Attempts',
+                executionOrderConcurrency: 'Order concurrency',
+                executionApiCalls: 'API calls',
+                executionTimeAxis: 'Elapsed',
+                executionNoRuns: 'No execution timeline is available',
+                executionLoadFailed: 'Failed to load execution timeline',
+
                 // Logs
                 filterLevel: 'Level:',
                 levelAll: 'All',
@@ -641,6 +812,7 @@
                 tabPositions: '持仓',
                 tabLots: '因子组合',
                 tabHistory: '历史记录',
+                tabExecutionTimeline: '执行时间轴',
                 tabLogs: '日志',
                 tabSettings: '设置',
 
@@ -722,6 +894,24 @@
                 noHistory: '暂无执行历史',
                 modalTitleExecution: '执行详情',
 
+                // Execution timeline
+                executionTimelineTitle: '执行阶段时间轴',
+                executionRun: '执行日期',
+                executionZoom: '缩放',
+                executionFit: '适应宽度',
+                executionOrders: '订单',
+                executionApi: 'API',
+                executionMilestones: '里程碑',
+                executionTotal: '进程总耗时',
+                executionTradingComplete: '交易完成',
+                executionOrderCount: '订单数',
+                executionAttemptCount: '尝试次数',
+                executionOrderConcurrency: '订单并发峰值',
+                executionApiCalls: 'API 调用数',
+                executionTimeAxis: '相对时间',
+                executionNoRuns: '暂无可用的执行时间轴',
+                executionLoadFailed: '执行时间轴加载失败',
+
                 // Logs
                 filterLevel: '级别：',
                 levelAll: '全部',
@@ -788,7 +978,7 @@
 
             // Update tabs
             document.querySelectorAll('.tab').forEach((tab, i) => {
-                const keys = ['tabOverview', 'tabPositions', 'tabLots', 'tabHistory', 'tabLogs', 'tabSettings'];
+                const keys = ['tabOverview', 'tabPositions', 'tabLots', 'tabHistory', 'tabExecutionTimeline', 'tabLogs', 'tabSettings'];
                 tab.textContent = t(keys[i]);
             });
 
@@ -810,6 +1000,17 @@
         let sseConnection = null;
         let lastUpdateTime = Date.now();
         let positionSortState = { key: 'market_value', direction: 'desc' };
+        let executionTimelineState = {
+            data: null,
+            selectedRun: '',
+            pixelsPerSecond: 6,
+            showOrders: true,
+            showApi: true,
+            showMilestones: true,
+            selectedItemId: '',
+            fittedRun: '',
+            itemMap: new Map(),
+        };
 
         async function fetchJSON(endpoint) {
             const resp = await fetch(`/api/${endpoint}`);
@@ -1252,6 +1453,7 @@
             else if (tab === 'positions') loadPositions();
             else if (tab === 'lots') loadLots();
             else if (tab === 'history') loadHistory();
+            else if (tab === 'execution-timeline') loadExecutionTimeline();
             else if (tab === 'logs') loadLogs();
             else if (tab === 'settings') loadSettings();
         }
@@ -2293,6 +2495,314 @@
             showModal(`${t('modalTitleExecution')}: ${runDir}`, body);
         }
 
+                // === EXECUTION TIMELINE TAB ===
+        function formatTimelineSeconds(value, precise = false) {
+            const seconds = Number(value);
+            if (!Number.isFinite(seconds)) return 'n/a';
+            if (precise && seconds < 1) return `${(seconds * 1000).toFixed(1)} ms`;
+            if (seconds < 60) return `${seconds.toFixed(precise ? 3 : 1)}s`;
+            const minutes = Math.floor(seconds / 60);
+            const remainder = seconds - minutes * 60;
+            return `${minutes}m ${remainder.toFixed(1)}s`;
+        }
+
+        function executionTimelineName(value) {
+            const token = String(value || '');
+            if (currentLang !== 'zh') return token;
+            const names = {
+                'Execution pipeline': '执行流水线',
+                'Milestones': '里程碑',
+                'Parallel orders': '并行订单',
+                'Broker API calls': '券商 API 调用',
+                'Pipeline': '全流程',
+                'Execution stages': '执行子阶段',
+                'Startup Evidence': '启动证据',
+                'Broker Preflight And Lot Sync': '券商预检与批次同步',
+                'Portfolio Decision': '加载组合决策',
+                'Market And Price Evidence': '市场与价格证据',
+                'Account Sizing And Projection': '账户定容与仓位优化',
+                'Order Submission And Tracking': '下单与跟踪',
+                'Post Run Audit And Finalize': '执行后审计与收尾',
+                'Prepare submission': '下单准备',
+                'Reconcile / reproject': '对账与重新投影',
+                'Finalize trading': '交易收尾',
+                'Release Sell Long': '卖出多头减仓',
+                'Release Buy To Cover': '买入平空减仓',
+                'Entry': '加仓入场',
+                'Entry Repair': '入场修补',
+                'Submit order': '提交订单',
+                'Cancel order': '取消订单',
+                'Poll order': '查询订单',
+                'List orders': '订单列表',
+                'Positions': '持仓查询',
+                'Portfolio history': '账户历史',
+                'Account settings': '账户设置',
+                'Account': '账户查询',
+                'Assets': '标的查询',
+                'Calendar': '交易日历',
+                'Market clock': '市场时钟',
+                'Market data': '市场数据',
+                'Corporate actions': '公司行动',
+                'Other API': '其他 API',
+            };
+            if (names[token]) return names[token];
+            const orderLane = token.match(/^Order lane (\d+)$/);
+            if (orderLane) return `订单轨道 ${orderLane[1]}`;
+            const apiLane = token.match(/^API lane (\d+)$/);
+            if (apiLane) return `API 轨道 ${apiLane[1]}`;
+            const attempt = token.match(/^Attempt (\d+)$/);
+            if (attempt) return `第 ${attempt[1]} 次尝试`;
+            return token;
+        }
+
+        function executionDetailKey(value) {
+            const token = String(value || '').replaceAll('_', ' ');
+            if (currentLang !== 'zh') return token.replace(/\b\w/g, ch => ch.toUpperCase());
+            return ({
+                'start': '开始', 'end': '结束', 'duration': '耗时', 'status': '状态',
+                'symbol': '标的', 'side': '方向', 'qty': '数量', 'stage': '阶段',
+                'queue wait ms': '排队等待', 'attempt count': '尝试次数',
+                'batch wave index': '批次波次', 'batch effective workers': '批次并发数',
+                'attempt no': '尝试序号', 'quote age ms': '报价延迟', 'offset bps': '限价偏移',
+                'spread bps': '买卖价差', 'poll event count': '轮询次数',
+                'reference price source': '参考价来源', 'operation': '操作', 'method': '方法',
+                'elapsed ms': '调用耗时', 'ok': '成功', 'status code': '状态码',
+                'sequence': '序号', 'phase': '流程阶段', 'share of run pct': '总耗时占比',
+                'order count': '订单数', 'event': '事件',
+            }[token] || token);
+        }
+
+        function executionDetailValue(key, value) {
+            if (value === null || value === undefined || value === '') return 'n/a';
+            if (typeof value === 'boolean') return value ? t('yes') : t('no');
+            const numeric = Number(value);
+            if (Number.isFinite(numeric)) {
+                if (String(key).endsWith('_ms')) return `${numeric.toFixed(3)} ms`;
+                if (String(key).endsWith('_bps')) return `${numeric.toFixed(3)} bps`;
+                if (String(key).endsWith('_pct')) return `${numeric.toFixed(3)}%`;
+                return Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+            }
+            return executionTimelineName(String(value));
+        }
+
+        async function loadExecutionTimeline(runName = null) {
+            const container = document.getElementById('execution-timeline');
+            try {
+                const requested = runName || executionTimelineState.selectedRun;
+                const endpoint = requested
+                    ? `execution-timeline?run=${encodeURIComponent(requested)}`
+                    : 'execution-timeline';
+                const data = await fetchJSON(endpoint);
+                executionTimelineState.data = data;
+                executionTimelineState.selectedRun = data.selected_run || '';
+                executionTimelineState.selectedItemId = '';
+                if (data.status === 'pass' && executionTimelineState.fittedRun !== data.selected_run) {
+                    const total = Math.max(1, Number(data.run?.elapsed_seconds || 0));
+                    const labelWidth = window.innerWidth <= 760 ? 112 : 164;
+                    const panelPadding = window.innerWidth <= 760 ? 28 : 48;
+                    const availableWidth = Math.max(320, (container.clientWidth || window.innerWidth) - panelPadding);
+                    const minimumTimelineScale = 520 / total;
+                    executionTimelineState.pixelsPerSecond = Math.max(0.75, minimumTimelineScale, Math.min(18, (availableWidth - labelWidth - 30) / total));
+                    executionTimelineState.fittedRun = data.selected_run;
+                }
+                renderExecutionTimeline();
+                updateLastUpdate();
+            } catch (err) {
+                console.error('Failed to load execution timeline:', err);
+                container.innerHTML = `<div class="empty-state"><div>${t('executionLoadFailed')}</div></div>`;
+            }
+        }
+
+        function executionTimelineTickStep(pixelsPerSecond) {
+            return [1, 2, 5, 10, 15, 30, 60, 120, 300, 600].find(step => step * pixelsPerSecond >= 76) || 900;
+        }
+
+        function visibleExecutionTracks(data) {
+            return (data.tracks || []).filter(track => {
+                if (track.kind === 'order') return executionTimelineState.showOrders;
+                if (track.kind === 'api') return executionTimelineState.showApi;
+                if (track.kind === 'milestone') return executionTimelineState.showMilestones;
+                return true;
+            });
+        }
+
+        function executionBarHTML(item, track, pixelsPerSecond) {
+            const start = Number(item.start_seconds) || 0;
+            const end = Number(item.end_seconds) || start;
+            const left = start * pixelsPerSecond;
+            if (track.kind === 'milestone') {
+                executionTimelineState.itemMap.set(item.id, {item, track});
+                return `<div class="execution-milestone" data-timeline-item="${escapeHTML(item.id)}" style="left:${left.toFixed(2)}px"></div>`;
+            }
+            const width = Math.max(track.kind === 'api' ? 0.5 : 3, (end - start) * pixelsPerSecond);
+            executionTimelineState.itemMap.set(item.id, {item, track});
+            const children = (item.children || []).map(child => {
+                executionTimelineState.itemMap.set(child.id, {item: child, track: {...track, kind: 'attempt'}});
+                const childLeft = Math.max(0, (Number(child.start_seconds) - start) * pixelsPerSecond);
+                const childWidth = Math.max(2, (Number(child.end_seconds) - Number(child.start_seconds)) * pixelsPerSecond);
+                return `<span class="execution-attempt" data-timeline-item="${escapeHTML(child.id)}" style="left:${childLeft.toFixed(2)}px;width:${childWidth.toFixed(2)}px"></span>`;
+            }).join('');
+            const labelThreshold = track.kind === 'api' ? 36 : 14;
+            const visibleLabel = width >= labelThreshold
+                ? `<span>${escapeHTML(executionTimelineName(item.label))}</span>`
+                : '';
+            const compactClass = visibleLabel ? '' : ' compact';
+            return `<div class="execution-bar kind-${escapeHTML(track.kind || 'segment')} ${escapeHTML(item.color_key || 'preparation')}${compactClass}" data-timeline-item="${escapeHTML(item.id)}" style="left:${left.toFixed(2)}px;width:${width.toFixed(2)}px">${visibleLabel}${children}</div>`;
+        }
+
+        function renderExecutionTimeline() {
+            const data = executionTimelineState.data || {};
+            const container = document.getElementById('execution-timeline');
+            if (data.status !== 'pass' || !(data.tracks || []).length) {
+                container.innerHTML = `<div class="empty-state"><div>${t('executionNoRuns')}</div></div>`;
+                return;
+            }
+            executionTimelineState.itemMap = new Map();
+            const total = Math.max(1, Number(data.run?.elapsed_seconds || data.summary?.total_process_seconds || 0));
+            const pixelsPerSecond = Math.max(0.75, Number(executionTimelineState.pixelsPerSecond) || 6);
+            const timelineWidth = Math.max(520, Math.ceil(total * pixelsPerSecond) + 2);
+            const tickStep = executionTimelineTickStep(pixelsPerSecond);
+            const tickWidth = tickStep * pixelsPerSecond;
+            const labelWidth = window.innerWidth <= 760 ? 112 : 164;
+            const ticks = [];
+            for (let second = 0; second <= total + 1e-6; second += tickStep) {
+                ticks.push(`<div class="execution-ruler-tick" style="left:${(second * pixelsPerSecond).toFixed(2)}px">${formatTimelineSeconds(second)}</div>`);
+            }
+            const tracks = visibleExecutionTracks(data);
+            const groups = data.groups || [];
+            const rows = [];
+            groups.forEach(group => {
+                const groupTracks = tracks.filter(track => track.group === group.id);
+                if (!groupTracks.length) return;
+                rows.push(`<div class="execution-group-row"><div class="execution-group-label">${escapeHTML(executionTimelineName(group.label))}</div><div class="execution-group-track"></div></div>`);
+                groupTracks.forEach(track => {
+                    const bars = (track.items || []).map(item => executionBarHTML(item, track, pixelsPerSecond)).join('');
+                    rows.push(`<div class="execution-track-row"><div class="execution-track-label" title="${escapeHTML(executionTimelineName(track.label))}">${escapeHTML(executionTimelineName(track.label))}</div><div class="execution-track-lane">${bars}</div></div>`);
+                });
+            });
+            const runs = (data.available_runs || []).map(run => {
+                const selected = run.run_name === data.selected_run ? ' selected' : '';
+                return `<option value="${escapeHTML(run.run_name)}"${selected}>${escapeHTML(run.session_date || run.run_name)} · ${escapeHTML(run.status || '')}</option>`;
+            }).join('');
+            const summary = data.summary || {};
+            const summaryItems = [
+                [t('executionTotal'), formatTimelineSeconds(summary.total_process_seconds)],
+                [t('executionTradingComplete'), formatTimelineSeconds(summary.trading_complete_seconds)],
+                [t('executionOrderCount'), formatNumber(summary.order_count || 0)],
+                [t('executionAttemptCount'), formatNumber(summary.attempt_count || 0)],
+                [t('executionOrderConcurrency'), formatNumber(summary.max_order_concurrency || 0)],
+                [t('executionApiCalls'), formatNumber(summary.api_call_count || 0)],
+            ];
+            container.innerHTML = `
+                <div class="panel">
+                    <div class="panel-title">${t('executionTimelineTitle')}</div>
+                    <div class="execution-toolbar">
+                        <label>${t('executionRun')} <select onchange="loadExecutionTimeline(this.value)">${runs}</select></label>
+                        <label>${t('executionZoom')} <input type="range" min="0.75" max="18" step="0.25" value="${pixelsPerSecond}" oninput="setExecutionTimelineZoom(this.value)"></label>
+                        <button class="btn secondary" onclick="fitExecutionTimeline()">${t('executionFit')}</button>
+                        <span class="execution-toolbar-spacer"></span>
+                        <label><input type="checkbox" ${executionTimelineState.showOrders ? 'checked' : ''} onchange="toggleExecutionTimelineTrack('orders', this.checked)"> ${t('executionOrders')}</label>
+                        <label><input type="checkbox" ${executionTimelineState.showApi ? 'checked' : ''} onchange="toggleExecutionTimelineTrack('api', this.checked)"> ${t('executionApi')}</label>
+                        <label><input type="checkbox" ${executionTimelineState.showMilestones ? 'checked' : ''} onchange="toggleExecutionTimelineTrack('milestones', this.checked)"> ${t('executionMilestones')}</label>
+                    </div>
+                    <div class="execution-summary">${summaryItems.map(([label, value]) => `<div class="execution-summary-item"><div class="execution-summary-label">${escapeHTML(label)}</div><div class="execution-summary-value">${escapeHTML(value)}</div></div>`).join('')}</div>
+                    <div class="execution-timeline-shell">
+                        <div class="execution-timeline-scroll scroll-style">
+                            <div class="execution-timeline-grid" style="--timeline-label-width:${labelWidth}px;--timeline-width:${timelineWidth}px;--timeline-tick-width:${tickWidth}px">
+                                <div class="execution-ruler-row"><div class="execution-ruler-label">${t('executionTimeAxis')} · ${escapeHTML(data.run?.session_date || '')}</div><div class="execution-ruler-track">${ticks.join('')}</div></div>
+                                ${rows.join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="execution-detail-panel" id="executionDetailPanel"></div>
+                </div>
+                <div class="execution-timeline-tooltip" id="executionTimelineTooltip"></div>
+            `;
+            wireExecutionTimelineInteractions();
+        }
+
+        function setExecutionTimelineZoom(value) {
+            executionTimelineState.pixelsPerSecond = Math.max(0.75, Math.min(18, Number(value) || 6));
+            executionTimelineState.fittedRun = executionTimelineState.selectedRun;
+            renderExecutionTimeline();
+        }
+
+        function fitExecutionTimeline() {
+            const scroll = document.querySelector('.execution-timeline-scroll');
+            const total = Number(executionTimelineState.data?.run?.elapsed_seconds || 1);
+            if (!scroll || total <= 0) return;
+            const labelWidth = window.innerWidth <= 760 ? 112 : 164;
+            executionTimelineState.pixelsPerSecond = Math.max(0.75, Math.min(18, (scroll.clientWidth - labelWidth - 10) / total));
+            executionTimelineState.fittedRun = executionTimelineState.selectedRun;
+            renderExecutionTimeline();
+        }
+
+        function toggleExecutionTimelineTrack(group, visible) {
+            if (group === 'orders') executionTimelineState.showOrders = visible;
+            else if (group === 'api') executionTimelineState.showApi = visible;
+            else if (group === 'milestones') executionTimelineState.showMilestones = visible;
+            renderExecutionTimeline();
+        }
+
+        function executionItemRows(item, includeAll = false) {
+            const rows = [
+                ['start', formatTimelineSeconds(item.start_seconds, true)],
+                ['end', formatTimelineSeconds(item.end_seconds, true)],
+                ['duration', formatTimelineSeconds(item.duration_seconds, true)],
+                ['status', executionTimelineName(item.status || 'unknown')],
+            ];
+            const details = Object.entries(item.detail || {}).filter(([, value]) => value !== null && value !== undefined && value !== '');
+            rows.push(...(includeAll ? details : details.slice(0, 6)).map(([key, value]) => [key, executionDetailValue(key, value)]));
+            return rows;
+        }
+
+        function renderExecutionTooltip(item, track) {
+            const rows = executionItemRows(item, false);
+            return `<div class="execution-tooltip-title">${escapeHTML(executionTimelineName(item.label))} · ${escapeHTML(executionTimelineName(track.label))}</div>${rows.map(([key, value]) => `<div class="execution-tooltip-row"><span class="execution-tooltip-key">${escapeHTML(executionDetailKey(key))}</span><span>${escapeHTML(value)}</span></div>`).join('')}`;
+        }
+
+        function positionExecutionTooltip(event, tooltip) {
+            const gap = 14;
+            const width = tooltip.offsetWidth || 280;
+            const height = tooltip.offsetHeight || 140;
+            const left = Math.min(window.innerWidth - width - 10, event.clientX + gap);
+            const top = Math.min(window.innerHeight - height - 10, event.clientY + gap);
+            tooltip.style.left = `${Math.max(8, left)}px`;
+            tooltip.style.top = `${Math.max(8, top)}px`;
+        }
+
+        function showExecutionDetail(item, track) {
+            executionTimelineState.selectedItemId = item.id;
+            document.querySelectorAll('[data-timeline-item]').forEach(element => element.classList.toggle('selected', element.dataset.timelineItem === item.id));
+            const panel = document.getElementById('executionDetailPanel');
+            if (!panel) return;
+            const rows = executionItemRows(item, true);
+            panel.innerHTML = `<div class="execution-detail-title">${escapeHTML(executionTimelineName(item.label))} · ${escapeHTML(executionTimelineName(track.label))}</div><div class="execution-detail-grid">${rows.map(([key, value]) => `<div class="execution-detail-cell"><div class="execution-detail-key">${escapeHTML(executionDetailKey(key))}</div><div class="execution-detail-value">${escapeHTML(value)}</div></div>`).join('')}</div>`;
+            panel.classList.add('show');
+        }
+
+        function wireExecutionTimelineInteractions() {
+            const tooltip = document.getElementById('executionTimelineTooltip');
+            document.querySelectorAll('[data-timeline-item]').forEach(element => {
+                element.addEventListener('mouseenter', event => {
+                    const payload = executionTimelineState.itemMap.get(element.dataset.timelineItem);
+                    if (!payload || !tooltip) return;
+                    tooltip.innerHTML = renderExecutionTooltip(payload.item, payload.track);
+                    tooltip.classList.add('show');
+                    positionExecutionTooltip(event, tooltip);
+                });
+                element.addEventListener('mousemove', event => {
+                    if (tooltip?.classList.contains('show')) positionExecutionTooltip(event, tooltip);
+                });
+                element.addEventListener('mouseleave', () => tooltip?.classList.remove('show'));
+                element.addEventListener('click', event => {
+                    event.stopPropagation();
+                    const payload = executionTimelineState.itemMap.get(element.dataset.timelineItem);
+                    if (payload) showExecutionDetail(payload.item, payload.track);
+                });
+            });
+        }
+
                 // === LOGS TAB ===
         async function loadLogs() {
             try {
@@ -2537,6 +3047,12 @@
             updateLanguage(); // Apply language on load
             loadOverview();
             connectSSE();
+
+            window.addEventListener('resize', () => {
+                if (currentTab === 'execution-timeline' && executionTimelineState.data) {
+                    renderExecutionTimeline();
+                }
+            });
 
             // Auto-refresh fallback (SSE primary, polling backup)
             setInterval(() => {
