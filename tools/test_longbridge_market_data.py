@@ -204,6 +204,30 @@ def test_stale_depth_snapshots_are_refreshed_concurrently() -> None:
     refresh = health["last_snapshot_refresh"]
     assert refresh["depth_worker_count"] == 8, refresh
     assert refresh["refresh_round_count"] == 1, refresh
+    assert refresh["depth_aggregate_work_seconds"] >= 0.7, refresh
+    assert refresh["depth_phase_elapsed_seconds"] < 0.2, refresh
+    assert refresh["depth_parallel_speedup_ratio"] >= 3.0, refresh
+    assert health["snapshot_refresh_multi_symbol_count"] == 1, health
+    assert health["snapshot_refresh_max_requested_symbols"] == len(symbols), health
+    assert health["snapshot_refresh_max_depth_workers"] == 8, health
+    assert health["snapshot_refresh_multi_symbol_parallel_speedup_ratio"] >= 3.0, health
+
+
+def test_near_expiry_depth_is_refreshed_before_hard_limit() -> None:
+    context = _FakeContext()
+    client = LongbridgeQuoteClient(
+        _credentials(),
+        max_quote_age_seconds=0.4,
+        context_factory=lambda credentials: context,
+    )
+    client.start(["AAPL"])
+    time.sleep(0.32)
+    quote = client.get_marketable_quote("AAPL")
+    assert quote["depth_source"] == "snapshot_refresh", quote
+    assert context.depth_calls == ["AAPL.US"], context.depth_calls
+    health = client.health_snapshot(requested_symbols=["AAPL"])
+    assert health["max_quote_age_seconds"] == 0.4, health
+    assert abs(health["snapshot_proactive_refresh_age_seconds"] - 0.28) < 1e-9, health
 
 
 def test_stale_quote_is_rejected_when_snapshot_refresh_fails() -> None:
@@ -223,6 +247,8 @@ def test_stale_quote_is_rejected_when_snapshot_refresh_fails() -> None:
         raise AssertionError("stale Longbridge quote was accepted")
     health = client.health_snapshot(requested_symbols=["AAPL"])
     assert health["snapshot_refresh_failure_count"] == 3, health
+    assert len(health["snapshot_refresh_failure_history"]) == 3, health
+    assert health["snapshot_refresh_failure_history"][0]["requested_symbols"] == ["AAPL"], health
 
 
 def test_wide_quote_is_rejected() -> None:
@@ -482,6 +508,7 @@ def main() -> int:
         test_stream_warmup_and_class_symbol_mapping,
         test_stale_stream_quote_is_refreshed_from_snapshot,
         test_stale_depth_snapshots_are_refreshed_concurrently,
+        test_near_expiry_depth_is_refreshed_before_hard_limit,
         test_stale_quote_is_rejected_when_snapshot_refresh_fails,
         test_wide_quote_is_rejected,
         test_wide_quote_can_value_portfolio_but_cannot_price_order,

@@ -99,6 +99,15 @@ class LongbridgeQuoteClient:
         self._snapshot_refresh_attempt_count = 0
         self._snapshot_refresh_symbol_count = 0
         self._snapshot_refresh_failure_count = 0
+        self._snapshot_refresh_elapsed_seconds = 0.0
+        self._snapshot_refresh_depth_elapsed_seconds = 0.0
+        self._snapshot_refresh_depth_work_seconds = 0.0
+        self._snapshot_refresh_multi_symbol_count = 0
+        self._snapshot_refresh_multi_symbol_depth_elapsed_seconds = 0.0
+        self._snapshot_refresh_multi_symbol_depth_work_seconds = 0.0
+        self._snapshot_refresh_max_requested_symbols = 0
+        self._snapshot_refresh_max_depth_workers = 0
+        self._snapshot_refresh_failure_history: list[dict[str, Any]] = []
         self._last_snapshot_refresh: dict[str, Any] = {}
 
     def check_symbol_coverage(
@@ -441,10 +450,58 @@ class LongbridgeQuoteClient:
             "snapshot_refresh_attempt_count": int(self._snapshot_refresh_attempt_count),
             "snapshot_refresh_symbol_count": int(self._snapshot_refresh_symbol_count),
             "snapshot_refresh_failure_count": int(self._snapshot_refresh_failure_count),
+            "snapshot_refresh_elapsed_seconds": round(
+                float(self._snapshot_refresh_elapsed_seconds), 6
+            ),
+            "snapshot_refresh_depth_elapsed_seconds": round(
+                float(self._snapshot_refresh_depth_elapsed_seconds), 6
+            ),
+            "snapshot_refresh_depth_work_seconds": round(
+                float(self._snapshot_refresh_depth_work_seconds), 6
+            ),
+            "snapshot_refresh_depth_parallel_speedup_ratio": (
+                float(
+                    self._snapshot_refresh_depth_work_seconds
+                    / self._snapshot_refresh_depth_elapsed_seconds
+                )
+                if self._snapshot_refresh_depth_elapsed_seconds > 0.0
+                else None
+            ),
+            "snapshot_refresh_multi_symbol_count": int(
+                self._snapshot_refresh_multi_symbol_count
+            ),
+            "snapshot_refresh_multi_symbol_depth_elapsed_seconds": round(
+                float(self._snapshot_refresh_multi_symbol_depth_elapsed_seconds), 6
+            ),
+            "snapshot_refresh_multi_symbol_depth_work_seconds": round(
+                float(self._snapshot_refresh_multi_symbol_depth_work_seconds), 6
+            ),
+            "snapshot_refresh_multi_symbol_parallel_speedup_ratio": (
+                float(
+                    self._snapshot_refresh_multi_symbol_depth_work_seconds
+                    / self._snapshot_refresh_multi_symbol_depth_elapsed_seconds
+                )
+                if self._snapshot_refresh_multi_symbol_depth_elapsed_seconds > 0.0
+                else None
+            ),
+            "snapshot_refresh_max_requested_symbols": int(
+                self._snapshot_refresh_max_requested_symbols
+            ),
+            "snapshot_refresh_max_depth_workers": int(
+                self._snapshot_refresh_max_depth_workers
+            ),
+            "snapshot_refresh_failure_history": [
+                dict(item) for item in self._snapshot_refresh_failure_history
+            ],
             "last_snapshot_refresh": dict(self._last_snapshot_refresh),
             "max_spread_bps_observed": max(spreads, default=None),
             "warmup_timeout_seconds": self._warmup_timeout_seconds,
             "max_quote_age_seconds": self._max_quote_age_seconds,
+            "snapshot_proactive_refresh_age_seconds": max(
+                0.05,
+                self._max_quote_age_seconds
+                - min(3.0, self._max_quote_age_seconds * 0.30),
+            ),
             "max_spread_bps": self._max_spread_bps,
             "max_subscriptions": self._max_subscriptions,
             "status": (
@@ -577,6 +634,14 @@ class LongbridgeQuoteClient:
 
     def _snapshot_refresh_candidates(self, requested: Sequence[str]) -> list[str]:
         now_monotonic = time.monotonic()
+        freshness_headroom_seconds = min(
+            3.0,
+            self._max_quote_age_seconds * 0.30,
+        )
+        proactive_refresh_age_seconds = max(
+            0.05,
+            self._max_quote_age_seconds - freshness_headroom_seconds,
+        )
         out: list[str] = []
         with self._lock:
             for symbol in requested:
@@ -586,7 +651,7 @@ class LongbridgeQuoteClient:
                     out.append(symbol)
                     continue
                 received_monotonic = float(depth.get("received_monotonic") or 0.0)
-                if now_monotonic - received_monotonic > self._max_quote_age_seconds:
+                if now_monotonic - received_monotonic > proactive_refresh_age_seconds:
                     out.append(symbol)
         return out
 
@@ -601,6 +666,7 @@ class LongbridgeQuoteClient:
         self._snapshot_refresh_attempt_count += 1
         self._snapshot_refresh_symbol_count += len(requested)
 
+        quote_batch_started_monotonic = time.monotonic()
         try:
             static_quotes = list(self._context.quote(provider_symbols) or [])
             for event in static_quotes:
@@ -621,22 +687,42 @@ class LongbridgeQuoteClient:
                     "error": str(exc),
                 }
             )
+        quote_batch_elapsed_seconds = time.monotonic() - quote_batch_started_monotonic
 
-        def fetch_depth(symbol: str, provider_symbol: str) -> tuple[str, str, Any, Exception | None]:
+        def fetch_depth(
+            symbol: str,
+            provider_symbol: str,
+        ) -> tuple[str, str, Any, Exception | None, float]:
+            depth_started_monotonic = time.monotonic()
             try:
                 event = self._context.depth(provider_symbol)
-                return symbol, provider_symbol, event, None
+                return (
+                    symbol,
+                    provider_symbol,
+                    event,
+                    None,
+                    time.monotonic() - depth_started_monotonic,
+                )
             except Exception as exc:
-                return symbol, provider_symbol, None, exc
+                return (
+                    symbol,
+                    provider_symbol,
+                    None,
+                    exc,
+                    time.monotonic() - depth_started_monotonic,
+                )
 
         depth_worker_count = min(8, max(1, len(provider_symbols)))
+        depth_started_monotonic = time.monotonic()
+        depth_request_elapsed_seconds: list[float] = []
         with ThreadPoolExecutor(max_workers=depth_worker_count) as executor:
             futures = [
                 executor.submit(fetch_depth, symbol, provider_symbol)
                 for symbol, provider_symbol in zip(requested, provider_symbols)
             ]
             for future in as_completed(futures):
-                symbol, provider_symbol, event, error = future.result()
+                symbol, provider_symbol, event, error, request_elapsed = future.result()
+                depth_request_elapsed_seconds.append(float(request_elapsed))
                 if error is not None:
                     errors.append(
                         {
@@ -652,6 +738,8 @@ class LongbridgeQuoteClient:
                     self._depths[symbol]["source"] = "snapshot_refresh"
                     self._depths[symbol]["snapshot_refreshed_at_utc"] = started_at_utc
                 depth_refreshed.add(symbol)
+        depth_elapsed_seconds = time.monotonic() - depth_started_monotonic
+        depth_work_seconds = float(sum(depth_request_elapsed_seconds))
 
         missing_quote = sorted(set(requested) - quote_refreshed)
         missing_depth = sorted(set(requested) - depth_refreshed)
@@ -659,18 +747,67 @@ class LongbridgeQuoteClient:
             errors.append({"scope": "quote_missing", "symbols": ",".join(missing_quote)})
         if missing_depth:
             errors.append({"scope": "depth_missing", "symbols": ",".join(missing_depth)})
-        if errors:
-            self._snapshot_refresh_failure_count += 1
-        return {
+        elapsed_seconds = time.monotonic() - started_monotonic
+        self._snapshot_refresh_elapsed_seconds += float(elapsed_seconds)
+        self._snapshot_refresh_depth_elapsed_seconds += float(depth_elapsed_seconds)
+        self._snapshot_refresh_depth_work_seconds += float(depth_work_seconds)
+        self._snapshot_refresh_max_requested_symbols = max(
+            int(self._snapshot_refresh_max_requested_symbols), len(requested)
+        )
+        self._snapshot_refresh_max_depth_workers = max(
+            int(self._snapshot_refresh_max_depth_workers), int(depth_worker_count)
+        )
+        if len(requested) > 1:
+            self._snapshot_refresh_multi_symbol_count += 1
+            self._snapshot_refresh_multi_symbol_depth_elapsed_seconds += float(
+                depth_elapsed_seconds
+            )
+            self._snapshot_refresh_multi_symbol_depth_work_seconds += float(
+                depth_work_seconds
+            )
+        result = {
             "attempted_at_utc": started_at_utc,
             "requested_symbols": requested,
             "quote_refreshed_symbols": sorted(quote_refreshed),
             "depth_refreshed_symbols": sorted(depth_refreshed),
             "errors": errors,
-            "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
+            "elapsed_seconds": round(float(elapsed_seconds), 6),
+            "quote_batch_elapsed_seconds": round(
+                float(quote_batch_elapsed_seconds), 6
+            ),
+            "depth_phase_elapsed_seconds": round(float(depth_elapsed_seconds), 6),
+            "depth_aggregate_work_seconds": round(float(depth_work_seconds), 6),
+            "depth_parallel_speedup_ratio": (
+                float(depth_work_seconds / depth_elapsed_seconds)
+                if depth_elapsed_seconds > 0.0
+                else None
+            ),
+            "depth_request_min_seconds": (
+                round(min(depth_request_elapsed_seconds), 6)
+                if depth_request_elapsed_seconds
+                else None
+            ),
+            "depth_request_max_seconds": (
+                round(max(depth_request_elapsed_seconds), 6)
+                if depth_request_elapsed_seconds
+                else None
+            ),
             "depth_worker_count": int(depth_worker_count),
             "status": "pass" if not errors else "error",
         }
+        if errors:
+            self._snapshot_refresh_failure_count += 1
+            self._snapshot_refresh_failure_history.append(
+                {
+                    "attempted_at_utc": started_at_utc,
+                    "requested_symbols": requested,
+                    "errors": [dict(item) for item in errors],
+                    "elapsed_seconds": result["elapsed_seconds"],
+                    "depth_worker_count": int(depth_worker_count),
+                }
+            )
+            self._snapshot_refresh_failure_history = self._snapshot_refresh_failure_history[-20:]
+        return result
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
