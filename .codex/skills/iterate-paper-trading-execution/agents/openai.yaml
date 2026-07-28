@@ -1,0 +1,4 @@
+interface:
+  display_name: "Iterate Paper Trading Execution"
+  short_description: "Optimize broker execution with quality-gated paper A/B tests"
+  default_prompt: "Use $iterate-paper-trading-execution to benchmark and safely optimize this broker's paper-trading execution workflow."
