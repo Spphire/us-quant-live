@@ -279,6 +279,10 @@
             width: 100% !important;
             height: 300px !important;
         }
+        .performance-chart-panel canvas {
+            width: 100% !important;
+            height: 300px !important;
+        }
         .chart-key {
             display: flex;
             flex-wrap: wrap;
@@ -619,7 +623,6 @@
         <div class="tabs">
             <button class="tab active" data-tab="overview">Overview</button>
             <button class="tab" data-tab="positions">Positions</button>
-            <button class="tab" data-tab="lots">Factor Lots</button>
             <button class="tab" data-tab="history">History</button>
             <button class="tab" data-tab="execution-timeline">Execution Timeline</button>
             <button class="tab" data-tab="logs">Logs</button>
@@ -627,7 +630,6 @@
         </div>
         <div id="overview" class="tab-content active"></div>
         <div id="positions" class="tab-content"></div>
-        <div id="lots" class="tab-content"></div>
         <div id="history" class="tab-content"></div>
         <div id="execution-timeline" class="tab-content"></div>
         <div id="logs" class="tab-content"></div>
@@ -654,7 +656,6 @@
                 // Tabs
                 tabOverview: 'Overview',
                 tabPositions: 'Positions',
-                tabLots: 'Factor Lots',
                 tabHistory: 'History',
                 tabExecutionTimeline: 'Execution Timeline',
                 tabLogs: 'Logs',
@@ -676,8 +677,11 @@
                 statusRunning: 'Running',
                 statusStarted: 'Started',
                 chartEquityTitle: 'Portfolio Equity (Last 30 Days)',
+                chartSideReturnTitle: 'Daily Long / Short Returns (Execution Snapshot)',
                 chartWeightErrorTitle: 'Daily Weight Error (L1)',
                 chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
+                seriesLongReturn: 'Long return',
+                seriesShortReturn: 'Short return',
                 seriesStrategyActual: 'Strategy to actual',
                 seriesStrategyExecutable: 'Strategy to executable',
                 seriesExecutableActual: 'Executable to actual',
@@ -706,23 +710,6 @@
                 thChange: '% Change',
                 noPositions: 'No positions',
                 noMatch: 'No positions match filters',
-
-                // Lots
-                metricTotalLots: 'Total Lots',
-                metricLockedLots: 'Locked Lots',
-                metricUnlockedLots: 'Unlocked Lots',
-                withinMinHold: 'Within min_hold',
-                canRebalance: 'Can rebalance',
-                chartLotComposition: 'Lot Composition by Factor',
-                chartFactorDist: 'Factor Distribution',
-                allLotsTitle: 'All Lots',
-                showing: 'showing',
-                thFactor: 'Factor',
-                thWeight: 'Weight',
-                thMinHold: 'Min Hold',
-                thBirthIndex: 'Birth Index',
-                thEntryDate: 'Entry Date',
-                noLots: 'No lots',
 
                 // History
                 historyTitle: 'Execution History (Last 50 Runs)',
@@ -774,7 +761,7 @@
                 // Settings
                 settingsTradingTitle: 'Trading Configuration',
                 settingsSystemTitle: 'System Information',
-                settingsLedgerTitle: 'Lot Ledger State',
+                settingsAccountStateTitle: 'Account State',
                 settingsSchedulerTitle: 'Scheduler Command',
                 cfgAccount: 'Account',
                 cfgFeed: 'Feed',
@@ -790,9 +777,9 @@
                 cfgProjectRoot: 'Project Root',
                 cfgLastSessionIdx: 'Last Session Index',
                 cfgLastSessionDate: 'Last Session Date',
-                cfgLastSyncTime: 'Last Sync Time (UTC)',
+                cfgLastRunTime: 'Last Run Time (UTC)',
                 cfgLastBrokerEquity: 'Last Broker Equity',
-                cfgLastSyncApplied: 'Last Sync Applied',
+                cfgLastPostTradeEquity: 'Last Post-trade Equity',
                 notRunning: 'Not running',
                 yes: 'Yes',
                 no: 'No',
@@ -810,7 +797,6 @@
                 // Tabs
                 tabOverview: '总览',
                 tabPositions: '持仓',
-                tabLots: '因子组合',
                 tabHistory: '历史记录',
                 tabExecutionTimeline: '执行时间轴',
                 tabLogs: '日志',
@@ -832,8 +818,11 @@
                 statusRunning: '运行中',
                 statusStarted: '已启动',
                 chartEquityTitle: '账户权益曲线（最近30天）',
+                chartSideReturnTitle: '每日多空侧收益率（执行后快照）',
                 chartWeightErrorTitle: '每日权重误差（L1）',
                 chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
+                seriesLongReturn: '多头收益率',
+                seriesShortReturn: '空头收益率',
                 seriesStrategyActual: '策略到实际',
                 seriesStrategyExecutable: '策略到可执行',
                 seriesExecutableActual: '可执行到实际',
@@ -862,23 +851,6 @@
                 thChange: '涨跌幅',
                 noPositions: '无持仓',
                 noMatch: '无匹配的持仓',
-
-                // Lots
-                metricTotalLots: '总批次数',
-                metricLockedLots: '锁定批次',
-                metricUnlockedLots: '可调批次',
-                withinMinHold: '最短持仓期内',
-                canRebalance: '可以调仓',
-                chartLotComposition: '因子组合占比',
-                chartFactorDist: '因子分布',
-                allLotsTitle: '所有批次',
-                showing: '显示',
-                thFactor: '因子',
-                thWeight: '权重',
-                thMinHold: '最短持仓',
-                thBirthIndex: '创建索引',
-                thEntryDate: '入场日期',
-                noLots: '无批次',
 
                 // History
                 historyTitle: '执行历史（最近50次）',
@@ -930,7 +902,7 @@
                 // Settings
                 settingsTradingTitle: '交易配置',
                 settingsSystemTitle: '系统信息',
-                settingsLedgerTitle: '批次账本状态',
+                settingsAccountStateTitle: '账户状态',
                 settingsSchedulerTitle: '调度器命令',
                 cfgAccount: '账户',
                 cfgFeed: '数据源',
@@ -946,9 +918,9 @@
                 cfgProjectRoot: '项目根目录',
                 cfgLastSessionIdx: '最后会话索引',
                 cfgLastSessionDate: '最后会话日期',
-                cfgLastSyncTime: '最后同步时间（UTC）',
+                cfgLastRunTime: '最后运行时间（UTC）',
                 cfgLastBrokerEquity: '最后券商权益',
-                cfgLastSyncApplied: '最后同步已应用',
+                cfgLastPostTradeEquity: '最后执行后权益',
                 notRunning: '未运行',
                 yes: '是',
                 no: '否',
@@ -978,7 +950,7 @@
 
             // Update tabs
             document.querySelectorAll('.tab').forEach((tab, i) => {
-                const keys = ['tabOverview', 'tabPositions', 'tabLots', 'tabHistory', 'tabExecutionTimeline', 'tabLogs', 'tabSettings'];
+                const keys = ['tabOverview', 'tabPositions', 'tabHistory', 'tabExecutionTimeline', 'tabLogs', 'tabSettings'];
                 tab.textContent = t(keys[i]);
             });
 
@@ -996,7 +968,7 @@
 
         // === CORE STATE & UTILS ===
         let currentTab = 'overview';
-        let charts = { equity: null, weightError: null, buyingPowerError: null, lotPie: null };
+        let charts = { equity: null, sideReturn: null, weightError: null, buyingPowerError: null };
         let sseConnection = null;
         let lastUpdateTime = Date.now();
         let positionSortState = { key: 'market_value', direction: 'desc' };
@@ -1151,6 +1123,38 @@
                     value: Number(row.account_equity_post_trade),
                     runDir: row.run_dir || '',
                     runType: row.run_type || ''
+                }));
+        }
+
+        function buildSideReturnSeries(history) {
+            const rows = Array.isArray(history) ? history : [];
+            const epochs = rows
+                .map(row => Number(row.capital_epoch || 1))
+                .filter(value => Number.isFinite(value));
+            const activeEpoch = epochs.length ? Math.max(...epochs) : 1;
+            const sourceRows = rows.filter(row => {
+                if (Number(row.capital_epoch || 1) !== activeEpoch) return false;
+                if (String(row.run_type || '').toLowerCase() !== 'execute') return false;
+                return auditMetric(row, 'long_snapshot_intraday_return') !== null
+                    || auditMetric(row, 'short_snapshot_intraday_return') !== null;
+            });
+            const byDate = new Map();
+            for (const row of sourceRows) {
+                const dateKey = historyDateKey(row);
+                if (dateKey) byDate.set(dateKey, row);
+            }
+            return Array.from(byDate.values())
+                .sort(compareHistoryRowsAsc)
+                .slice(-30)
+                .map(row => ({
+                    label: historyDateKey(row),
+                    longReturnPct: auditMetric(row, 'long_snapshot_intraday_return', 100),
+                    shortReturnPct: auditMetric(row, 'short_snapshot_intraday_return', 100),
+                    longPnl: auditMetric(row, 'long_snapshot_intraday_pnl'),
+                    shortPnl: auditMetric(row, 'short_snapshot_intraday_pnl'),
+                    longExposure: auditMetric(row, 'long_gross_exposure_after'),
+                    shortExposure: auditMetric(row, 'short_gross_exposure_after'),
+                    runDir: row.run_dir || ''
                 }));
         }
 
@@ -1382,41 +1386,6 @@
             });
         }
 
-        function renderDoughnutCanvasFallback(canvas, labels, values, colors) {
-            canvas.dataset.fallbackChart = 'doughnut';
-            if (!labels.length || !values.length) {
-                renderNoCanvasData(canvas, 'No lot data');
-                return;
-            }
-            const { ctx, width, height } = setupCanvas(canvas);
-            const total = values.reduce((sum, value) => sum + Number(value || 0), 0);
-            const radius = Math.max(60, Math.min(width, height) * 0.34);
-            const innerRadius = radius * 0.58;
-            const cx = width / 2;
-            const cy = height / 2;
-            let angle = -Math.PI / 2;
-            values.forEach((raw, i) => {
-                const value = Number(raw || 0);
-                const slice = total ? (value / total) * Math.PI * 2 : 0;
-                ctx.beginPath();
-                ctx.moveTo(cx, cy);
-                ctx.arc(cx, cy, radius, angle, angle + slice);
-                ctx.closePath();
-                ctx.fillStyle = colors[i % colors.length];
-                ctx.fill();
-                angle += slice;
-            });
-            ctx.globalCompositeOperation = 'destination-out';
-            ctx.beginPath();
-            ctx.arc(cx, cy, innerRadius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.globalCompositeOperation = 'source-over';
-            ctx.fillStyle = '#e4e8f0';
-            ctx.font = '600 20px system-ui, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText(String(total), cx, cy + 7);
-        }
-
         function showModal(title, bodyHTML) {
             document.getElementById('modalTitle').textContent = title;
             document.getElementById('modalBody').innerHTML = bodyHTML;
@@ -1451,7 +1420,6 @@
         function loadTabData(tab) {
             if (tab === 'overview') loadOverview();
             else if (tab === 'positions') loadPositions();
-            else if (tab === 'lots') loadLots();
             else if (tab === 'history') loadHistory();
             else if (tab === 'execution-timeline') loadExecutionTimeline();
             else if (tab === 'logs') loadLogs();
@@ -1697,6 +1665,142 @@
             else document.getElementById('overview').insertAdjacentHTML('beforeend', html);
         }
 
+        function renderSideReturnChart(history) {
+            const series = buildSideReturnSeries(history);
+            const labels = series.map(point => point.label);
+            const longValues = series.map(point => point.longReturnPct);
+            const shortValues = series.map(point => point.shortReturnPct);
+            const colors = { long: '#60a5fa', short: '#f59e0b' };
+            const key = [
+                { color: colors.long, label: t('seriesLongReturn') },
+                { color: colors.short, label: t('seriesShortReturn') }
+            ];
+            const chartHTML = `
+                <div class="panel performance-chart-panel" id="sideReturnChartPanel">
+                    <div class="panel-title">${t('chartSideReturnTitle')}</div>
+                    <div class="timeline-sub" id="sideReturnChartMeta"></div>
+                    <div class="chart-key">${chartKeyHTML(key)}</div>
+                    <canvas id="sideReturnChart" height="300"></canvas>
+                </div>
+            `;
+
+            if (charts.sideReturn?.destroy) charts.sideReturn.destroy();
+            charts.sideReturn = null;
+            document.getElementById('sideReturnChartPanel')?.remove();
+            const equityPanel = document.getElementById('equityChartPanel');
+            if (equityPanel) equityPanel.insertAdjacentHTML('afterend', chartHTML);
+
+            const metaEl = document.getElementById('sideReturnChartMeta');
+            if (metaEl) {
+                const first = labels[0] || 'n/a';
+                const last = labels[labels.length - 1] || 'n/a';
+                const renderer = typeof Chart === 'undefined' ? 'canvas fallback' : 'Chart.js';
+                metaEl.textContent = labels.length
+                    ? `${first} to ${last} · ${labels.length} execute snapshots · ${renderer}`
+                    : `No side-return snapshots · ${renderer}`;
+            }
+
+            const canvas = document.getElementById('sideReturnChart');
+            if (!canvas) return;
+            const fallbackData = [
+                { color: colors.long, data: longValues },
+                { color: colors.short, data: shortValues }
+            ];
+            if (typeof Chart === 'undefined') {
+                renderMultiAxisLineFallback(
+                    canvas,
+                    labels,
+                    fallbackData,
+                    'No daily side-return evidence'
+                );
+                return;
+            }
+
+            delete canvas.dataset.fallbackChart;
+            delete canvas.dataset.fallbackLabels;
+            charts.sideReturn = new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: t('seriesLongReturn'),
+                            data: longValues,
+                            borderColor: colors.long,
+                            backgroundColor: 'rgba(96, 165, 250, 0.08)',
+                            borderWidth: 2.5,
+                            pointRadius: 3,
+                            pointHoverRadius: 6,
+                            tension: 0.25,
+                            spanGaps: false
+                        },
+                        {
+                            label: t('seriesShortReturn'),
+                            data: shortValues,
+                            borderColor: colors.short,
+                            backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                            borderWidth: 2.5,
+                            pointRadius: 3,
+                            pointHoverRadius: 6,
+                            tension: 0.25,
+                            spanGaps: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: '#0f1729',
+                            titleColor: '#e4e8f0',
+                            bodyColor: '#e4e8f0',
+                            borderColor: '#1e2a4a',
+                            borderWidth: 1,
+                            padding: 10,
+                            callbacks: {
+                                label: context => `${context.dataset.label}: ${formatPercent(context.parsed.y)}`,
+                                afterBody: items => {
+                                    const point = series[items?.[0]?.dataIndex ?? -1];
+                                    if (!point) return '';
+                                    return [
+                                        `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} / ${formatOptionalCurrency(point.longExposure)}`,
+                                        `${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)} / ${formatOptionalCurrency(point.shortExposure)}`
+                                    ];
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            ticks: {
+                                color: '#8b92a8',
+                                callback: value => `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(2)}%`
+                            },
+                            grid: {
+                                color: context => Number(context.tick?.value) === 0 ? '#64748b' : '#1e2a4a',
+                                lineWidth: context => Number(context.tick?.value) === 0 ? 1.25 : 0.5
+                            }
+                        },
+                        x: {
+                            ticks: {
+                                color: '#8b92a8',
+                                font: {size: 10},
+                                maxRotation: 45,
+                                callback: function(value) {
+                                    const label = String(this.getLabelForValue(value) || '');
+                                    return label.length >= 10 ? label.slice(5) : label;
+                                }
+                            },
+                            grid: { color: '#1e2a4a', lineWidth: 0.5 }
+                        }
+                    }
+                }
+            });
+        }
+
         async function loadEquityChart() {
             try {
                 const history = await fetchJSON('history?limit=120');
@@ -1714,6 +1818,7 @@
                 if (!document.getElementById('equityChartPanel')) {
                     document.getElementById('overview').insertAdjacentHTML('beforeend', chartHTML);
                 }
+                renderSideReturnChart(history);
                 const metaEl = document.getElementById('equityChartMeta');
                 if (metaEl) {
                     const first = labels[0] || 'n/a';
@@ -2253,151 +2358,6 @@
             });
         }
 
-                // === LOTS TAB ===
-        async function loadLots() {
-            try {
-                const data = await fetchJSON('lots');
-                renderLotMetrics(data);
-                renderLotPieChart(data);
-                renderLotsTable(data);
-                updateLastUpdate();
-            } catch (err) {
-                console.error('Failed to load lots:', err);
-            }
-        }
-
-        function renderLotMetrics(data) {
-            const html = `
-                <div class="metrics-grid">
-                    <div class="metric-card">
-                        <div class="metric-label">${t('metricTotalLots')}</div>
-                        <div class="metric-value">${data.total_count || 0}</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">${t('metricLockedLots')}</div>
-                        <div class="metric-value">${data.locked_count || 0}</div>
-                        <div class="metric-change neutral">${t('withinMinHold')}</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">${t('metricUnlockedLots')}</div>
-                        <div class="metric-value">${data.unlocked_count || 0}</div>
-                        <div class="metric-change neutral">${t('canRebalance')}</div>
-                    </div>
-                </div>
-            `;
-            const metricsEl = document.querySelector('#lots .metrics-grid');
-            if (metricsEl) metricsEl.outerHTML = html;
-            else document.getElementById('lots').insertAdjacentHTML('afterbegin', html);
-        }
-
-        function renderLotPieChart(data) {
-            const composition = data.composition || {};
-            const counts = composition.counts || {};
-            const labels = Object.keys(counts);
-            const values = Object.values(counts);
-            const colors = ['#60a5fa', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
-
-            const chartHTML = `
-                <div class="charts-row">
-                    <div class="panel">
-                        <div class="panel-title">${t('chartLotComposition')}</div>
-                        <canvas id="lotPieChart"></canvas>
-                    </div>
-                    <div class="panel">
-                        <div class="panel-title">${t('chartFactorDist')}</div>
-                        <div class="legend-list" id="factorLegend"></div>
-                    </div>
-                </div>
-            `;
-            const chartEl = document.querySelector('#lots .charts-row');
-            if (!chartEl) document.getElementById('lots').insertAdjacentHTML('beforeend', chartHTML);
-
-            const ctx = document.getElementById('lotPieChart');
-            if (!ctx) return;
-
-            if (charts.lotPie?.destroy) charts.lotPie.destroy();
-            if (typeof Chart === 'undefined') {
-                charts.lotPie = null;
-                renderDoughnutCanvasFallback(ctx, labels, values, colors);
-            } else {
-                delete ctx.dataset.fallbackChart;
-                charts.lotPie = new Chart(ctx.getContext('2d'), {
-                    type: 'doughnut',
-                    data: {
-                        labels: labels,
-                        datasets: [{
-                            data: values,
-                            backgroundColor: colors,
-                            borderWidth: 0
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: true,
-                        plugins: {
-                            legend: { display: false },
-                            tooltip: {
-                                backgroundColor: '#0f1729',
-                                titleColor: '#e4e8f0',
-                                bodyColor: '#e4e8f0',
-                                borderColor: '#1e2a4a',
-                                borderWidth: 1
-                            }
-                        }
-                    }
-                });
-            }
-
-            const legendHTML = labels.map((label, i) => `
-                <div class="legend-item">
-                    <div style="display:flex;align-items:center;">
-                        <div class="legend-color" style="background:${colors[i]}"></div>
-                        <span class="legend-label">${label}</span>
-                    </div>
-                    <span class="legend-value">${values[i]}</span>
-                </div>
-            `).join('');
-            document.getElementById('factorLegend').innerHTML = legendHTML;
-        }
-
-        function renderLotsTable(data) {
-            const lots = data.lots || [];
-            const html = `
-                <div class="panel">
-                    <div class="panel-title">${t('allLotsTitle')} <span style="font-weight:400;font-size:0.85rem;color:#8b92a8;">(${t('showing')} ${Math.min(lots.length, 200)})</span></div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>${t('thSymbol')}</th>
-                                <th>${t('thFactor')}</th>
-                                <th>${t('thWeight')}</th>
-                                <th>${t('thMinHold')}</th>
-                                <th>${t('thBirthIndex')}</th>
-                                <th>${t('thEntryDate')}</th>
-                            </tr>
-                        </thead>
-                        <tbody id="lotsTableBody"></tbody>
-                    </table>
-                </div>
-            `;
-            const tableEl = document.querySelector('#lots .panel:last-child');
-            if (!tableEl || !tableEl.querySelector('table')) {
-                document.getElementById('lots').insertAdjacentHTML('beforeend', html);
-            }
-
-            const rows = lots.slice(0, 200).map(lot => `
-                <tr>
-                    <td><strong>${lot.symbol}</strong></td>
-                    <td>${lot.factor}</td>
-                    <td>${(lot.weight * 100).toFixed(4)}%</td>
-                    <td>${lot.min_hold}</td>
-                    <td>${lot.birth_idx}</td>
-                    <td>${lot.entry_session_date || 'N/A'}</td>
-                </tr>
-            `).join('');
-            document.getElementById('lotsTableBody').innerHTML = rows || `<tr><td colspan="6" style="text-align:center;color:#8b92a8;">${t('noLots')}</td></tr>`;
-        }
-
                 // === HISTORY TAB ===
         async function loadHistory() {
             try {
@@ -2517,7 +2477,7 @@
                 'Pipeline': '全流程',
                 'Execution stages': '执行子阶段',
                 'Startup Evidence': '启动证据',
-                'Broker Preflight And Lot Sync': '券商预检与批次同步',
+                'Broker Preflight And State': '券商预检与账户状态',
                 'Portfolio Decision': '加载组合决策',
                 'Market And Price Evidence': '市场与价格证据',
                 'Account Sizing And Projection': '账户定容与仓位优化',
@@ -2884,7 +2844,7 @@
         function renderSettings(config) {
             const trading = config.trading || {};
             const system = config.system || {};
-            const ledger = config.ledger || {};
+            const accountState = config.account_state || {};
             const startupBinding = config.startup_binding || {};
             const autostartTask = startupBinding.autostart_task || {};
             const startupLog = startupBinding.startup_log || {};
@@ -2984,13 +2944,13 @@
                     </div>
                 </div>
                 <div class="panel">
-                    <div class="panel-title">${t('settingsLedgerTitle')}</div>
+                    <div class="panel-title">${t('settingsAccountStateTitle')}</div>
                     <div class="config-grid">
-                        <div class="config-item"><span class="config-key">${t('cfgLastSessionIdx')}</span><span class="config-value">${ledger.last_session_idx ?? 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">${t('cfgLastSessionDate')}</span><span class="config-value">${ledger.last_session_date || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">${t('cfgLastSyncTime')}</span><span class="config-value" style="font-size:0.75rem;">${ledger.last_sync_at_utc || 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">${t('cfgLastBrokerEquity')}</span><span class="config-value">${ledger.last_broker_equity ? formatCurrency(ledger.last_broker_equity) : 'N/A'}</span></div>
-                        <div class="config-item"><span class="config-key">${t('cfgLastSyncApplied')}</span><span class="config-value">${ledger.last_sync_applied ? t('yes') : t('no')}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSessionIdx')}</span><span class="config-value">${accountState.last_session_idx ?? 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastSessionDate')}</span><span class="config-value">${accountState.last_session_date || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastRunTime')}</span><span class="config-value" style="font-size:0.75rem;">${accountState.last_run_at_utc || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastBrokerEquity')}</span><span class="config-value">${accountState.last_broker_equity ? formatCurrency(accountState.last_broker_equity) : 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgLastPostTradeEquity')}</span><span class="config-value">${accountState.last_post_trade_equity ? formatCurrency(accountState.last_post_trade_equity) : 'N/A'}</span></div>
                     </div>
                 </div>
                 ${config.scheduler_command ? `<div class="panel">

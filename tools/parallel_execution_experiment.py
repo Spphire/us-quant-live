@@ -433,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         else (PROJECT_ROOT / "artifacts" / "parallel_execution_experiment" / stamp).resolve()
     )
     output_root.mkdir(parents=True, exist_ok=True)
-    ledger_path = output_root / "test_account_lot_ledger.json"
+    account_state_path = output_root / "test_account_state.json"
     rng = random.Random(int(args.seed))
     metadata = {
         "account_profile": str(args.account_name),
@@ -533,8 +533,8 @@ def main(argv: list[str] | None = None) -> int:
             "0.95",
             "--entry-buying-power-buffer",
             "0.95",
-            "--ledger-path",
-            str(ledger_path),
+            "--account-state-path",
+            str(account_state_path),
             "--output-root",
             str(run_dir),
         ]

@@ -1451,7 +1451,7 @@ def _generate_daily_audit(execute_output_root: Path, decision_output_root: Path 
         print(
             f"[Scheduler] daily audit: {result.get('audit_dir')} "
             f"(decision_rows={result.get('decision_rows')}, "
-            f"orders={result.get('order_rows')}, lots={result.get('lot_rows')}, "
+            f"orders={result.get('order_rows')}, decisions={result.get('decision_rows')}, "
             f"realized_rows={result.get('realized_pnl_rows')}, "
             f"manifest_files={result.get('audit_manifest_files')}, "
             f"rollup_days={rollup.get('trading_day_count')})",

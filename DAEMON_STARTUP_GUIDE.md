@@ -36,7 +36,7 @@ watch_daily_alpaca_scheduler.ps1 (看门狗)
 ```
 
 **执行时间**：
-- **12:00 北京时间**：运行 DecisionEngine，生成当日目标权重（含因子 lot），不下单
+- **12:00 北京时间**：运行 DecisionEngine，以券商实际持仓为上一期权重生成当日目标，不下单
 - **22:00 北京时间**：启动执行器，等到纽约时间 10:00 (开盘后 30 分钟) 真实下单
 
 ## 启动命令
@@ -68,7 +68,7 @@ cd W:\实验室项目\us-quant-live
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce decision -Date 2026-06-27 -Force
 ```
 
-检查生成的 `artifacts/daily_alpaca_scheduler/output/*/decision_targets.csv` 和 `lot_snapshot_*.json`。
+检查生成的 `artifacts/daily_alpaca_scheduler/output/*/decision_targets.csv` 和 `account_state.json`。
 
 如果确认无误，再手动跑 execute（**这会真实下单！**）：
 ```powershell
@@ -127,7 +127,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_sch
 - [ ] `alpaca_accounts.local.json` 中 `base_url` 正确
 - [ ] 至少手动跑过一次 `--RunOnce decision` 确认目标合理
 - [ ] 理解 22:00 CN = 启动执行器，实际下单在 NY 10:00 (夏令时约北京次日 22:00, 冬令时 23:00)
-- [ ] 看过 lot_ledger 确认因子 lot 正确持久化（本次已修复）
+- [ ] 确认 `account_state.json` 的账户、交易日和权益信息正确
 
 ## 故障排查
 
@@ -149,8 +149,8 @@ A: 检查：
 - `decision_targets.csv` 是否存在且非空
 - 是否在交易日（周末/节假日会跳过）
 
-**Q: lot 历史丢失（已修复）**
-A: 本次修复确保 decision 阶段落盘因子 lot，execute 阶段正确加载。升级到最新代码后首次运行会重建 ledger。
+**Q: decision 与实际仓位不同步**
+A: decision 每次直接读取券商实际持仓作为上一期权重，不依赖本地持仓账本。先检查券商持仓快照和当日 `decision_targets.csv`。
 
 ---
 **首次建议**：先用 `-Foreground -Once` 模式观察一个完整周期，确认无误后再用 `-Force` 启动后台守护。

@@ -2327,7 +2327,7 @@ def _build_equity_pnl_bridge(
         "notes": [
             "This bridge is diagnostic, not accounting-grade tax PnL.",
             "Broker equity snapshots can move with market marks while the executor is running.",
-            "Realized PnL uses broker average entry price before execution, not broker tax lots.",
+            "Realized PnL uses broker average entry price before execution, not transaction-level cost basis.",
             "Broker FILL cash flow is tracked separately and excluded from explained equity PnL because cash and position value offset at trade time.",
             "Position delta market value is included for sanity only; it is not itself PnL.",
         ],
@@ -3317,12 +3317,6 @@ def _build_decision_intent_trace(
                 "cash_quality_score": _safe_float(decision.get("cash_quality_score")),
                 "beta": _safe_float(decision.get("beta")),
                 "sic2_sector": decision.get("sic2_sector", ""),
-                "lot_total_weight": _safe_float(decision.get("lot_total_weight")),
-                "lot_weight_reversal_score": _safe_float(decision.get("lot_weight_reversal_score")),
-                "lot_weight_momentum_score": _safe_float(decision.get("lot_weight_momentum_score")),
-                "lot_weight_small_size_score": _safe_float(decision.get("lot_weight_small_size_score")),
-                "lot_weight_low_beta_score": _safe_float(decision.get("lot_weight_low_beta_score")),
-                "lot_weight_cash_quality_score": _safe_float(decision.get("lot_weight_cash_quality_score")),
             }
         )
 
@@ -4300,27 +4294,15 @@ def _context_bucket_rows(*, rows: list[dict[str, Any]], value_getter: Any) -> li
     return sorted(out, key=lambda item: _safe_float(item.get("snapshot_plus_realized_pnl")))
 
 
-def _factor_owners_for_symbol(lot_rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    out: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    for row in lot_rows:
-        symbol = str(row.get("symbol") or "").upper().strip()
-        factor = str(row.get("factor") or "unknown")
-        if symbol:
-            out[symbol][factor] += _safe_float(row.get("weight"))
-    return {symbol: dict(factors) for symbol, factors in out.items()}
-
-
 def _build_market_context_attribution(
     *,
     run_dir: Path,
     decision_rows: list[dict[str, Any]],
-    lot_rows: list[dict[str, Any]],
     symbol_attribution_rows: list[dict[str, Any]],
     market_price_evidence_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     decision_by_symbol = {str(row.get("symbol") or "").upper().strip(): row for row in decision_rows}
     price_by_symbol = {str(row.get("symbol") or "").upper().strip(): row for row in market_price_evidence_rows}
-    factor_by_symbol = _factor_owners_for_symbol(lot_rows)
     enriched_rows: list[dict[str, Any]] = []
     for row in symbol_attribution_rows:
         symbol = str(row.get("symbol") or "").upper().strip()
@@ -4331,8 +4313,8 @@ def _build_market_context_attribution(
         realized_pnl = _safe_float(row.get("realized_pnl_estimate"))
         total_pnl = snapshot_pnl + realized_pnl
         beta = _safe_float(decision.get("beta"))
-        factors = factor_by_symbol.get(symbol, {})
-        primary_factor = max(factors.items(), key=lambda item: abs(_safe_float(item[1])))[0] if factors else "unattributed"
+        factor_scores = {factor: _safe_float(decision.get(factor)) for factor in FACTOR_COLUMNS}
+        primary_factor = max(factor_scores, key=lambda factor: abs(factor_scores[factor])) if factor_scores else "unattributed"
         gross_mv = abs(after_mv)
         enriched_rows.append(
             {
@@ -4343,7 +4325,7 @@ def _build_market_context_attribution(
                 "after_side": row.get("after_side", ""),
                 "sic2_sector": decision.get("sic2_sector", "") or "unknown",
                 "primary_factor": primary_factor,
-                "factor_weights": _json_cell(factors),
+                "factor_scores": _json_cell(factor_scores),
                 "beta": beta,
                 "beta_bucket": _beta_bucket(beta),
                 "after_market_value": after_mv,
@@ -4451,8 +4433,8 @@ def _build_market_context_attribution(
         "side_buckets": side_rows,
         "benchmark_rows": benchmark_rows,
         "note": (
-            "This is local market/factor context, not a factor model. "
-            "It helps separate side/sector/beta/factor concentration from execution and account-state effects."
+            "Factor buckets use the largest absolute standardized alpha score for each symbol; "
+            "they are signal context, not position ownership attribution."
         ),
     }
     return all_rows, summary_payload
@@ -4561,7 +4543,7 @@ def _focus_next_action(bucket: str) -> str:
         "target_transition_gap": "Compare target transition, order constraints, fills, and after position snapshot for underfill or sizing drift.",
         "decision_execute_drift": "Compare 46_decision_execute_drift.csv with decision and execute order_plan.json.",
         "execution_shortfall": "Inspect order attempts, limit offsets, fills, quotes, and intraday VWAP context.",
-        "realized_pnl_loss": "Inspect 08_realized_pnl_ledger.csv and pre-trade lot ownership/cost basis.",
+        "realized_pnl_loss": "Inspect 08_realized_pnl_ledger.csv and the broker average cost basis.",
         "mark_to_market_loss": "Inspect market/factor context, beta/sector bucket, and same-day price path.",
         "strategy_symbol_loss": "Inspect symbol-level market/factor context and realized/snapshot split.",
         "context": "Use this row as supporting context after higher-priority focus rows.",
@@ -8700,7 +8682,6 @@ def _build_data_quality_snapshot(
             "decision_status": plan.get("decision_status"),
             "decision_skip_reason": plan.get("decision_skip_reason"),
             "target_short_floor_diagnostics": plan.get("target_short_floor_diagnostics"),
-            "lot_sync_before_decision": plan.get("lot_sync_before_decision"),
         },
         "missing_by_column": missing_by_column,
         "sec_status_counts": _counter_from_rows(alpha_rows, "sec_status"),
@@ -8935,9 +8916,8 @@ def _build_decision_trace(
     alpha: dict[str, dict[str, Any]],
     before: dict[str, dict[str, Any]],
     after: dict[str, dict[str, Any]],
-    lot_weights: dict[str, dict[str, float]],
 ) -> list[dict[str, Any]]:
-    symbols = sorted(set(targets) | set(before) | set(after) | set(lot_weights))
+    symbols = sorted(set(targets) | set(before) | set(after))
     rows: list[dict[str, Any]] = []
     for sym in symbols:
         target = targets.get(sym, {})
@@ -8967,47 +8947,11 @@ def _build_decision_trace(
             "beta": _safe_float(a.get("beta")),
             "composite_score": _safe_float(a.get("composite_score")),
             "composite_rank": _safe_int(a.get("composite_rank")),
-            "lot_total_weight": sum(lot_weights.get(sym, {}).values()),
         }
         for col in FACTOR_COLUMNS:
             row[col] = _safe_float(a.get(col))
-            row[f"lot_weight_{col}"] = _safe_float(lot_weights.get(sym, {}).get(col))
         rows.append(row)
     return rows
-
-
-def _build_lot_trace(lot_snapshot: dict[str, Any], session_idx: int) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
-    ledger = lot_snapshot.get("ledger", {}) if isinstance(lot_snapshot, dict) else {}
-    rows: list[dict[str, Any]] = []
-    lot_weights: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    for side in ["long", "short"]:
-        for lot in ledger.get(side, []) if isinstance(ledger, dict) else []:
-            sym = str(lot.get("symbol") or "").upper().strip()
-            factor = str(lot.get("factor") or "")
-            weight = _safe_float(lot.get("weight"))
-            birth_idx = _safe_int(lot.get("birth_idx"))
-            min_hold = _safe_int(lot.get("min_hold"))
-            age = max(0, session_idx - birth_idx)
-            locked = age < min_hold
-            if sym and factor:
-                lot_weights[sym][factor] += weight
-            rows.append(
-                {
-                    "side": side,
-                    "symbol": sym,
-                    "factor": factor,
-                    "weight": weight,
-                    "birth_idx": birth_idx,
-                    "session_idx": session_idx,
-                    "age_sessions": age,
-                    "min_hold": min_hold,
-                    "locked": locked,
-                    "remaining_lock_sessions": max(0, min_hold - age),
-                    "entry_session_date": lot.get("entry_session_date", ""),
-                    "entry_time_utc": lot.get("entry_time_utc", ""),
-                }
-            )
-    return rows, {s: dict(v) for s, v in lot_weights.items()}
 
 
 def _build_order_trace(
@@ -9293,84 +9237,6 @@ def _build_position_pnl(before: dict[str, dict[str, Any]], after: dict[str, dict
     return rows
 
 
-def _build_factor_attribution(
-    decision_rows: list[dict[str, Any]],
-    lot_weights: dict[str, dict[str, float]],
-) -> list[dict[str, Any]]:
-    """Approximate factor-level PnL by splitting symbol snapshot PnL by lot weights."""
-    rows: list[dict[str, Any]] = []
-    by_factor: dict[str, dict[str, Any]] = defaultdict(lambda: {"factor": "", "lot_weight": 0.0, "approx_intraday_pnl": 0.0, "symbols": set()})
-    by_symbol = {str(row.get("symbol") or "").upper(): row for row in decision_rows}
-    for symbol, weights in lot_weights.items():
-        row = by_symbol.get(symbol, {})
-        pnl = _safe_float(row.get("unrealized_intraday_pl_snapshot"))
-        total = sum(_safe_float(v) for v in weights.values())
-        if total <= 0:
-            continue
-        for factor, weight in weights.items():
-            share = _safe_float(weight) / total if total else 0.0
-            approx = pnl * share
-            bucket = by_factor[factor]
-            bucket["factor"] = factor
-            bucket["lot_weight"] += _safe_float(weight)
-            bucket["approx_intraday_pnl"] += approx
-            bucket["symbols"].add(symbol)
-            rows.append(
-                {
-                    "level": "symbol_factor",
-                    "factor": factor,
-                    "symbol": symbol,
-                    "symbol_side": row.get("after_side") or row.get("target_side") or "",
-                    "symbol_intraday_pnl_snapshot": pnl,
-                    "symbol_lot_total_weight": total,
-                    "factor_lot_weight": _safe_float(weight),
-                    "factor_weight_share_in_symbol": share,
-                    "approx_intraday_pnl": approx,
-                    "note": "snapshot approximation: symbol unrealized_intraday_pl allocated by factor-lot weight share",
-                }
-            )
-    summary_rows = []
-    for factor, bucket in by_factor.items():
-        summary_rows.append(
-            {
-                "level": "factor_total",
-                "factor": factor,
-                "symbol": "__TOTAL__",
-                "symbol_side": "",
-                "symbol_intraday_pnl_snapshot": "",
-                "symbol_lot_total_weight": "",
-                "factor_lot_weight": bucket["lot_weight"],
-                "factor_weight_share_in_symbol": "",
-                "approx_intraday_pnl": bucket["approx_intraday_pnl"],
-                "note": f"{len(bucket['symbols'])} symbols",
-            }
-        )
-    return sorted(summary_rows, key=lambda r: _safe_float(r.get("approx_intraday_pnl"))) + rows
-
-
-def _find_pre_trade_lot_snapshot(
-    run_dir: Path,
-    decision_dir: Path | None,
-    session_key: str,
-) -> tuple[dict[str, Any], Path | None, str]:
-    candidates: list[tuple[Path, str]] = [
-        (run_dir / f"lot_snapshot_before_execution_{session_key}.json", "execute_pre_execution"),
-        (run_dir / f"lot_snapshot_before_decision_{session_key}.json", "run_pre_decision"),
-    ]
-    if decision_dir:
-        candidates.extend(
-            [
-                (decision_dir / f"lot_snapshot_before_decision_{session_key}.json", "decision_pre_decision"),
-                (decision_dir / f"lot_snapshot_{session_key}.json", "decision_post_decision_fallback"),
-            ]
-        )
-    candidates.append((run_dir / f"lot_snapshot_{session_key}.json", "execute_post_execution_fallback"))
-    for path, source in candidates:
-        if path.exists():
-            return _read_json(path, {}), path, source
-    return {}, None, "missing"
-
-
 def _order_lookup(records: list[dict[str, Any]], order_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for row in order_rows:
@@ -9406,66 +9272,6 @@ def _order_lookup(records: list[dict[str, Any]], order_rows: list[dict[str, Any]
     return lookup
 
 
-def _pre_trade_lot_states(
-    lot_snapshot: dict[str, Any],
-    before_positions: dict[str, dict[str, Any]],
-    session_idx: int,
-) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    ledger = lot_snapshot.get("ledger", {}) if isinstance(lot_snapshot, dict) else {}
-    states: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    ordinals: Counter[tuple[str, str, str, int]] = Counter()
-    for side in ("long", "short"):
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for lot in ledger.get(side, []) if isinstance(ledger, dict) else []:
-            if not isinstance(lot, dict):
-                continue
-            sym = str(lot.get("symbol") or "").upper().strip()
-            if not sym:
-                continue
-            grouped[sym].append(lot)
-        for sym, lots in grouped.items():
-            pos = before_positions.get(sym, {})
-            pos_side = str(pos.get("side") or "").lower()
-            pos_qty = _safe_float(pos.get("qty"))
-            if pos_side != side or pos_qty <= 0:
-                continue
-            total_weight = sum(_safe_float(lot.get("weight")) for lot in lots)
-            if total_weight <= 0:
-                continue
-            for lot in lots:
-                factor = str(lot.get("factor") or "unknown")
-                birth_idx = _safe_int(lot.get("birth_idx"))
-                min_hold = _safe_int(lot.get("min_hold"))
-                key = (side, sym, factor, birth_idx)
-                ordinals[key] += 1
-                lot_weight = _safe_float(lot.get("weight"))
-                remaining_qty = pos_qty * lot_weight / total_weight
-                states[(side, sym)].append(
-                    {
-                        "lot_id": f"{side}:{sym}:{factor}:{birth_idx}:{ordinals[key]}",
-                        "side": side,
-                        "symbol": sym,
-                        "factor": factor,
-                        "weight": lot_weight,
-                        "remaining_qty": remaining_qty,
-                        "birth_idx": birth_idx,
-                        "min_hold": min_hold,
-                        "locked": int(session_idx) - birth_idx < min_hold,
-                        "entry_session_date": lot.get("entry_session_date", ""),
-                        "entry_time_utc": lot.get("entry_time_utc", ""),
-                    }
-                )
-            states[(side, sym)].sort(
-                key=lambda item: (
-                    bool(item.get("locked")),
-                    -_safe_int(item.get("birth_idx")),
-                    -_safe_float(item.get("weight")),
-                    str(item.get("factor") or ""),
-                )
-            )
-    return states
-
-
 def _signed_slippage_bps(side: str, reference_price: float, fill_price: float) -> float | None:
     if reference_price <= 0 or fill_price <= 0:
         return None
@@ -9480,12 +9286,9 @@ def _build_realized_pnl_ledger(
     records: list[dict[str, Any]],
     order_rows: list[dict[str, Any]],
     before_positions: dict[str, dict[str, Any]],
-    pre_trade_lot_snapshot: dict[str, Any],
     session_date: str,
     session_idx: int,
-    lot_source: str,
 ) -> list[dict[str, Any]]:
-    lot_states = _pre_trade_lot_states(pre_trade_lot_snapshot, before_positions, session_idx)
     remaining_position_qty: dict[tuple[str, str], float] = {}
     for sym, pos in before_positions.items():
         side = str(pos.get("side") or "").lower()
@@ -9517,98 +9320,41 @@ def _build_realized_pnl_ledger(
         reference_price = _safe_float(order.get("reference_price"))
         slippage_bps = _signed_slippage_bps(fill_side, reference_price, fill_price)
 
-        if closing_side and close_qty > 1e-9 and avg_entry > 0:
+        if closing_side and close_qty > 1e-9:
             remaining_position_qty[(closing_side, symbol)] = max(0.0, available - close_qty)
-            remaining_to_allocate = close_qty
-            lots = lot_states.get((closing_side, symbol), [])
-            for lot in lots:
-                if remaining_to_allocate <= 1e-9:
-                    break
-                lot_remaining = _safe_float(lot.get("remaining_qty"))
-                if lot_remaining <= 1e-9:
-                    continue
-                qty = min(lot_remaining, remaining_to_allocate)
-                lot["remaining_qty"] = max(0.0, lot_remaining - qty)
-                remaining_to_allocate -= qty
-                pnl_per_share = (fill_price - avg_entry) if closing_side == "long" else (avg_entry - fill_price)
-                seq += 1
-                ledger_rows.append(
-                    {
-                        "ledger_seq": seq,
-                        "session_date": session_date,
-                        "session_idx": session_idx,
-                        "symbol": symbol,
-                        "fill_side": fill_side,
-                        "closed_position_side": closing_side,
-                        "action": "close",
-                        "fill_id": fill.get("raw_activity_id", ""),
-                        "order_id": order_id,
-                        "client_order_id": fill.get("client_order_id") or order.get("client_order_id", ""),
-                        "stage": order.get("stage", ""),
-                        "transaction_time": fill.get("transaction_time", ""),
-                        "fill_qty": fill_qty,
-                        "closed_qty": qty,
-                        "opening_qty": 0.0,
-                        "fill_price": fill_price,
-                        "avg_entry_price_before": avg_entry,
-                        "cost_basis_source": "broker_avg_entry_price_before",
-                        "realized_pnl": pnl_per_share * qty,
-                        "pnl_per_share": pnl_per_share,
-                        "gross_exit_notional": qty * fill_price,
-                        "reference_price": reference_price,
-                        "slippage_bps": slippage_bps,
-                        "lot_id": lot.get("lot_id", ""),
-                        "factor": lot.get("factor", ""),
-                        "lot_weight": lot.get("weight", ""),
-                        "lot_birth_idx": lot.get("birth_idx", ""),
-                        "lot_min_hold": lot.get("min_hold", ""),
-                        "lot_locked_at_close": lot.get("locked", ""),
-                        "lot_entry_session_date": lot.get("entry_session_date", ""),
-                        "lot_entry_time_utc": lot.get("entry_time_utc", ""),
-                        "pre_trade_lot_source": lot_source,
-                        "strictness": "fill_level_with_broker_avg_cost_and_strategy_lot_allocation",
-                    }
-                )
-            if remaining_to_allocate > 1e-6:
-                pnl_per_share = (fill_price - avg_entry) if closing_side == "long" else (avg_entry - fill_price)
-                seq += 1
-                ledger_rows.append(
-                    {
-                        "ledger_seq": seq,
-                        "session_date": session_date,
-                        "session_idx": session_idx,
-                        "symbol": symbol,
-                        "fill_side": fill_side,
-                        "closed_position_side": closing_side,
-                        "action": "close_unattributed",
-                        "fill_id": fill.get("raw_activity_id", ""),
-                        "order_id": order_id,
-                        "client_order_id": fill.get("client_order_id") or order.get("client_order_id", ""),
-                        "stage": order.get("stage", ""),
-                        "transaction_time": fill.get("transaction_time", ""),
-                        "fill_qty": fill_qty,
-                        "closed_qty": remaining_to_allocate,
-                        "opening_qty": 0.0,
-                        "fill_price": fill_price,
-                        "avg_entry_price_before": avg_entry,
-                        "cost_basis_source": "broker_avg_entry_price_before",
-                        "realized_pnl": pnl_per_share * remaining_to_allocate,
-                        "pnl_per_share": pnl_per_share,
-                        "gross_exit_notional": remaining_to_allocate * fill_price,
-                        "reference_price": reference_price,
-                        "slippage_bps": slippage_bps,
-                        "lot_id": "",
-                        "factor": "unattributed_pre_trade_lot",
-                        "lot_weight": "",
-                        "lot_birth_idx": "",
-                        "lot_min_hold": "",
-                        "lot_locked_at_close": "",
-                        "lot_entry_session_date": "",
-                        "lot_entry_time_utc": "",
-                        "pre_trade_lot_source": lot_source,
-                        "strictness": "fill_level_with_broker_avg_cost_unattributed_lot",
-                    }
-                )
+            has_cost_basis = avg_entry > 0
+            pnl_per_share = (
+                (fill_price - avg_entry) if closing_side == "long" else (avg_entry - fill_price)
+            ) if has_cost_basis else None
+            seq += 1
+            ledger_rows.append(
+                {
+                    "ledger_seq": seq,
+                    "session_date": session_date,
+                    "session_idx": session_idx,
+                    "symbol": symbol,
+                    "fill_side": fill_side,
+                    "closed_position_side": closing_side,
+                    "action": "close" if has_cost_basis else "close_missing_cost_basis",
+                    "fill_id": fill.get("raw_activity_id", ""),
+                    "order_id": order_id,
+                    "client_order_id": fill.get("client_order_id") or order.get("client_order_id", ""),
+                    "stage": order.get("stage", ""),
+                    "transaction_time": fill.get("transaction_time", ""),
+                    "fill_qty": fill_qty,
+                    "closed_qty": close_qty,
+                    "opening_qty": 0.0,
+                    "fill_price": fill_price,
+                    "avg_entry_price_before": avg_entry if has_cost_basis else "",
+                    "cost_basis_source": "broker_avg_entry_price_before" if has_cost_basis else "missing",
+                    "realized_pnl": pnl_per_share * close_qty if pnl_per_share is not None else "",
+                    "pnl_per_share": pnl_per_share if pnl_per_share is not None else "",
+                    "gross_exit_notional": close_qty * fill_price,
+                    "reference_price": reference_price,
+                    "slippage_bps": slippage_bps,
+                    "strictness": "fill_level_with_broker_avg_cost" if has_cost_basis else "fill_level_missing_cost_basis",
+                }
+            )
         if opening_qty > 1e-9:
             seq += 1
             ledger_rows.append(
@@ -9636,15 +9382,6 @@ def _build_realized_pnl_ledger(
                     "gross_exit_notional": 0.0,
                     "reference_price": reference_price,
                     "slippage_bps": slippage_bps,
-                    "lot_id": "",
-                    "factor": "new_position_not_realized",
-                    "lot_weight": "",
-                    "lot_birth_idx": "",
-                    "lot_min_hold": "",
-                    "lot_locked_at_close": "",
-                    "lot_entry_session_date": "",
-                    "lot_entry_time_utc": "",
-                    "pre_trade_lot_source": lot_source,
                     "strictness": "opening_fill_no_realized_pnl_yet",
                 }
             )
@@ -9677,7 +9414,7 @@ def _group_realized(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[st
     return sorted(grouped.values(), key=lambda item: _safe_float(item.get("realized_pnl")))
 
 
-def _realized_summary(rows: list[dict[str, Any]], lot_source_path: Path | None, lot_source: str) -> dict[str, Any]:
+def _realized_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     close_rows = [row for row in rows if _safe_float(row.get("closed_qty")) > 0]
     opening_rows = [row for row in rows if _safe_float(row.get("opening_qty")) > 0]
     return {
@@ -9688,13 +9425,8 @@ def _realized_summary(rows: list[dict[str, Any]], lot_source_path: Path | None, 
         "close_row_count": len(close_rows),
         "opening_row_count": len(opening_rows),
         "ledger_row_count": len(rows),
-        "pre_trade_lot_source": lot_source,
-        "pre_trade_lot_source_path": lot_source_path.as_posix() if lot_source_path else None,
         "cost_basis_source": "broker_positions_before.avg_entry_price",
-        "strictness": (
-            "Fill-level realized PnL using broker average entry cost before execution; "
-            "factor ownership allocated by pre-trade strategy lot reduction policy."
-        ),
+        "strictness": "Fill-level realized PnL using broker average entry cost before execution.",
     }
 
 
@@ -9711,7 +9443,6 @@ def _risk_snapshot(
     quality: dict[str, Any],
     decision_diag: dict[str, Any],
     decision_rows: list[dict[str, Any]],
-    lot_rows: list[dict[str, Any]],
     execution_attempt_outcomes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     long_mv = sum(max(0.0, _safe_float(r.get("after_market_value"))) for r in decision_rows)
@@ -9719,13 +9450,10 @@ def _risk_snapshot(
     equity = _safe_float(summary.get("account_equity_post_trade") or summary.get("account_equity"), 0.0)
     side_pnl = defaultdict(float)
     sector_pnl = defaultdict(float)
-    factor_weight = defaultdict(float)
     for r in decision_rows:
         side = r.get("after_side") or r.get("target_side") or "unknown"
         side_pnl[str(side)] += _safe_float(r.get("unrealized_intraday_pl_snapshot"))
         sector_pnl[str(r.get("sic2_sector") or "unknown")] += _safe_float(r.get("unrealized_intraday_pl_snapshot"))
-    for r in lot_rows:
-        factor_weight[str(r.get("factor") or "unknown")] += _safe_float(r.get("weight"))
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "session_date": summary.get("decision_date") or quality.get("session_date"),
@@ -9752,9 +9480,6 @@ def _risk_snapshot(
         },
         "snapshot_intraday_pnl_by_side": dict(sorted(side_pnl.items())),
         "snapshot_intraday_pnl_by_sector": dict(sorted(sector_pnl.items(), key=lambda kv: kv[1])),
-        "lot_weight_by_factor": dict(sorted(factor_weight.items())),
-        "locked_lot_count": sum(1 for r in lot_rows if str(r.get("locked")).lower() == "true"),
-        "lot_count": len(lot_rows),
     }
 
 
@@ -9868,7 +9593,6 @@ def _write_review(
         f"- Closed qty total: `{(realized_summary or {}).get('closed_qty_total')}`\n",
         f"- Close rows: `{(realized_summary or {}).get('close_row_count')}`; opening rows: `{(realized_summary or {}).get('opening_row_count')}`\n",
         f"- Cost basis: `{(realized_summary or {}).get('cost_basis_source')}`\n",
-        f"- Lot source: `{(realized_summary or {}).get('pre_trade_lot_source')}`\n",
         "\n## Equity / PnL Bridge\n",
         f"- Broker equity change: `{bridge_amounts.get('broker_equity_change')}`\n",
         f"- Snapshot intraday PnL: `{bridge_amounts.get('snapshot_unrealized_intraday_pnl')}`\n",
@@ -10164,15 +9888,12 @@ def _write_review(
         "\n## Files in this audit package\n",
         "- `00_run_context.json` — run inputs/paths and artifact availability\n",
         "- Source artifacts in run dir — `source_code_snapshot.zip`, `source_git_diff.patch`, and manifests capture exact runnable code for future runs\n",
-        "- `01_decision_trace.csv` — symbol-level target, alpha, lot, position and PnL snapshot\n",
-        "- `02_lot_trace.csv` — factor-lot age/lock trace\n",
+        "- `01_decision_trace.csv` — symbol-level target, alpha, position and PnL snapshot\n",
         "- `03_order_trace.csv` — plan vs submit/fill trace\n",
         "- `04_position_pnl_snapshot.csv` — broker position PnL snapshot\n",
         "- `05_fill_trace.csv` — fill-level trace; broker FILL activities when available, execution-record fallback otherwise\n",
-        "- `06_factor_attribution_snapshot.csv` — approximate factor PnL allocation by factor-lot weight share\n",
-        "- `07_risk_snapshot.json` — aggregate exposure, quality, side/sector/factor summaries\n",
-        "- `08_realized_pnl_ledger.csv` — fill x lot realized PnL attribution ledger\n",
-        "- `09_factor_realized_pnl.csv` — realized PnL grouped by factor and closed side\n",
+        "- `07_risk_snapshot.json` — aggregate exposure, quality, and side/sector summaries\n",
+        "- `08_realized_pnl_ledger.csv` — fill-level realized PnL from broker average cost\n",
         "- `10_symbol_realized_pnl.csv` — realized PnL grouped by symbol and closed side\n",
         "- `11_realized_pnl_summary.json` — realized PnL ledger metadata and totals\n",
         "- `12_audit_manifest.json` — file inventory with size, mtime, and sha256 hashes\n",
@@ -10225,7 +9946,7 @@ def _write_review(
         "- `39_evidence_completeness.csv/json` — evidence coverage by replay area and strict replay readiness\n",
         "- `40_target_transition_trace.csv` — intended before-to-target transition vs after snapshot by symbol\n",
         "- `41_target_transition_summary.json` — target-transition status, counts, largest gaps, and unverified transitions\n",
-        "- `42_decision_intent_trace.csv` — raw target weights, projected executable weights, signal/lot context, and no-order reasons\n",
+        "- `42_decision_intent_trace.csv` — raw target weights, projected executable weights, signal context, and no-order reasons\n",
         "- `43_decision_intent_summary.json` — target projection, short-floor, skipped-symbol, and no-order diagnostics\n",
         "- `44_order_constraint_trace.csv` — order-builder constraints, quantity rounding, skipped rows, and fill coverage\n",
         "- `45_order_constraint_summary.json` — order constraint totals, skipped reasons, whole-share counts, and largest unfilled orders\n",
@@ -10259,15 +9980,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     for stale_name in [
         "00_run_context.json",
         "01_decision_trace.csv",
-        "02_lot_trace.csv",
         "03_order_trace.csv",
         "04_position_pnl_snapshot.csv",
         "05_risk_snapshot.json",
         "05_fill_trace.csv",
-        "06_factor_attribution_snapshot.csv",
         "07_risk_snapshot.json",
         "08_realized_pnl_ledger.csv",
-        "09_factor_realized_pnl.csv",
         "10_symbol_realized_pnl.csv",
         "11_realized_pnl_summary.json",
         "12_audit_manifest.json",
@@ -10369,16 +10087,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     startup_binding_rows, startup_binding_summary = _build_startup_binding_audit(run_dir.parent)
 
     session_date = str(summary.get("decision_date") or plan.get("decision_date") or "")
-    session_key = session_date.replace("-", "") if session_date else run_dir.name.split("_")[0]
-    lot_path = run_dir / f"lot_snapshot_{session_key}.json"
-    if not lot_path.exists() and decision_dir:
-        lot_path = decision_dir / f"lot_snapshot_{session_key}.json"
-    lot_snapshot = _read_json(lot_path, {})
-    pre_trade_lot_snapshot, pre_trade_lot_path, pre_trade_lot_source = _find_pre_trade_lot_snapshot(
-        run_dir,
-        decision_dir,
-        session_key,
-    )
     alpha_path = _find_alpha_path(run_dir, decision_dir, summary)
 
     targets = _load_targets(run_dir / "decision_targets.csv")
@@ -10395,8 +10103,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     if not alpha:
         alpha = _load_alpha_by_symbol(alpha_path)
     session_idx = _safe_int(summary.get("session_idx") or plan.get("session_idx"))
-    lot_rows, lot_weights = _build_lot_trace(lot_snapshot, session_idx)
-    decision_rows = _build_decision_trace(targets, alpha, before, after, lot_weights)
+    decision_rows = _build_decision_trace(targets, alpha, before, after)
     order_rows = _build_order_trace(
         plan,
         records if isinstance(records, list) else [],
@@ -10405,20 +10112,16 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     )
     fill_rows = _build_fill_trace(records if isinstance(records, list) else [], broker_fills if isinstance(broker_fills, dict) else {})
     position_rows = _build_position_pnl(before, after)
-    factor_rows = _build_factor_attribution(decision_rows, lot_weights)
     realized_rows = _build_realized_pnl_ledger(
         fill_rows=fill_rows,
         records=records if isinstance(records, list) else [],
         order_rows=order_rows,
         before_positions=before,
-        pre_trade_lot_snapshot=pre_trade_lot_snapshot,
         session_date=session_date,
         session_idx=session_idx,
-        lot_source=pre_trade_lot_source,
     )
-    factor_realized_rows = _group_realized(realized_rows, ["factor", "closed_position_side"])
     symbol_realized_rows = _group_realized(realized_rows, ["symbol", "closed_position_side"])
-    realized_summary = _realized_summary(realized_rows, pre_trade_lot_path, pre_trade_lot_source)
+    realized_summary = _realized_summary(realized_rows)
     order_poll_rows = _build_order_poll_rows(order_poll_timeline if isinstance(order_poll_timeline, dict) else {})
     data_quality = _build_data_quality_snapshot(
         alpha_rows=alpha_rows,
@@ -10529,7 +10232,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     market_context_rows, market_context_summary = _build_market_context_attribution(
         run_dir=run_dir,
         decision_rows=decision_rows,
-        lot_rows=lot_rows,
         symbol_attribution_rows=symbol_attribution_rows,
         market_price_evidence_rows=market_price_evidence_rows,
     )
@@ -10800,9 +10502,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             else None,
             "decision_targets": (run_dir / "decision_targets.csv").as_posix(),
             "alpha_panel": alpha_path.as_posix() if alpha_path else None,
-            "lot_snapshot": lot_path.as_posix() if lot_path.exists() else None,
-            "pre_trade_lot_snapshot": pre_trade_lot_path.as_posix() if pre_trade_lot_path else None,
-            "pre_trade_lot_source": pre_trade_lot_source,
             "broker_positions_before": (run_dir / "broker_positions_before.csv").as_posix(),
             "broker_positions_after": (run_dir / "broker_positions_after.csv").as_posix(),
         },
@@ -10813,7 +10512,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             "alpha_symbols": len(alpha),
             "positions_before": len(before),
             "positions_after": len(after),
-            "lot_rows": len(lot_rows),
             "order_rows": len(order_rows),
             "fill_rows": len(fill_rows),
             "realized_pnl_rows": len(realized_rows),
@@ -10896,7 +10594,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         quality,
         decision_diag,
         decision_rows,
-        lot_rows,
         execution_attempt_outcomes,
     )
     equity_pnl_bridge = _build_equity_pnl_bridge(
@@ -11061,12 +10758,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "before_market_value", "after_market_value", "delta_market_value", "current_price", "avg_entry_price",
         "unrealized_intraday_pl_snapshot", "unrealized_pl_since_entry", "change_today", "sic2_sector", "beta",
         "composite_score", "composite_rank", "reversal_score", "momentum_score", "small_size_score", "low_beta_score",
-        "cash_quality_score", "lot_total_weight", "lot_weight_reversal_score", "lot_weight_momentum_score",
-        "lot_weight_small_size_score", "lot_weight_low_beta_score", "lot_weight_cash_quality_score",
-    ])
-    _write_csv(audit_dir / "02_lot_trace.csv", lot_rows, [
-        "side", "symbol", "factor", "weight", "birth_idx", "session_idx", "age_sessions", "min_hold", "locked",
-        "remaining_lock_sessions", "entry_session_date", "entry_time_utc",
+        "cash_quality_score",
     ])
     _write_csv(audit_dir / "03_order_trace.csv", order_rows, [
         "symbol", "side", "stage", "planned_qty", "planned_delta_notional", "reference_price", "sizing_price",
@@ -11085,25 +10777,18 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "source", "fill_seq", "symbol", "side", "order_id", "client_order_id", "transaction_time", "qty", "price",
         "gross_amount", "net_amount", "raw_activity_id",
     ])
-    _write_csv(audit_dir / "06_factor_attribution_snapshot.csv", factor_rows, [
-        "level", "factor", "symbol", "symbol_side", "symbol_intraday_pnl_snapshot", "symbol_lot_total_weight",
-        "factor_lot_weight", "factor_weight_share_in_symbol", "approx_intraday_pnl", "note",
-    ])
     _write_json(audit_dir / "07_risk_snapshot.json", risk)
     realized_fields = [
         "ledger_seq", "session_date", "session_idx", "symbol", "fill_side", "closed_position_side", "action",
         "fill_id", "order_id", "client_order_id", "stage", "transaction_time", "fill_qty", "closed_qty",
         "opening_qty", "fill_price", "avg_entry_price_before", "cost_basis_source", "realized_pnl",
-        "pnl_per_share", "gross_exit_notional", "reference_price", "slippage_bps", "lot_id", "factor",
-        "lot_weight", "lot_birth_idx", "lot_min_hold", "lot_locked_at_close", "lot_entry_session_date",
-        "lot_entry_time_utc", "pre_trade_lot_source", "strictness",
+        "pnl_per_share", "gross_exit_notional", "reference_price", "slippage_bps", "strictness",
     ]
     _write_csv(audit_dir / "08_realized_pnl_ledger.csv", realized_rows, realized_fields)
     realized_summary_fields = [
-        "factor", "symbol", "closed_position_side", "realized_pnl", "closed_qty", "opening_qty",
+        "symbol", "closed_position_side", "realized_pnl", "closed_qty", "opening_qty",
         "gross_exit_notional", "fill_row_count", "close_row_count",
     ]
-    _write_csv(audit_dir / "09_factor_realized_pnl.csv", factor_realized_rows, realized_summary_fields)
     _write_csv(audit_dir / "10_symbol_realized_pnl.csv", symbol_realized_rows, realized_summary_fields)
     _write_json(audit_dir / "11_realized_pnl_summary.json", realized_summary)
     order_poll_fields = [
@@ -11293,8 +10978,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "remaining_qty_from_order_trace", "order_intent_status", "skip_reason", "skip_count",
         "min_trade_notional", "composite_score", "reversal_score", "momentum_score",
         "small_size_score", "low_beta_score", "cash_quality_score", "beta", "sic2_sector",
-        "lot_total_weight", "lot_weight_reversal_score", "lot_weight_momentum_score",
-        "lot_weight_small_size_score", "lot_weight_low_beta_score", "lot_weight_cash_quality_score",
     ]
     _write_csv(audit_dir / "42_decision_intent_trace.csv", decision_intent_rows, decision_intent_fields)
     _write_json(audit_dir / "43_decision_intent_summary.json", decision_intent_summary)
@@ -11574,7 +11257,6 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "audit_dir": audit_dir.as_posix(),
         "session_date": session_date,
         "decision_rows": len(decision_rows),
-        "lot_rows": len(lot_rows),
         "order_rows": len(order_rows),
         "fill_rows": len(fill_rows),
         "realized_pnl_rows": len(realized_rows),

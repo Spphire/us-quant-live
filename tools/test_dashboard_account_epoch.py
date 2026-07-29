@@ -38,18 +38,15 @@ def _write_positions(path: Path, rows: list[dict]) -> None:
 def _build_fixture(project_root: Path) -> tuple[Path, DataAggregator]:
     artifacts_root = project_root / "artifacts" / "daily_alpaca_scheduler"
     _write_json(
-        project_root / "artifacts" / "alpaca_executor" / "lot_ledger.json",
+        project_root / "artifacts" / "alpaca_executor" / "account_state.json",
         {
-            "meta": {
-                "lifecycle_epoch": 2,
-                "account_reset_at_utc": "2026-07-23T03:05:04Z",
-                "account_reset_effective_session": "2026-07-23",
-                "broker_account_id": "new-account-id",
-                "broker_account_number": "NEW-PAPER",
-                "initial_equity": 100000.0,
-                "initial_cash": 100000.0,
-            },
-            "ledger": {"long": [], "short": []},
+            "lifecycle_epoch": 2,
+            "account_reset_at_utc": "2026-07-23T03:05:04Z",
+            "account_reset_effective_session": "2026-07-23",
+            "broker_account_id": "new-account-id",
+            "broker_account_number": "NEW-PAPER",
+            "initial_equity": 100000.0,
+            "initial_cash": 100000.0,
         },
     )
     _write_json(

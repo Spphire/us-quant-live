@@ -45,8 +45,8 @@ class DataAggregator:
         with self.cache_lock:
             state = self._read_scheduler_state()
             latest_summary = self._get_latest_execution_summary()
-            lot_ledger = self._read_lot_ledger()
-            account_epoch = self._account_epoch(lot_ledger)
+            account_state = self._read_account_state()
+            account_epoch = self._account_epoch(account_state)
             reset_pending = self._account_reset_pending(account_epoch, latest_summary)
             audit_rollup = self._read_audit_rollup()
             latest_audit = self._latest_audit_row(audit_rollup)
@@ -56,7 +56,7 @@ class DataAggregator:
                 if reset_pending
                 else latest_summary.get("account_equity_post_trade", 0.0)
             )
-            session_idx = lot_ledger.get("meta", {}).get("last_session_idx", 0)
+            session_idx = account_state.get("last_session_idx", 0)
 
             positions_data = [] if reset_pending else self._read_latest_positions()
             long_count = sum(1 for p in positions_data if p.get("side") == "long")
@@ -104,44 +104,16 @@ class DataAggregator:
     def get_positions(self) -> list[dict[str, Any]]:
         """Get current positions."""
         with self.cache_lock:
-            account_epoch = self._account_epoch(self._read_lot_ledger())
+            account_epoch = self._account_epoch(self._read_account_state())
             if self._account_reset_pending(account_epoch, self._get_latest_execution_summary()):
                 return []
             return self._read_latest_positions()
 
-    def get_lots(self) -> dict[str, Any]:
-        """Get factor lot breakdown."""
-        with self.cache_lock:
-            lot_ledger = self._read_lot_ledger()
-            long_lots = lot_ledger.get("ledger", {}).get("long", [])
-            short_lots = lot_ledger.get("ledger", {}).get("short", [])
-
-            # Count by factor
-            factor_counts: dict[str, int] = {}
-            factor_weights: dict[str, float] = {}
-            for lot in long_lots + short_lots:
-                factor = lot.get("factor", "unknown")
-                factor_counts[factor] = factor_counts.get(factor, 0) + 1
-                factor_weights[factor] = factor_weights.get(factor, 0.0) + float(lot.get("weight", 0.0))
-
-            # Count locked vs unlocked
-            session_idx = lot_ledger.get("meta", {}).get("last_session_idx", 0)
-            locked = sum(1 for lot in long_lots + short_lots if self._is_locked(lot, session_idx))
-            unlocked = len(long_lots) + len(short_lots) - locked
-
-            return {
-                "composition": {"counts": factor_counts, "weights": factor_weights},
-                "lots": long_lots + short_lots,
-                "locked_count": locked,
-                "unlocked_count": unlocked,
-                "total_count": len(long_lots) + len(short_lots),
-            }
-
     def get_history(self, limit: int = 30) -> list[dict[str, Any]]:
         """Get execution history across all run directories."""
         with self.cache_lock:
-            lot_ledger = self._read_lot_ledger()
-            account_epoch = self._account_epoch(lot_ledger)
+            account_state = self._read_account_state()
+            account_epoch = self._account_epoch(account_state)
             summaries = []
             if account_epoch.get("effective_session"):
                 summaries.append(
@@ -191,6 +163,8 @@ class DataAggregator:
                         account_epoch,
                         session_date,
                     )
+                    if run_type == "execute":
+                        summary.update(self._read_side_return_snapshot(run_dir))
                     if run_type == "execute":
                         audit = audit_rows.get(session_date) or audit_rows.get(self._compact_date_to_iso(session_date)) or {}
                     else:
@@ -519,8 +493,7 @@ class DataAggregator:
 
     def get_config(self) -> dict[str, Any]:
         """Get system configuration and live status."""
-        lot_ledger = self._read_lot_ledger()
-        meta = lot_ledger.get("meta", {})
+        account_state = self._read_account_state()
 
         # Try to read scheduler command for actual config
         scheduler_cmd_file = self.artifacts_root / "daemon" / "scheduler.command.txt"
@@ -563,12 +536,12 @@ class DataAggregator:
                 "pid_scheduler": scheduler_pid,
                 "pid_watchdog": watchdog_pid,
             },
-            "ledger": {
-                "last_session_idx": meta.get("last_session_idx"),
-                "last_session_date": meta.get("last_session_date"),
-                "last_sync_at_utc": meta.get("executor_last_sync_at_utc"),
-                "last_broker_equity": meta.get("executor_last_broker_equity"),
-                "last_sync_applied": meta.get("executor_last_sync_applied"),
+            "account_state": {
+                "last_session_idx": account_state.get("last_session_idx"),
+                "last_session_date": account_state.get("last_session_date"),
+                "last_run_at_utc": account_state.get("executor_last_run_utc"),
+                "last_broker_equity": account_state.get("executor_last_broker_equity"),
+                "last_post_trade_equity": account_state.get("executor_last_post_trade_equity"),
             },
             "scheduler_command": scheduler_cmd,
             "scheduler_due_latest": self._read_json_file(
@@ -877,7 +850,7 @@ class DataAggregator:
     def get_artifact_mtimes(self) -> dict[str, float]:
         """Return mtimes of key artifact files for change detection (SSE)."""
         files = {
-            "lot_ledger": self.project_root / "artifacts" / "alpaca_executor" / "lot_ledger.json",
+            "account_state": self.project_root / "artifacts" / "alpaca_executor" / "account_state.json",
             "state": self.artifacts_root / "state.json",
             "audit_rollup": self.artifacts_root / "audit_rollup.json",
         }
@@ -1485,6 +1458,45 @@ class DataAggregator:
         """Read audit_rollup.json if available."""
         return self._read_json_file(self.artifacts_root / "audit_rollup.json")
 
+    def _read_side_return_snapshot(self, run_dir: Path) -> dict[str, Any]:
+        """Read broker intraday PnL and normalize it by post-trade side exposure."""
+        risk = self._read_json_file(run_dir / "audit" / "07_risk_snapshot.json")
+        by_side = risk.get("snapshot_intraday_pnl_by_side", {})
+        if not isinstance(by_side, dict):
+            by_side = {}
+
+        long_pnl = self._safe_timeline_float(by_side.get("long"))
+        short_pnl = self._safe_timeline_float(by_side.get("short"))
+        long_exposure = self._safe_timeline_float(
+            risk.get("gross_long_market_value_after")
+        )
+        short_exposure = self._safe_timeline_float(
+            risk.get("gross_short_market_value_abs_after")
+        )
+
+        def normalized_return(pnl: float | None, exposure: float | None) -> float | None:
+            if pnl is None or exposure is None or exposure <= 0:
+                return None
+            return pnl / exposure
+
+        return {
+            "side_return_snapshot_source": (
+                "audit/07_risk_snapshot.json" if risk else ""
+            ),
+            "long_snapshot_intraday_pnl": long_pnl,
+            "short_snapshot_intraday_pnl": short_pnl,
+            "long_gross_exposure_after": long_exposure,
+            "short_gross_exposure_after": short_exposure,
+            "long_snapshot_intraday_return": normalized_return(
+                long_pnl,
+                long_exposure,
+            ),
+            "short_snapshot_intraday_return": normalized_return(
+                short_pnl,
+                short_exposure,
+            ),
+        }
+
     @staticmethod
     def _compact_date_to_iso(value: str) -> str:
         token = str(value or "").strip()
@@ -1584,28 +1596,22 @@ class DataAggregator:
         execute = session.get("execute", {}) or {}
         return latest_date, decision, execute
 
-    def _read_lot_ledger(self) -> dict[str, Any]:
-        """Read lot_ledger.json."""
-        ledger_file = self.project_root / "artifacts" / "alpaca_executor" / "lot_ledger.json"
-        if not ledger_file.exists():
-            return {"ledger": {"long": [], "short": []}, "meta": {}}
-        try:
-            return json.loads(ledger_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {"ledger": {"long": [], "short": []}, "meta": {}}
+    def _read_account_state(self) -> dict[str, Any]:
+        """Read the executor account lifecycle state."""
+        return self._read_json_file(
+            self.project_root / "artifacts" / "alpaca_executor" / "account_state.json"
+        )
 
     @staticmethod
-    def _account_epoch(lot_ledger: dict[str, Any]) -> dict[str, Any]:
-        meta = lot_ledger.get("meta", {}) if isinstance(lot_ledger, dict) else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        effective_session = str(meta.get("account_reset_effective_session") or "").strip()
+    def _account_epoch(account_state: dict[str, Any]) -> dict[str, Any]:
+        state = account_state if isinstance(account_state, dict) else {}
+        effective_session = str(state.get("account_reset_effective_session") or "").strip()
         return {
-            "capital_epoch": max(1, int(meta.get("lifecycle_epoch") or 1)),
+            "capital_epoch": max(1, int(state.get("lifecycle_epoch") or 1)),
             "effective_session": effective_session,
-            "initial_equity": float(meta.get("initial_equity") or 0.0),
-            "initial_cash": float(meta.get("initial_cash") or 0.0),
-            "reset_at_utc": str(meta.get("account_reset_at_utc") or ""),
+            "initial_equity": float(state.get("initial_equity") or 0.0),
+            "initial_cash": float(state.get("initial_cash") or 0.0),
+            "reset_at_utc": str(state.get("account_reset_at_utc") or ""),
         }
 
     @staticmethod
@@ -1681,14 +1687,6 @@ class DataAggregator:
         except Exception:
             return []
 
-    @staticmethod
-    def _is_locked(lot: dict[str, Any], current_session_idx: int) -> bool:
-        """Check if lot is locked (within min_hold period)."""
-        birth_idx = int(lot.get("birth_idx", 0))
-        min_hold = int(lot.get("min_hold", 0))
-        return (current_session_idx - birth_idx) < min_hold
-
-
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP request handler for dashboard."""
 
@@ -1712,8 +1710,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(self.aggregator.get_overview())
         elif path == "/api/positions":
             self._send_json(self.aggregator.get_positions())
-        elif path == "/api/lots":
-            self._send_json(self.aggregator.get_lots())
         elif path == "/api/history":
             limit = int(query.get("limit", ["30"])[0])
             self._send_json(self.aggregator.get_history(limit))

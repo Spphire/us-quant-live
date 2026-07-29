@@ -33,7 +33,6 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
-from lot_manager import DEFAULT_FACTOR_MIN_HOLDS, LotManager  # noqa: E402
 from vendors import (  # noqa: E402
     AlpacaHttpClient,
     AlpacaRequestError,
@@ -44,7 +43,7 @@ from vendors import (  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "artifacts" / "ibkr_executor"
-DEFAULT_LEDGER_PATH = PROJECT_ROOT / "artifacts" / "ibkr_executor" / "lot_ledger.json"
+DEFAULT_ACCOUNT_STATE_PATH = PROJECT_ROOT / "artifacts" / "ibkr_executor" / "account_state.json"
 EPS = 1e-10
 TERMINAL_ORDER_STATUSES = {
     "filled",
@@ -77,7 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Execute daily AlphaCore + DecisionEngine plan with IBKR execution: "
-            "broker/lot sync -> alpha decision -> open-triggered order submit -> post-trade lot sync."
+            "broker state -> alpha decision -> open-triggered order submit -> post-trade reconciliation."
         )
     )
     parser.add_argument("--date", default=date.today().isoformat())
@@ -164,10 +163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--turnover-budget", type=float, default=0.15)
     parser.add_argument("--beta-band-grid", default="0.05,0.10,0.15,0.20")
 
-    parser.add_argument("--ledger-path", default=str(DEFAULT_LEDGER_PATH))
+    parser.add_argument("--account-state-path", default=str(DEFAULT_ACCOUNT_STATE_PATH))
     parser.add_argument("--session-idx", type=int, default=None)
-    parser.add_argument("--lot-sync-mode", choices=("check", "auto_fix"), default="auto_fix")
-    parser.add_argument("--lot-sync-tolerance", type=float, default=0.01)
 
     parser.add_argument(
         "--trigger-mode",
@@ -257,7 +254,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         output_root.mkdir(parents=True, exist_ok=True)
         should_submit = not bool(args.no_submit) and str(args.trigger_mode) != "plan_only"
-        ledger_write_enabled = bool(should_submit)
 
         alpaca_credentials = _resolve_alpaca_credentials(
             accounts_json_path=str(args.accounts_json_path),
@@ -295,45 +291,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             equity=equity_before,
         )
 
-        ledger_path = Path(args.ledger_path).resolve()
-        ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        lot_manager = LotManager.from_json(ledger_path)
-        resolved_session_idx = _resolve_session_idx(lot_manager, args.session_idx)
-
-        lot_check = _check_lot_alignment(
-            lot_manager=lot_manager,
-            broker_weights=broker_weights_before,
-            tolerance=float(args.lot_sync_tolerance),
+        account_state_path = Path(args.account_state_path).resolve()
+        account_state_path.parent.mkdir(parents=True, exist_ok=True)
+        account_state = _load_json_dict(account_state_path)
+        resolved_session_idx = _resolve_session_idx(
+            account_state,
+            args.session_idx,
+            session_date=decision_date.isoformat(),
         )
-        lot_sync_applied = False
-        if lot_check["abs_weight_diff_sum"] > float(args.lot_sync_tolerance):
-            if str(args.lot_sync_mode) == "check":
-                raise ValueError(
-                    "Lot/Broker mismatch exceeded tolerance in check mode. "
-                    f"abs_weight_diff_sum={lot_check['abs_weight_diff_sum']:.6f} "
-                    f"tolerance={float(args.lot_sync_tolerance):.6f}"
-                )
-            _sync_lot_to_broker(
-                lot_manager=lot_manager,
-                broker_weights=broker_weights_before,
-                session_idx=resolved_session_idx,
-                session_date=decision_date.isoformat(),
-            )
-            lot_sync_applied = True
-
-        lot_manager.meta.update(
+        account_state.setdefault("schema_version", "1.0")
+        account_state.setdefault("lifecycle_epoch", 1)
+        account_state.setdefault("initial_equity", float(equity_before))
+        account_state.update(
             {
-                "executor_last_sync_mode": str(args.lot_sync_mode),
-                "executor_last_sync_applied": bool(lot_sync_applied),
-                "executor_last_sync_at_utc": _utc_now(),
+                "last_session_idx": int(resolved_session_idx),
+                "last_session_date": decision_date.isoformat(),
                 "executor_last_broker_equity": float(equity_before),
                 "executor_last_broker_equity_source": str(equity_before_source),
                 "executor_broker": "ibkr_client_portal",
                 "executor_broker_account_id": broker_account_id,
             }
         )
-        if ledger_write_enabled:
-            lot_manager.to_json(ledger_path)
+        _write_json_file(account_state_path, account_state)
         alpha_panel = pd.DataFrame()
         alpha_path: Path | None = None
         decision_targets_path: Path | None = None
@@ -441,7 +420,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             decision_config = DecisionConfig(
                 factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
-                factor_min_holds=dict(DEFAULT_FACTOR_MIN_HOLDS),
                 candidate_pool_per_side=int(args.candidate_pool_per_side),
                 max_single_name_side_weight=float(args.max_single_name_side_weight),
                 min_nonzero_names=int(args.min_nonzero_names),
@@ -454,7 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             engine = DecisionEngine(decision_config)
             decision_result = engine.decide(
                 alpha_frame=alpha_panel,
-                lot_manager=lot_manager,
+                previous_weights=_split_signed_weights(broker_weights_before),
                 session_idx=int(resolved_session_idx),
                 session_date=decision_date.isoformat(),
             )
@@ -465,7 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             decision_diagnostics = dict(decision_result.diagnostics)
 
             decision_targets_path = output_root / "decision_targets.csv"
-            target_signed_weights = _signed_weights_from_lot(lot_manager)
+            target_signed_weights = _signed_weights_from_decision_targets(decision_result.targets)
             _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
         assets_by_symbol: dict[str, Mapping[str, Any]] = {}
 
@@ -540,7 +518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "decision_status": decision_status,
                     "decision_skip_reason": decision_skip_reason,
                     "decision_diagnostics": decision_diagnostics,
-                    "lot_sync_before_decision": lot_check,
+                    "previous_broker_signed_weights": dict(sorted(broker_weights_before.items())),
                     "sec_cache_source": sec_cache_source,
                     "dynamic_symbol_count": int(len(symbols)),
                     "raw_target_signed_weights": raw_target_signed_weights,
@@ -598,31 +576,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             broker_signed_notional_after,
             equity=equity_after,
         )
-        post_trade_lot_manager = lot_manager.clone()
-        _sync_lot_to_broker(
-            lot_manager=post_trade_lot_manager,
-            broker_weights=broker_weights_after,
-            session_idx=int(resolved_session_idx),
-            session_date=decision_date.isoformat(),
-        )
-        post_trade_lot_manager.meta.update(
+        account_state.update(
             {
                 "last_session_idx": int(resolved_session_idx),
                 "last_session_date": decision_date.isoformat(),
                 "executor_last_run_utc": _utc_now(),
                 "executor_last_order_count": int(len(instructions)),
                 "executor_last_submit_enabled": bool(should_submit),
-                "executor_last_ledger_write_enabled": bool(ledger_write_enabled),
                 "executor_last_post_trade_equity": float(equity_after),
                 "executor_last_post_trade_equity_source": str(equity_after_source),
                 "executor_broker": "ibkr_client_portal",
                 "executor_broker_account_id": broker_account_id,
             }
         )
-        day_lot_snapshot_path = output_root / f"lot_snapshot_{decision_date.strftime('%Y%m%d')}.json"
-        if ledger_write_enabled:
-            post_trade_lot_manager.to_json(ledger_path)
-        post_trade_lot_manager.to_json(day_lot_snapshot_path, extra_meta={"snapshot_type": "post_execution_daily"})
+        _write_json_file(account_state_path, account_state)
 
         broker_frame_before.to_csv(output_root / "broker_positions_before.csv", index=False)
         broker_frame_after.to_csv(output_root / "broker_positions_after.csv", index=False)
@@ -651,9 +618,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "order_plan_count": int(len(instructions)),
             "submitted": bool(should_submit),
             "submitted_orders": int(len(execution_records)),
-            "ledger_write_enabled": bool(ledger_write_enabled),
-            "lot_ledger_path": ledger_path.as_posix(),
-            "daily_lot_snapshot_path": day_lot_snapshot_path.as_posix(),
+            "account_state_path": account_state_path.as_posix(),
             "alignment_after_execution": alignment_after,
             "outputs": {
                 "alpha_panel_csv": alpha_path.as_posix() if alpha_path else None,
@@ -721,7 +686,7 @@ def _parse_hhmm(text: str) -> tuple[int, int]:
 
 def _load_json_dict(path: Path) -> dict[str, Any]:
     if not path.exists():
-        raise FileNotFoundError(f"JSON file not found: {path.as_posix()}")
+        return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object in {path.as_posix()}")
@@ -849,12 +814,20 @@ def _resolve_account_equity(
     )
 
 
-def _resolve_session_idx(lot_manager: LotManager, provided: int | None) -> int:
+def _resolve_session_idx(
+    account_state: Mapping[str, Any],
+    provided: int | None,
+    session_date: str | None = None,
+) -> int:
     if provided is not None:
         return int(provided)
-    if "last_session_idx" in lot_manager.meta:
-        return int(lot_manager.meta["last_session_idx"]) + 1
-    return int(lot_manager.max_birth_idx()) + 1
+    last_idx = account_state.get("last_session_idx")
+    if last_idx is not None:
+        last_date = account_state.get("last_session_date")
+        if session_date is not None and last_date is not None and str(last_date) == str(session_date):
+            return int(last_idx)
+        return int(last_idx) + 1
+    return 0
 
 
 def _positions_to_frame_and_notional(
@@ -930,51 +903,39 @@ def _weights_from_signed_notional(
     return out
 
 
-def _signed_weights_from_lot(lot_manager: LotManager) -> dict[str, float]:
-    previous = lot_manager.previous_weights()
+def _split_signed_weights(signed_weights: Mapping[str, float]) -> dict[str, dict[str, float]]:
+    long_weights: dict[str, float] = {}
+    short_weights: dict[str, float] = {}
+    for symbol, raw_weight in signed_weights.items():
+        weight = float(raw_weight)
+        symbol_text = str(symbol).strip().upper()
+        if not symbol_text or abs(weight) <= EPS:
+            continue
+        if weight > 0:
+            long_weights[symbol_text] = weight
+        else:
+            short_weights[symbol_text] = abs(weight)
+    return {"long": long_weights, "short": short_weights}
+
+
+def _signed_weights_from_decision_targets(targets: pd.DataFrame) -> dict[str, float]:
+    if targets.empty:
+        return {}
+    required = {"symbol", "signed_weight"}
+    if not required.issubset(targets.columns):
+        raise ValueError(f"decision targets missing columns: {sorted(required - set(targets.columns))}")
     out: dict[str, float] = {}
-    for symbol, value in previous.get("long", {}).items():
-        out[str(symbol).upper()] = out.get(str(symbol).upper(), 0.0) + float(value)
-    for symbol, value in previous.get("short", {}).items():
-        out[str(symbol).upper()] = out.get(str(symbol).upper(), 0.0) - float(value)
-    return {symbol: float(value) for symbol, value in out.items() if abs(value) > EPS}
+    for row in targets[["symbol", "signed_weight"]].itertuples(index=False):
+        symbol = str(row.symbol).strip().upper()
+        weight = float(row.signed_weight)
+        if symbol and abs(weight) > EPS:
+            out[symbol] = weight
+    return out
 
 
-def _check_lot_alignment(
-    *,
-    lot_manager: LotManager,
-    broker_weights: Mapping[str, float],
-    tolerance: float,
-) -> dict[str, Any]:
-    lot_signed = _signed_weights_from_lot(lot_manager)
-    universe = sorted(set(lot_signed) | set(broker_weights))
-    diffs = [abs(float(lot_signed.get(symbol, 0.0)) - float(broker_weights.get(symbol, 0.0))) for symbol in universe]
-    abs_sum = float(sum(diffs))
-    max_abs = float(max(diffs)) if diffs else 0.0
-    return {
-        "lot_symbol_count": int(len(lot_signed)),
-        "broker_symbol_count": int(len(broker_weights)),
-        "union_symbol_count": int(len(universe)),
-        "abs_weight_diff_sum": abs_sum,
-        "max_abs_weight_diff": max_abs,
-        "within_tolerance": bool(abs_sum <= float(tolerance)),
-    }
-
-
-def _sync_lot_to_broker(
-    *,
-    lot_manager: LotManager,
-    broker_weights: Mapping[str, float],
-    session_idx: int,
-    session_date: str | None = None,
-) -> None:
-    lot_manager.sync_to_broker_weights(
-        broker_weights=broker_weights,
-        session_idx=int(session_idx),
-        session_date=str(session_date) if session_date is not None else None,
-        sync_factor="broker_sync",
-        sync_time_utc=_utc_now(),
-    )
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _build_fallback_price_map(

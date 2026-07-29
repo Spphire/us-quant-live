@@ -39,12 +39,11 @@ python src/alpaca_executor.py \
 
 Check outputs:
 - `artifacts/test_decision/decision_targets.csv` - target weights
-- `artifacts/test_decision/lot_snapshot_*.json` - factor lots with min_hold
-- `artifacts/alpaca_executor/lot_ledger.json` - persisted ledger
+- `artifacts/alpaca_executor/account_state.json` - account lifecycle and session metadata
 
-Verify the ledger contains lots with:
-- `factor`: "reversal_score", "momentum_score", etc. (NOT just "broker_sync")
-- `min_hold`: 5, 10, 20 (NOT just 0)
+The optimizer uses current broker position weights as the previous portfolio. The
+default rebalance turnover budget is `0.15`; an underinvested account receives a
+separate deploy-gap allowance so the initial portfolio can be established.
 
 ## Run Full Scheduler Test
 
@@ -102,6 +101,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_sch
 **First time setup checklist:**
 - [ ] Create `configs/alpaca_acounts/alpaca_accounts.local.json` from template
 - [ ] Fill in Alpaca API key/secret (use paper account for testing!)
-- [ ] Run single decision test to verify lot persistence works
+- [ ] Run a single decision test and inspect targets plus turnover diagnostics
 - [ ] Start daemon in foreground mode to observe one full cycle
 - [ ] Switch to background mode for production

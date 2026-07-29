@@ -252,7 +252,7 @@ python tools/test_tray_launcher.py
 
 ### 为什么用 30 秒早死阈值？
 
-- scheduler 启动包括：加载 Python 模块、连接 Alpaca API、初始化 lot ledger
+- scheduler 启动包括：加载 Python 模块、连接 Alpaca API、读取账户状态
 - 通常需要 5-15 秒
 - 30 秒既能识别真正的配置错误，又能容忍正常的启动延迟
 

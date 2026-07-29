@@ -43,12 +43,6 @@ python tools/dashboard_server.py \
 - **Columns**: Symbol, Side, Qty, Market Value, Entry Price, Current Price, P&L, % Change
 - **Color Coding**: Green for profits, Red for losses
 
-### 🎯 Factor Lots Tab (Key Feature)
-- **Composition Doughnut Chart**: Visual factor distribution
-- **Factor Legend**: Count per factor with color codes
-- **Metrics**: Total / Locked / Unlocked lots
-- **Detailed Lot Table**: First 200 lots with symbol/factor/weight/min_hold/birth_idx
-
 ### 📅 History Tab
 - **Last 50 Executions**: Date, session, status, symbols, orders, equity
 - **Details Modal**: Click "Details" for full execution_summary.json
@@ -64,13 +58,13 @@ python tools/dashboard_server.py \
 ### ⚙️ Settings Tab
 - **Trading Config**: Account, feed, execution mode, schedule times
 - **System Info**: Python version, platform, PIDs (self/scheduler/watchdog)
-- **Ledger State**: Last session_idx, date, sync time, equity
+- **Account State**: Last session index/date, run time, and broker equity
 - **Scheduler Command**: Full command line (if available)
 
 ## Real-Time Updates (SSE)
 
 Dashboard uses **Server-Sent Events** for live updates:
-- ✅ Detects changes to `lot_ledger.json` within ~1.5 seconds
+- ✅ Detects changes to `account_state.json` within ~1.5 seconds
 - ✅ Detects changes to `state.json` (scheduler progress)
 - ✅ Detects new `execution_summary.json` files
 - ✅ Auto-reconnect on disconnection (5s retry)
@@ -86,10 +80,9 @@ When changes detected → current tab data automatically refreshes.
 ```
 GET /api/overview      - Account summary + position counts
 GET /api/positions     - All active positions with P&L
-GET /api/lots          - Factor lots with composition
 GET /api/history       - Execution history (?limit=N)
 GET /api/logs          - Parsed logs (?lines=N&level=X&source=Y)
-GET /api/config        - Trading + system + ledger config
+GET /api/config        - Trading + system + account-state config
 GET /api/stream        - Server-Sent Events for live updates
 GET /                  - Dashboard HTML SPA
 ```
@@ -109,8 +102,8 @@ GET /                  - Dashboard HTML SPA
               ▼
 ┌─────────────────────────────────────────────┐
 │  dashboard.html (Vanilla JS + Chart.js)      │
-│  ├── 6 Tabs: Overview / Positions / Lots /   │
-│  │           History / Logs / Settings       │
+│  ├── 6 Tabs: Overview / Positions / History /│
+│  │   Execution Timeline / Logs / Settings    │
 │  ├── SSE Client (auto-reconnect)             │
 │  ├── Filter/Search/Sort                      │
 │  └── Modal for detail views                  │
@@ -124,7 +117,7 @@ GET /                  - Dashboard HTML SPA
 - `artifacts/daily_alpaca_scheduler/logs/*.log` - task logs
 - `artifacts/daily_alpaca_scheduler/daemon/*.log` - scheduler logs
 - `artifacts/daily_alpaca_scheduler/watchdog/*.log` - watchdog logs
-- `artifacts/alpaca_executor/lot_ledger.json` - factor lots
+- `artifacts/alpaca_executor/account_state.json` - account lifecycle/session state
 
 ## Configuration
 
@@ -150,7 +143,7 @@ GET /                  - Dashboard HTML SPA
 ## UI Design
 - 🌑 **Dark theme**: Professional trading platform aesthetic
 - 🎨 **Color palette**: Deep navy (#0a0e27) base, blue accents (#60a5fa)
-- 💚 **Status colors**: Green for profits, Red for losses, Orange for locked
+- 💚 **Status colors**: Green for profits, Red for losses, Orange for warnings
 - ⚡ **Smooth animations**: Tab transitions, pulse indicators
 - 📱 **Responsive**: Adapts to screen size (charts stack on mobile)
 
@@ -164,7 +157,7 @@ GET /                  - Dashboard HTML SPA
 ### Empty data
 - Make sure scheduler has run at least once (or use test data)
 - Check `artifacts/daily_alpaca_scheduler/output/` has run directories
-- Verify `artifacts/alpaca_executor/lot_ledger.json` exists
+- Verify `artifacts/alpaca_executor/account_state.json` exists
 
 ### Port already in use
 ```bash
@@ -178,10 +171,9 @@ python tools/dashboard_server.py --port 8767
 GET /                  HTTP 200 (~50KB HTML)
 GET /api/overview      HTTP 200 (account + counts)
 GET /api/positions     HTTP 200 (60 positions)
-GET /api/lots          HTTP 200 (449 lots with factors)
 GET /api/history       HTTP 200 (execution history)
 GET /api/logs          HTTP 200 (parsed log entries)
-GET /api/config        HTTP 200 (trading + system + ledger)
+GET /api/config        HTTP 200 (trading + system + account state)
 GET /api/stream        HTTP 200 (SSE event stream)
 ```
 

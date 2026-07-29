@@ -12,17 +12,10 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
 
-from lot_manager import (
-    DEFAULT_FACTOR_MIN_HOLDS,
-    FACTOR_COLUMNS,
-    EPS,
-    LotManager,
-)
-
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ALPHA_ROOT = PROJECT_ROOT / "artifacts" / "alpha_core"
 DEFAULT_DECISION_ROOT = PROJECT_ROOT / "artifacts" / "decision"
+EPS = 1e-12
 
 DEFAULT_FACTOR_WEIGHTS = {
     "reversal_score": 0.25,
@@ -31,13 +24,13 @@ DEFAULT_FACTOR_WEIGHTS = {
     "low_beta_score": 0.20,
     "cash_quality_score": 0.15,
 }
+FACTOR_COLUMNS = tuple(DEFAULT_FACTOR_WEIGHTS)
 DEFAULT_BETA_BAND_GRID = (0.05, 0.10, 0.15, 0.20)
 
 
 @dataclass(frozen=True)
 class DecisionConfig:
     factor_weights: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_FACTOR_WEIGHTS))
-    factor_min_holds: Mapping[str, int] = field(default_factory=lambda: dict(DEFAULT_FACTOR_MIN_HOLDS))
     candidate_pool_per_side: int = 120
     max_single_name_side_weight: float = 1.0 / 30.0
     min_nonzero_names: int = 20
@@ -59,7 +52,7 @@ class DecisionResult:
 
 
 class DecisionEngine:
-    """Standalone single-session decision engine matching locked-lot mechanics."""
+    """Single-session portfolio optimizer using current broker weights as state."""
 
     def __init__(self, config: DecisionConfig, *, eps: float = EPS) -> None:
         self.config = config
@@ -70,34 +63,30 @@ class DecisionEngine:
         self,
         *,
         alpha_frame: pd.DataFrame,
-        lot_manager: LotManager,
+        previous_weights: Mapping[str, Mapping[str, float]],
         session_idx: int,
         session_date: str,
     ) -> DecisionResult:
         scored = self._prepare_alpha_frame(alpha_frame)
         needed = ["symbol", "composite_score", "beta", "sic2_sector", *FACTOR_COLUMNS]
         base = scored.dropna(subset=needed).drop_duplicates("symbol").copy()
-
+        previous_weights = self._normalize_previous_weights(previous_weights)
         available_symbols = set(base["symbol"].astype(str))
-        dropped_summary = lot_manager.prune(available_symbols=available_symbols, session_idx=int(session_idx))
-        previous_weights = lot_manager.previous_weights()
-        locked_weights = lot_manager.locked_weights(int(session_idx))
-        locked_symbols = {side: set(locked_weights[side]) for side in ("long", "short")}
+        unavailable_previous = {
+            side: sorted(set(previous_weights[side]) - available_symbols)
+            for side in ("long", "short")
+        }
 
-        longs = self._candidate_union_locked(
+        longs = self._candidate_union(
             base,
             side="long",
             previous_weights=previous_weights["long"],
-            locked_symbols=locked_symbols["long"],
-            blocked_symbols=locked_symbols["short"],
             candidate_pool_per_side=int(self.config.candidate_pool_per_side),
         )
-        shorts = self._candidate_union_locked(
+        shorts = self._candidate_union(
             base,
             side="short",
             previous_weights=previous_weights["short"],
-            locked_symbols=locked_symbols["short"],
-            blocked_symbols=locked_symbols["long"],
             candidate_pool_per_side=int(self.config.candidate_pool_per_side),
         )
 
@@ -109,22 +98,20 @@ class DecisionEngine:
 
         if len(base) < 2 * int(self.config.min_nonzero_names) or longs.empty or shorts.empty:
             repaired = self._repair_after_optimizer_failure(
-                lot_manager=lot_manager,
                 base=base,
                 longs=longs,
                 shorts=shorts,
                 previous_weights=previous_weights,
-                locked_weights=locked_weights,
                 session_date=str(session_date),
                 session_idx=int(session_idx),
                 reason="insufficient_base_or_candidates",
-                dropped_summary=dropped_summary,
+                unavailable_previous=unavailable_previous,
             )
             if repaired is not None:
                 return repaired
 
         try:
-            long_weights, short_weights = self._optimize_joint_weights_locked(
+            long_weights, short_weights = self._optimize_joint_weights(
                 longs=longs,
                 shorts=shorts,
                 max_weight=float(self.config.max_single_name_side_weight),
@@ -133,22 +120,11 @@ class DecisionEngine:
                 turnover_penalty=float(self.config.turnover_penalty),
                 previous_long_weights=previous_weights["long"],
                 previous_short_weights=previous_weights["short"],
-                locked_long_weights=locked_weights["long"],
-                locked_short_weights=locked_weights["short"],
                 turnover_budget=float(effective_budget),
                 deploy_gap=float(deploy_gap),
             )
         except ValueError as exc:
-            # First fallback: progressively relax the turnover budget. The strict
-            # budget (default 0.15/day) is designed for steady-state low-turnover
-            # operation. In cold-start scenarios (broker has pre-existing positions
-            # the strategy didn't pick, or after a long pause with significant
-            # drift) the L1 distance from prev to the optimal portfolio genuinely
-            # exceeds the daily budget, so the LP is infeasible NOT because the
-            # alpha or risk constraints conflict — only because we asked it to
-            # transition too fast. Try progressively looser budgets before giving
-            # up on the strict optimizer.
-            relaxed_turnover = self._try_relaxed_turnover_fallback(
+            relaxed = self._try_relaxed_beta_fallback(
                 longs=longs,
                 shorts=shorts,
                 max_weight=float(self.config.max_single_name_side_weight),
@@ -157,104 +133,71 @@ class DecisionEngine:
                 turnover_penalty=float(self.config.turnover_penalty),
                 previous_long_weights=previous_weights["long"],
                 previous_short_weights=previous_weights["short"],
-                locked_long_weights=locked_weights["long"],
-                locked_short_weights=locked_weights["short"],
-                base_turnover_budget=float(effective_budget),
+                turnover_budget=float(effective_budget),
                 deploy_gap=float(deploy_gap),
+                beta_band_grid=self.config.beta_band_grid,
             )
-            if relaxed_turnover is not None:
-                long_weights, short_weights, used_budget = relaxed_turnover
+            if relaxed is not None:
+                long_weights, short_weights, used_beta_band = relaxed
                 carry_reason = (
-                    f"fallback_relaxed_turnover_budget_{used_budget:.3f}"
+                    f"fallback_relaxed_beta_band_{used_beta_band:.3f}"
                     f"_after_optimizer_failed:{str(exc).replace(' ', '_')}"
                 )
-                # Override effective_budget for downstream diagnostics so the
-                # actual budget used is recorded.
-                effective_budget = used_budget
-                turnover_cap_total = float(effective_budget + deploy_gap)
             else:
-                relaxed = self._try_relaxed_beta_fallback(
+                repaired = self._repair_after_optimizer_failure(
+                    base=base,
                     longs=longs,
                     shorts=shorts,
-                    max_weight=float(self.config.max_single_name_side_weight),
-                    score_weight=float(self.config.score_weight),
-                    sector_penalty=float(self.config.sector_penalty),
-                    turnover_penalty=float(self.config.turnover_penalty),
-                    previous_long_weights=previous_weights["long"],
-                    previous_short_weights=previous_weights["short"],
-                    locked_long_weights=locked_weights["long"],
-                    locked_short_weights=locked_weights["short"],
-                    turnover_budget=float(effective_budget),
-                    deploy_gap=float(deploy_gap),
-                    beta_band_grid=self.config.beta_band_grid,
+                    previous_weights=previous_weights,
+                    session_date=str(session_date),
+                    session_idx=int(session_idx),
+                    reason=f"optimizer_failed:{exc}",
+                    unavailable_previous=unavailable_previous,
                 )
-                if relaxed is not None:
-                    long_weights, short_weights, used_beta_band = relaxed
-                    carry_reason = (
-                        f"fallback_relaxed_beta_band_{used_beta_band:.3f}"
-                        f"_after_optimizer_failed:{str(exc).replace(' ', '_')}"
-                    )
-                else:
-                    repaired = self._repair_after_optimizer_failure(
-                        lot_manager=lot_manager,
-                        base=base,
-                        longs=longs,
-                        shorts=shorts,
-                        previous_weights=previous_weights,
-                        locked_weights=locked_weights,
-                        session_date=str(session_date),
-                        session_idx=int(session_idx),
-                        reason=f"optimizer_failed:{exc}",
-                        dropped_summary=dropped_summary,
-                    )
-                    if repaired is not None:
-                        return repaired
-                    diagnostics = {
-                        "status": "skip",
-                        "skip_reason": f"optimizer_failed_unrepairable:{exc}",
-                        "session_date": str(session_date),
-                        "session_idx": int(session_idx),
-                        "base_names": int(len(base)),
-                        "long_candidates": int(len(longs)),
-                        "short_candidates": int(len(shorts)),
-                        "dropped_lot_summary": dropped_summary,
-                    }
-                    return DecisionResult(
-                        status="skip",
-                        session_idx=int(session_idx),
-                        session_date=str(session_date),
-                        targets=pd.DataFrame(),
-                        diagnostics=diagnostics,
-                        skip_reason="optimizer_failed_unrepairable",
-                    )
+                if repaired is not None:
+                    return repaired
+                diagnostics = {
+                    "status": "skip",
+                    "skip_reason": f"optimizer_failed_unrepairable:{exc}",
+                    "session_date": str(session_date),
+                    "session_idx": int(session_idx),
+                    "base_names": int(len(base)),
+                    "long_candidates": int(len(longs)),
+                    "short_candidates": int(len(shorts)),
+                    "unavailable_previous_symbols": unavailable_previous,
+                }
+                return DecisionResult(
+                    status="skip",
+                    session_idx=int(session_idx),
+                    session_date=str(session_date),
+                    targets=pd.DataFrame(),
+                    diagnostics=diagnostics,
+                    skip_reason="optimizer_failed_unrepairable",
+                )
 
         if int((long_weights > self.eps).sum()) < int(self.config.min_nonzero_names):
             repaired = self._repair_after_optimizer_failure(
-                lot_manager=lot_manager,
                 base=base,
                 longs=longs,
                 shorts=shorts,
                 previous_weights=previous_weights,
-                locked_weights=locked_weights,
                 session_date=str(session_date),
                 session_idx=int(session_idx),
                 reason="insufficient_long_nonzero",
-                dropped_summary=dropped_summary,
+                unavailable_previous=unavailable_previous,
             )
             if repaired is not None:
                 return repaired
         if int((short_weights > self.eps).sum()) < int(self.config.min_nonzero_names):
             repaired = self._repair_after_optimizer_failure(
-                lot_manager=lot_manager,
                 base=base,
                 longs=longs,
                 shorts=shorts,
                 previous_weights=previous_weights,
-                locked_weights=locked_weights,
                 session_date=str(session_date),
                 session_idx=int(session_idx),
                 reason="insufficient_short_nonzero",
-                dropped_summary=dropped_summary,
+                unavailable_previous=unavailable_previous,
             )
             if repaired is not None:
                 return repaired
@@ -265,15 +208,6 @@ class DecisionEngine:
 
         long_target = self._target_dict(longs["symbol"], long_weights)
         short_target = self._target_dict(shorts["symbol"], short_weights)
-        lot_manager.update_for_targets(
-            target_weights={"long": long_target, "short": short_target},
-            base=base,
-            session_idx=int(session_idx),
-            session_date=str(session_date),
-            factor_weights=self.config.factor_weights,
-            factor_min_holds=self.config.factor_min_holds,
-        )
-
         rows = [
             *self._position_rows(longs, long_weights, session_date=str(session_date), session_idx=int(session_idx), side="long"),
             *self._position_rows(shorts, short_weights, session_date=str(session_date), session_idx=int(session_idx), side="short"),
@@ -300,10 +234,9 @@ class DecisionEngine:
             "long_beta": float(np.dot(long_weights, longs["beta"])),
             "short_beta": float(np.dot(short_weights, shorts["beta"])),
             "net_beta": float(np.dot(long_weights, longs["beta"]) - np.dot(short_weights, shorts["beta"])),
-            "locked_long_weight": float(sum(locked_weights["long"].values())),
-            "locked_short_weight": float(sum(locked_weights["short"].values())),
-            "locked_total_weight": float(sum(locked_weights["long"].values()) + sum(locked_weights["short"].values())),
-            "dropped_lot_summary": dropped_summary,
+            "previous_long_weight": float(sum(previous_weights["long"].values())),
+            "previous_short_weight": float(sum(previous_weights["short"].values())),
+            "unavailable_previous_symbols": unavailable_previous,
         }
         return DecisionResult(
             status="ok",
@@ -357,7 +290,7 @@ class DecisionEngine:
         session_date: str,
         session_idx: int,
         reason: str,
-        dropped_summary: Mapping[str, float | int],
+        unavailable_previous: Mapping[str, Sequence[str]],
     ) -> DecisionResult | None:
         if self._is_empty_book(previous_weights):
             return None
@@ -394,7 +327,9 @@ class DecisionEngine:
             "long_candidates": int(len(longs)),
             "short_candidates": int(len(shorts)),
             "target_turnover": 0.0,
-            "dropped_lot_summary": dict(dropped_summary),
+            "unavailable_previous_symbols": {
+                side: list(symbols) for side, symbols in unavailable_previous.items()
+            },
         }
         return DecisionResult(
             status="carry",
@@ -408,16 +343,14 @@ class DecisionEngine:
     def _repair_after_optimizer_failure(
         self,
         *,
-        lot_manager: LotManager,
         base: pd.DataFrame,
         longs: pd.DataFrame,
         shorts: pd.DataFrame,
         previous_weights: Mapping[str, Mapping[str, float]],
-        locked_weights: Mapping[str, Mapping[str, float]],
         session_date: str,
         session_idx: int,
         reason: str,
-        dropped_summary: Mapping[str, float | int],
+        unavailable_previous: Mapping[str, Sequence[str]],
     ) -> DecisionResult | None:
         strict_carry = self._carry_previous(
             base=base,
@@ -425,7 +358,7 @@ class DecisionEngine:
             session_date=session_date,
             session_idx=session_idx,
             reason=reason,
-            dropped_summary=dropped_summary,
+            unavailable_previous=unavailable_previous,
         )
         if strict_carry is not None:
             strict_carry.status = "repair"
@@ -437,14 +370,6 @@ class DecisionEngine:
                     "skip_reason": None,
                 }
             )
-            self._update_lot_manager_from_targets(
-                lot_manager=lot_manager,
-                base=base,
-                long_target=dict(previous_weights["long"]),
-                short_target=dict(previous_weights["short"]),
-                session_idx=session_idx,
-                session_date=session_date,
-            )
             return strict_carry
 
         for method, enforce_cap, allow_cap_relax, fill_empty in (
@@ -455,7 +380,6 @@ class DecisionEngine:
             long_target = self._fill_side_target(
                 candidates=longs,
                 previous=previous_weights["long"],
-                locked=locked_weights["long"],
                 side="long",
                 enforce_cap=enforce_cap,
                 allow_cap_relax=allow_cap_relax,
@@ -464,7 +388,6 @@ class DecisionEngine:
             short_target = self._fill_side_target(
                 candidates=shorts,
                 previous=previous_weights["short"],
-                locked=locked_weights["short"],
                 side="short",
                 enforce_cap=enforce_cap,
                 allow_cap_relax=allow_cap_relax,
@@ -486,6 +409,8 @@ class DecisionEngine:
             raw_turnover += self._side_turnover(previous_weights["short"], short_frame["symbol"], short_weights)
             deploy_gap = self._deploy_gap_from_previous(previous_weights)
             rebalance_turnover = max(0.0, float(raw_turnover) - float(deploy_gap))
+            if rebalance_turnover > float(self.config.turnover_budget) + 1e-8:
+                continue
             net_beta = float(np.dot(long_weights, long_frame["beta"]) - np.dot(short_weights, short_frame["beta"]))
 
             rows = [
@@ -505,15 +430,6 @@ class DecisionEngine:
                 ),
             ]
             targets = pd.DataFrame(rows)
-            self._update_lot_manager_from_targets(
-                lot_manager=lot_manager,
-                base=base,
-                long_target=long_target,
-                short_target=short_target,
-                session_idx=session_idx,
-                session_date=session_date,
-            )
-
             diagnostics = {
                 "status": "repair",
                 "fallback_method": method,
@@ -531,10 +447,11 @@ class DecisionEngine:
                 "max_single_name_side_weight": float(self.config.max_single_name_side_weight),
                 "max_long_side_weight": float(long_weights.max()) if len(long_weights) else 0.0,
                 "max_short_side_weight": float(short_weights.max()) if len(short_weights) else 0.0,
-                "locked_long_weight": float(sum(locked_weights["long"].values())),
-                "locked_short_weight": float(sum(locked_weights["short"].values())),
-                "locked_total_weight": float(sum(locked_weights["long"].values()) + sum(locked_weights["short"].values())),
-                "dropped_lot_summary": dict(dropped_summary),
+                "previous_long_weight": float(sum(previous_weights["long"].values())),
+                "previous_short_weight": float(sum(previous_weights["short"].values())),
+                "unavailable_previous_symbols": {
+                    side: list(symbols) for side, symbols in unavailable_previous.items()
+                },
                 "cap_enforced": bool(enforce_cap),
                 "cap_relaxed": bool(allow_cap_relax),
             }
@@ -554,31 +471,11 @@ class DecisionEngine:
             )
         return None
 
-    def _update_lot_manager_from_targets(
-        self,
-        *,
-        lot_manager: LotManager,
-        base: pd.DataFrame,
-        long_target: Mapping[str, float],
-        short_target: Mapping[str, float],
-        session_idx: int,
-        session_date: str,
-    ) -> None:
-        lot_manager.update_for_targets(
-            target_weights={"long": dict(long_target), "short": dict(short_target)},
-            base=base,
-            session_idx=int(session_idx),
-            session_date=str(session_date),
-            factor_weights=self.config.factor_weights,
-            factor_min_holds=self.config.factor_min_holds,
-        )
-
     def _fill_side_target(
         self,
         *,
         candidates: pd.DataFrame,
         previous: Mapping[str, float],
-        locked: Mapping[str, float],
         side: str,
         enforce_cap: bool,
         allow_cap_relax: bool,
@@ -605,15 +502,6 @@ class DecisionEngine:
             if weight <= self.eps:
                 continue
             target[symbol_text] = weight
-        for symbol, value in locked.items():
-            symbol_text = str(symbol)
-            if symbol_text not in symbols_in_candidates:
-                continue
-            weight = max(0.0, float(value))
-            if weight <= self.eps:
-                continue
-            target[symbol_text] = max(float(target.get(symbol_text, 0.0)), weight)
-
         ranked = self._ranked_symbols_for_side(candidates, side=side)
         if not target:
             if not fill_empty:
@@ -630,22 +518,14 @@ class DecisionEngine:
             return {symbol: equal_weight for symbol in chosen}
 
         for symbol in ranked:
-            locked_target = {
-                str(item): max(0.0, float(value))
-                for item, value in locked.items()
-                if str(item) in target and float(value) > self.eps
-            }
-            locked_sum = float(sum(locked_target.values()))
-            residual_capacity = sum(max(0.0, float(cap) - float(locked_target.get(str(item), 0.0))) for item in target)
-            capacity_ok = locked_sum >= 1.0 - 1e-8 or float(residual_capacity) >= max(0.0, 1.0 - locked_sum) - 1e-8
+            capacity_ok = float(len(target)) * cap >= 1.0 - 1e-8
             if len(target) >= required_names and (capacity_ok or not enforce_cap):
                 break
             if symbol not in target:
                 target[symbol] = 0.0
 
-        target = self._scale_down_to_budget_preserving_locked(
+        target = self._scale_to_budget(
             target=target,
-            locked=locked,
             cap=cap,
             enforce_cap=enforce_cap,
         )
@@ -656,35 +536,22 @@ class DecisionEngine:
         ranked = candidates.sort_values(["composite_score", "symbol"], ascending=ascending)
         return [str(symbol) for symbol in ranked["symbol"].astype(str).tolist()]
 
-    def _scale_down_to_budget_preserving_locked(
+    def _scale_to_budget(
         self,
         *,
         target: Mapping[str, float],
-        locked: Mapping[str, float],
         cap: float,
         enforce_cap: bool,
     ) -> dict[str, float]:
-        locked_target = {
-            str(symbol): max(0.0, float(value))
-            for symbol, value in locked.items()
-            if str(symbol) in target and float(value) > self.eps
-        }
-        locked_sum = float(sum(locked_target.values()))
-        if locked_sum >= 1.0:
-            return self._normalize_weights(locked_target)
-        remaining_budget = max(0.0, 1.0 - locked_sum)
         if not enforce_cap:
-            return self._normalize_preserving_locked(target=target, locked=locked_target)
+            return self._normalize_weights(target)
 
         symbols = [str(symbol) for symbol in target]
-        capacities = {
-            symbol: max(0.0, float(cap) - float(locked_target.get(symbol, 0.0)))
-            for symbol in symbols
-        }
-        if float(sum(capacities.values())) < remaining_budget - 1e-8:
+        capacities = {symbol: max(0.0, float(cap)) for symbol in symbols}
+        if float(sum(capacities.values())) < 1.0 - 1e-8:
             return {}
         residual = {
-            symbol: max(0.0, float(target.get(symbol, 0.0)) - float(locked_target.get(symbol, 0.0)))
+            symbol: max(0.0, float(target.get(symbol, 0.0)))
             for symbol in symbols
         }
         active = {
@@ -694,7 +561,7 @@ class DecisionEngine:
         }
         unused = [symbol for symbol in symbols if symbol not in active and capacities.get(symbol, 0.0) > self.eps]
         fixed: dict[str, float] = {}
-        remaining = float(remaining_budget)
+        remaining = 1.0
         while remaining > self.eps:
             if not active:
                 if not unused:
@@ -725,42 +592,7 @@ class DecisionEngine:
                 return {}
         if remaining > 1e-8:
             return {}
-        out = dict(locked_target)
-        for symbol, value in fixed.items():
-            total_value = float(out.get(symbol, 0.0)) + float(value)
-            if total_value > self.eps:
-                out[symbol] = total_value
-        return out
-
-    def _normalize_preserving_locked(
-        self,
-        *,
-        target: Mapping[str, float],
-        locked: Mapping[str, float],
-    ) -> dict[str, float]:
-        locked_target = {
-            str(symbol): max(0.0, float(value))
-            for symbol, value in locked.items()
-            if float(value) > self.eps
-        }
-        locked_sum = float(sum(locked_target.values()))
-        if locked_sum >= 1.0:
-            return self._normalize_weights(locked_target)
-        flexible = {
-            str(symbol): max(0.0, float(value) - float(locked_target.get(str(symbol), 0.0)))
-            for symbol, value in target.items()
-            if max(0.0, float(value) - float(locked_target.get(str(symbol), 0.0))) > self.eps
-        }
-        flexible_sum = float(sum(flexible.values()))
-        if flexible_sum <= self.eps:
-            return self._normalize_weights(locked_target)
-        out = dict(locked_target)
-        scale = max(0.0, 1.0 - locked_sum) / flexible_sum
-        for symbol, value in flexible.items():
-            scaled = float(value) * scale
-            if scaled > self.eps:
-                out[symbol] = float(out.get(symbol, 0.0)) + scaled
-        return out
+        return {symbol: float(value) for symbol, value in fixed.items() if float(value) > self.eps}
 
     def _normalize_weights(self, weights: Mapping[str, float]) -> dict[str, float]:
         cleaned = {
@@ -773,17 +605,15 @@ class DecisionEngine:
             return {}
         return {symbol: float(value) / total for symbol, value in cleaned.items()}
 
-    def _candidate_union_locked(
+    def _candidate_union(
         self,
         group: pd.DataFrame,
         *,
         side: str,
         previous_weights: Mapping[str, float],
-        locked_symbols: set[str],
-        blocked_symbols: set[str],
         candidate_pool_per_side: int,
     ) -> pd.DataFrame:
-        available = group[~group["symbol"].astype(str).isin(blocked_symbols)].copy()
+        available = group.copy()
         if side == "long":
             ranked = available.sort_values(["composite_score", "symbol"], ascending=[False, True])
         elif side == "short":
@@ -791,13 +621,12 @@ class DecisionEngine:
         else:
             raise ValueError(f"unknown_side:{side}")
         previous_symbols = set(previous_weights)
-        locked = available[available["symbol"].astype(str).isin(locked_symbols)]
         incumbents = available[available["symbol"].astype(str).isin(previous_symbols)]
         top = ranked.head(int(candidate_pool_per_side))
-        union = pd.concat([locked, incumbents, top], ignore_index=True).drop_duplicates("symbol", keep="first")
+        union = pd.concat([incumbents, top], ignore_index=True).drop_duplicates("symbol", keep="first")
         return union.reset_index(drop=True)
 
-    def _optimize_joint_weights_locked(
+    def _optimize_joint_weights(
         self,
         *,
         longs: pd.DataFrame,
@@ -808,8 +637,6 @@ class DecisionEngine:
         turnover_penalty: float,
         previous_long_weights: Mapping[str, float],
         previous_short_weights: Mapping[str, float],
-        locked_long_weights: Mapping[str, float],
-        locked_short_weights: Mapping[str, float],
         turnover_budget: float,
         deploy_gap: float,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -817,27 +644,8 @@ class DecisionEngine:
         n_short = len(shorts)
         n = n_long + n_short
 
-        long_lower = self._sanitize_locked_lower(
-            np.array([float(locked_long_weights.get(symbol, 0.0)) for symbol in longs["symbol"]], dtype=float),
-            max_weight=max_weight,
-        )
-        short_lower = self._sanitize_locked_lower(
-            np.array([float(locked_short_weights.get(symbol, 0.0)) for symbol in shorts["symbol"]], dtype=float),
-            max_weight=max_weight,
-        )
-        lower = np.concatenate([long_lower, short_lower])
-
-        if float(long_lower.sum()) > 1.0 + 1e-8 or float(short_lower.sum()) > 1.0 + 1e-8:
-            raise ValueError("locked_weight_exceeds_side_budget")
-        # Per-name upper bound: normally the single-name cap, but if a locked lot
-        # already exceeds the cap (e.g. carried from a prior session, or a broker
-        # position that drifted above cap due to price moves), pin that name's upper
-        # bound to its locked weight so the lower bound never exceeds the upper bound.
-        # This keeps the LP feasible — the cap still constrains all NON-over-locked
-        # names, and over-cap locked names are simply held in place rather than forcing
-        # an infeasible problem (which previously dropped the whole decision to the
-        # carry/repair fallback every session).
-        upper = np.maximum(lower, max_weight)
+        lower = np.zeros(n, dtype=float)
+        upper = np.full(n, float(max_weight), dtype=float)
         if n_long * max_weight < 1.0 - 1e-12 or n_short * max_weight < 1.0 - 1e-12:
             raise ValueError("insufficient_weight_capacity")
 
@@ -849,6 +657,17 @@ class DecisionEngine:
                 np.array([float(previous_long_weights.get(symbol, 0.0)) for symbol in longs["symbol"]], dtype=float),
                 np.array([float(previous_short_weights.get(symbol, 0.0)) for symbol in shorts["symbol"]], dtype=float),
             ]
+        )
+        long_symbols = set(longs["symbol"].astype(str))
+        short_symbols = set(shorts["symbol"].astype(str))
+        outside_turnover = sum(
+            float(weight)
+            for symbol, weight in previous_long_weights.items()
+            if str(symbol) not in long_symbols
+        ) + sum(
+            float(weight)
+            for symbol, weight in previous_short_weights.items()
+            if str(symbol) not in short_symbols
         )
 
         aeq = []
@@ -890,7 +709,10 @@ class DecisionEngine:
         sector_top = np.column_stack([sector_matrix, np.zeros((m_sector, n)), -np.eye(m_sector)])
         sector_bottom = np.column_stack([-sector_matrix, np.zeros((m_sector, n)), -np.eye(m_sector)])
 
-        turnover_limit = max(0.0, float(turnover_budget) + float(deploy_gap))
+        turnover_limit = float(turnover_budget) + float(deploy_gap) - float(outside_turnover)
+        if turnover_limit < -self.eps:
+            raise ValueError("turnover_budget_exhausted_by_unavailable_previous")
+        turnover_limit = max(0.0, turnover_limit)
 
         result = linprog(
             c,
@@ -913,62 +735,6 @@ class DecisionEngine:
             raise ValueError("beta_constraint_breach")
         return long_weights, short_weights
 
-    def _try_relaxed_turnover_fallback(
-        self,
-        *,
-        longs: pd.DataFrame,
-        shorts: pd.DataFrame,
-        max_weight: float,
-        score_weight: float,
-        sector_penalty: float,
-        turnover_penalty: float,
-        previous_long_weights: Mapping[str, float],
-        previous_short_weights: Mapping[str, float],
-        locked_long_weights: Mapping[str, float],
-        locked_short_weights: Mapping[str, float],
-        base_turnover_budget: float,
-        deploy_gap: float,
-    ) -> tuple[np.ndarray, np.ndarray, float] | None:
-        """Retry the strict optimizer with progressively larger turnover budgets.
-
-        The 0.15/day default is for STEADY-STATE rebalancing. Cold-start situations
-        — first run after a long pause, broker has pre-existing positions the
-        strategy didn't pick, large universe drift — produce a genuine L1 gap
-        between prev and optimal that exceeds the daily budget. The LP is then
-        infeasible NOT because alpha/risk constraints conflict, only because the
-        budget pinches the transition.
-
-        Strategy: try doubling the budget up to a cap (2.0 = effectively unbounded
-        per side for a long/short book that sums to 1.0 each side). The smallest
-        budget that works is returned. This lets the system auto-heal from
-        transition mismatches without manual intervention while preserving the
-        steady-state behaviour: when the strict 0.15 budget IS feasible, the
-        outer call uses it directly and this helper is never invoked.
-        """
-        candidate_budgets = [0.30, 0.60, 1.2, 2.0]
-        for budget in candidate_budgets:
-            if budget <= base_turnover_budget:
-                continue
-            try:
-                long_w, short_w = self._optimize_joint_weights_locked(
-                    longs=longs,
-                    shorts=shorts,
-                    max_weight=max_weight,
-                    score_weight=score_weight,
-                    sector_penalty=sector_penalty,
-                    turnover_penalty=turnover_penalty,
-                    previous_long_weights=previous_long_weights,
-                    previous_short_weights=previous_short_weights,
-                    locked_long_weights=locked_long_weights,
-                    locked_short_weights=locked_short_weights,
-                    turnover_budget=float(budget),
-                    deploy_gap=deploy_gap,
-                )
-                return long_w, short_w, float(budget)
-            except ValueError:
-                continue
-        return None
-
     def _try_relaxed_beta_fallback(
         self,
         *,
@@ -980,8 +746,6 @@ class DecisionEngine:
         turnover_penalty: float,
         previous_long_weights: Mapping[str, float],
         previous_short_weights: Mapping[str, float],
-        locked_long_weights: Mapping[str, float],
-        locked_short_weights: Mapping[str, float],
         turnover_budget: float,
         deploy_gap: float,
         beta_band_grid: Sequence[float],
@@ -991,7 +755,7 @@ class DecisionEngine:
             if not np.isfinite(beta_band_value) or beta_band_value <= 0.0:
                 continue
             try:
-                long_weights, short_weights = self._optimize_joint_weights_locked_relaxed_beta(
+                long_weights, short_weights = self._optimize_joint_weights_relaxed_beta(
                     longs=longs,
                     shorts=shorts,
                     max_weight=max_weight,
@@ -1000,8 +764,6 @@ class DecisionEngine:
                     turnover_penalty=turnover_penalty,
                     previous_long_weights=previous_long_weights,
                     previous_short_weights=previous_short_weights,
-                    locked_long_weights=locked_long_weights,
-                    locked_short_weights=locked_short_weights,
                     turnover_budget=turnover_budget,
                     deploy_gap=deploy_gap,
                     beta_band=beta_band_value,
@@ -1011,7 +773,7 @@ class DecisionEngine:
                 continue
         return None
 
-    def _optimize_joint_weights_locked_relaxed_beta(
+    def _optimize_joint_weights_relaxed_beta(
         self,
         *,
         longs: pd.DataFrame,
@@ -1022,8 +784,6 @@ class DecisionEngine:
         turnover_penalty: float,
         previous_long_weights: Mapping[str, float],
         previous_short_weights: Mapping[str, float],
-        locked_long_weights: Mapping[str, float],
-        locked_short_weights: Mapping[str, float],
         turnover_budget: float,
         deploy_gap: float,
         beta_band: float,
@@ -1031,21 +791,8 @@ class DecisionEngine:
         n_long = len(longs)
         n_short = len(shorts)
         n = n_long + n_short
-        long_lower = self._sanitize_locked_lower(
-            np.array([float(locked_long_weights.get(symbol, 0.0)) for symbol in longs["symbol"]], dtype=float),
-            max_weight=max_weight,
-        )
-        short_lower = self._sanitize_locked_lower(
-            np.array([float(locked_short_weights.get(symbol, 0.0)) for symbol in shorts["symbol"]], dtype=float),
-            max_weight=max_weight,
-        )
-        lower = np.concatenate([long_lower, short_lower])
-        if float(long_lower.sum()) > 1.0 + 1e-8 or float(short_lower.sum()) > 1.0 + 1e-8:
-            raise ValueError("locked_weight_exceeds_side_budget")
-        # See _optimize_joint_weights_locked: pin per-name upper to the locked weight
-        # when it exceeds the single-name cap, keeping the LP feasible instead of
-        # rejecting over-cap locked lots and dropping to the carry/repair fallback.
-        upper = np.maximum(lower, max_weight)
+        lower = np.zeros(n, dtype=float)
+        upper = np.full(n, float(max_weight), dtype=float)
         if n_long * max_weight < 1.0 - 1e-12 or n_short * max_weight < 1.0 - 1e-12:
             raise ValueError("insufficient_weight_capacity")
 
@@ -1057,6 +804,17 @@ class DecisionEngine:
                 np.array([float(previous_long_weights.get(symbol, 0.0)) for symbol in longs["symbol"]], dtype=float),
                 np.array([float(previous_short_weights.get(symbol, 0.0)) for symbol in shorts["symbol"]], dtype=float),
             ]
+        )
+        long_symbols = set(longs["symbol"].astype(str))
+        short_symbols = set(shorts["symbol"].astype(str))
+        outside_turnover = sum(
+            float(weight)
+            for symbol, weight in previous_long_weights.items()
+            if str(symbol) not in long_symbols
+        ) + sum(
+            float(weight)
+            for symbol, weight in previous_short_weights.items()
+            if str(symbol) not in short_symbols
         )
 
         aeq = []
@@ -1097,7 +855,10 @@ class DecisionEngine:
         beta_upper = np.concatenate([beta_row, np.zeros(n + m_sector)])[None, :]
         beta_lower = np.concatenate([-beta_row, np.zeros(n + m_sector)])[None, :]
 
-        turnover_limit = max(0.0, float(turnover_budget) + float(deploy_gap))
+        turnover_limit = float(turnover_budget) + float(deploy_gap) - float(outside_turnover)
+        if turnover_limit < -self.eps:
+            raise ValueError("turnover_budget_exhausted_by_unavailable_previous")
+        turnover_limit = max(0.0, turnover_limit)
 
         result = linprog(
             c,
@@ -1139,41 +900,6 @@ class DecisionEngine:
         if abs(net_beta) > float(beta_band) + 1e-5:
             raise ValueError("beta_band_constraint_breach")
         return long_weights, short_weights
-
-    def _sanitize_locked_lower(self, values: np.ndarray, *, max_weight: float) -> np.ndarray:
-        # Clean tiny/negative noise and normalize collectively-over-budget locked
-        # weights down to fit under the side-budget constraint (Σw_side = 1.0).
-        #
-        # Two kinds of overflow are handled here:
-        #
-        #  (a) Tiny floating-point noise (sum in (1.0, 1.0+1e-7]): scale to just
-        #      under 1.0 so the equality constraint stays feasible.
-        #
-        #  (b) Genuine over-budget locked total (e.g. broker positions drifted up
-        #      on price, side-weight sum reached 100.3% as seen in the 2026-06-29
-        #      paper account): proportionally scale ALL locked weights down so
-        #      their sum reaches `over_budget_target` (default 0.99). This
-        #      preserves the RELATIVE position structure while making the LP
-        #      feasible — without this rescue, every decision would dead-end at
-        #      'locked_weight_exceeds_side_budget' and fall back to carry/repair,
-        #      never running the real optimization.
-        #
-        # We do NOT clip individual over-cap locked weights here — the optimizer
-        # accommodates them via a per-name upper bound (see
-        # _optimize_joint_weights_locked).
-        lower = np.asarray(values, dtype=float).copy()
-        lower[np.abs(lower) <= self.eps] = 0.0
-        total = float(lower.sum())
-        if total > 1.0:
-            if total <= 1.0 + 1e-7:
-                # Float-noise: nudge under 1.0
-                lower *= (1.0 - 1e-9) / total
-            else:
-                # Genuine over-budget: scale to 99% of the side budget so the LP
-                # has a tiny slack for the equality constraint.
-                over_budget_target = 0.99
-                lower *= over_budget_target / total
-        return lower
 
     def _group_exposure_matrix(self, longs: pd.DataFrame, shorts: pd.DataFrame, group_column: str) -> np.ndarray:
         groups = sorted(set(longs[group_column].astype(str)).union(set(shorts[group_column].astype(str))))
@@ -1243,6 +969,23 @@ class DecisionEngine:
         short_gap = max(0.0, 1.0 - short_sum)
         return float(long_gap + short_gap)
 
+    def _normalize_previous_weights(
+        self,
+        previous_weights: Mapping[str, Mapping[str, float]],
+    ) -> dict[str, dict[str, float]]:
+        normalized: dict[str, dict[str, float]] = {"long": {}, "short": {}}
+        for side in ("long", "short"):
+            side_values = previous_weights.get(side, {})
+            for symbol, raw_value in side_values.items():
+                value = float(raw_value)
+                symbol_text = str(symbol).strip().upper()
+                if symbol_text and np.isfinite(value) and value > self.eps:
+                    normalized[side][symbol_text] = value
+        overlap = set(normalized["long"]) & set(normalized["short"])
+        if overlap:
+            raise ValueError(f"previous_weights contain both sides for: {','.join(sorted(overlap))}")
+        return normalized
+
     @staticmethod
     def _zscore_array(values: np.ndarray) -> np.ndarray:
         values = np.asarray(values, dtype=float)
@@ -1279,7 +1022,7 @@ class DecisionEngine:
 def run_live_decision(
     *,
     alpha_csv_path: str | Path,
-    ledger_path: str | Path,
+    previous_weights: Mapping[str, Mapping[str, float]] | None = None,
     session_date: str = "latest",
     session_idx: int | None = None,
     output_root: str | Path = DEFAULT_DECISION_ROOT,
@@ -1290,22 +1033,21 @@ def run_live_decision(
         raise ValueError("account_equity must be positive")
 
     alpha_path = Path(alpha_csv_path)
-    ledger_path_obj = Path(ledger_path)
     output_root_obj = Path(output_root)
     output_root_obj.mkdir(parents=True, exist_ok=True)
-    ledger_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     alpha_frame, selected_session_date = _load_alpha_frame(alpha_path, decision_date=session_date)
-    lot_manager = LotManager.from_json(ledger_path_obj)
-    resolved_session_idx = _resolve_session_idx(lot_manager, session_idx)
+    resolved_session_idx = _resolve_session_idx(session_idx, selected_session_date)
+    normalized_previous = {
+        "long": dict((previous_weights or {}).get("long", {})),
+        "short": dict((previous_weights or {}).get("short", {})),
+    }
 
     engine = DecisionEngine(config or DecisionConfig())
-    before_snapshot = lot_manager.snapshot(session_idx=resolved_session_idx)
-    before_positions = lot_manager.position_frame(session_idx=resolved_session_idx)
 
     result = engine.decide(
         alpha_frame=alpha_frame,
-        lot_manager=lot_manager,
+        previous_weights=normalized_previous,
         session_idx=resolved_session_idx,
         session_date=selected_session_date,
     )
@@ -1316,26 +1058,11 @@ def run_live_decision(
         targets["abs_signed_weight"] = pd.to_numeric(targets["signed_weight"], errors="coerce").abs()
         targets = targets.sort_values(["abs_signed_weight", "symbol"], ascending=[False, True]).reset_index(drop=True)
 
-    after_snapshot = lot_manager.snapshot(session_idx=resolved_session_idx)
-    after_positions = lot_manager.position_frame(session_idx=resolved_session_idx)
-
-    lot_manager.meta.update(
-        {
-            "last_session_idx": int(resolved_session_idx),
-            "last_session_date": str(selected_session_date),
-        }
-    )
-    lot_manager.to_json(ledger_path_obj)
-
     token = f"{selected_session_date.replace('-', '')}_idx{int(resolved_session_idx):05d}"
     target_path = output_root_obj / f"target_{token}.csv"
-    before_path = output_root_obj / f"positions_before_{token}.csv"
-    after_path = output_root_obj / f"positions_after_{token}.csv"
     summary_path = output_root_obj / f"decision_summary_{token}.json"
 
     targets.to_csv(target_path, index=False)
-    before_positions.to_csv(before_path, index=False)
-    after_positions.to_csv(after_path, index=False)
 
     summary = {
         "created_at_utc": _utc_now(),
@@ -1345,15 +1072,11 @@ def run_live_decision(
         "skip_reason": result.skip_reason,
         "diagnostics": result.diagnostics,
         "account_equity": float(account_equity),
-        "before_snapshot": before_snapshot,
-        "after_snapshot": after_snapshot,
+        "previous_weights": normalized_previous,
         "target_names": int(len(targets)),
         "outputs": {
             "target_csv": target_path.as_posix(),
-            "positions_before_csv": before_path.as_posix(),
-            "positions_after_csv": after_path.as_posix(),
             "summary_json": summary_path.as_posix(),
-            "ledger_json": ledger_path_obj.as_posix(),
         },
         "inputs": {
             "alpha_csv_path": alpha_path.as_posix(),
@@ -1404,12 +1127,10 @@ def _load_alpha_frame(path: Path, *, decision_date: str) -> tuple[pd.DataFrame, 
     return out, selected.date().isoformat()
 
 
-def _resolve_session_idx(lot_manager: LotManager, provided: int | None) -> int:
+def _resolve_session_idx(provided: int | None, session_date: str) -> int:
     if provided is not None:
         return int(provided)
-    if "last_session_idx" in lot_manager.meta:
-        return int(lot_manager.meta["last_session_idx"]) + 1
-    return int(lot_manager.max_birth_idx()) + 1
+    return int(pd.Timestamp(session_date).date().toordinal())
 
 
 def _infer_date_from_filename(name: str) -> str | None:
@@ -1447,10 +1168,33 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _load_previous_weights_json(path_value: str | None) -> dict[str, dict[str, float]]:
+    if not path_value:
+        return {"long": {}, "short": {}}
+    path = Path(path_value)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("previous weights JSON must be an object")
+    if "long" in payload or "short" in payload:
+        return {
+            "long": {str(k): float(v) for k, v in dict(payload.get("long") or {}).items()},
+            "short": {str(k): float(v) for k, v in dict(payload.get("short") or {}).items()},
+        }
+    long_weights: dict[str, float] = {}
+    short_weights: dict[str, float] = {}
+    for symbol, raw_weight in payload.items():
+        weight = float(raw_weight)
+        if weight > 0:
+            long_weights[str(symbol)] = weight
+        elif weight < 0:
+            short_weights[str(symbol)] = abs(weight)
+    return {"long": long_weights, "short": short_weights}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one standalone decision from alpha_core output CSV.")
     parser.add_argument("--alpha-csv-path", default=None)
-    parser.add_argument("--ledger-path", default=str(DEFAULT_DECISION_ROOT / "live_ledger.json"))
+    parser.add_argument("--previous-weights-json-path", default=None)
     parser.add_argument("--session-date", default="latest")
     parser.add_argument("--session-idx", type=int, default=None)
     parser.add_argument("--output-root", default=str(DEFAULT_DECISION_ROOT))
@@ -1469,11 +1213,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="e.g. reversal_score:0.25,momentum_score:0.10,small_size_score:0.30,low_beta_score:0.20,cash_quality_score:0.15",
     )
-    parser.add_argument(
-        "--factor-min-holds",
-        default="",
-        help="e.g. reversal_score:5,momentum_score:10,small_size_score:20,low_beta_score:20,cash_quality_score:20",
-    )
     args = parser.parse_args(argv)
 
     if args.alpha_csv_path:
@@ -1484,12 +1223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     factor_weights = dict(DEFAULT_FACTOR_WEIGHTS)
     factor_weights.update(_parse_float_mapping(args.factor_weights))
-    factor_min_holds = dict(DEFAULT_FACTOR_MIN_HOLDS)
-    factor_min_holds.update({k: int(v) for k, v in _parse_float_mapping(args.factor_min_holds).items()})
+    previous_weights = _load_previous_weights_json(args.previous_weights_json_path)
 
     config = DecisionConfig(
         factor_weights=factor_weights,
-        factor_min_holds=factor_min_holds,
         candidate_pool_per_side=int(args.candidate_pool_per_side),
         max_single_name_side_weight=float(args.max_single_name_side_weight),
         min_nonzero_names=int(args.min_nonzero_names),
@@ -1502,7 +1239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     summary = run_live_decision(
         alpha_csv_path=alpha_csv_path,
-        ledger_path=Path(args.ledger_path),
+        previous_weights=previous_weights,
         session_date=str(args.session_date),
         session_idx=args.session_idx,
         output_root=Path(args.output_root),

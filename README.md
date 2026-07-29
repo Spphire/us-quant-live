@@ -1,6 +1,6 @@
 # us-quant-live
 
-美股多因子横截面多空策略实盘系统。项目覆盖动态股票池、Alpha/Decision Engine、lot 最短持仓锁定、Reg T 两阶段调仓执行、Alpaca/IBKR 执行接口与后台守护调度。
+美股多因子横截面多空策略实盘系统。项目覆盖动态股票池、Alpha/Decision Engine、基于券商实际持仓的换手约束、Reg T 两阶段调仓执行、Alpaca/IBKR 执行接口与后台守护调度。
 
 ## 重要提示
 

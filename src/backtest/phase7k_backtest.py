@@ -52,7 +52,6 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
-from lot_manager import DEFAULT_FACTOR_MIN_HOLDS, LotManager  # noqa: E402
 from vendors import AlpacaHttpClient, AlpacaRequestError  # noqa: E402
 
 
@@ -91,7 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run a long-horizon Phase7K-style backtest: "
-            "dynamic symbol pool + AlphaCore + DecisionEngine + lot ledger."
+            "dynamic symbol pool + AlphaCore + DecisionEngine with prior-target turnover state."
         )
     )
     parser.add_argument("--start-date", default="2016-01-01")
@@ -469,7 +468,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         decision_config = DecisionConfig(
             factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
-            factor_min_holds=dict(DEFAULT_FACTOR_MIN_HOLDS),
             candidate_pool_per_side=int(args.candidate_pool_per_side),
             max_single_name_side_weight=float(args.max_single_name_side_weight),
             min_nonzero_names=int(args.min_nonzero_names),
@@ -480,7 +478,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             beta_band_grid=tuple(_parse_float_list(str(args.beta_band_grid))),
         )
         engine = DecisionEngine(decision_config)
-        lot_manager = LotManager()
+        previous_weights: dict[str, dict[str, float]] = {"long": {}, "short": {}}
+        target_signed_weights: dict[str, float] = {}
 
         cost_model = CostModel(
             execution_bps=float(args.execution_bps),
@@ -569,14 +568,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     alpha_panel.to_csv(alpha_path, index=False)
                 result = engine.decide(
                     alpha_frame=alpha_panel,
-                    lot_manager=lot_manager,
+                    previous_weights=previous_weights,
                     session_idx=int(session_idx),
                     session_date=session_date,
                 )
                 diagnostics = dict(result.diagnostics or {})
                 status = str(result.status)
+                if not result.targets.empty:
+                    target_signed_weights = _signed_weights_from_decision_targets(result.targets)
+                    previous_weights = _split_signed_weights(target_signed_weights)
 
-            target_signed_weights = _signed_weights_from_lot(lot_manager)
             spy_ret = _open_to_open_return(
                 symbol=benchmark_symbol,
                 open_today=session_open,
@@ -687,8 +688,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "in_performance_window": in_performance_window,
                 "dynamic_symbols": int(len(symbols_today)),
                 "symbols_after_stale_filter": int(len(symbols_ready)),
-                "long_names": int(len(lot_manager.previous_weights()["long"])),
-                "short_names": int(len(lot_manager.previous_weights()["short"])),
+                "long_names": int(len(previous_weights["long"])),
+                "short_names": int(len(previous_weights["short"])),
                 "target_turnover": primary_turnover,
                 "gross_return": float(primary_metrics["gross_return"]),
                 "cost_rate": float(primary_metrics["cost_rate"]),
@@ -703,8 +704,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "cost_sec_fee": float(primary_metrics["cost_sec_fee"]),
                 "cost_taf": float(primary_metrics["cost_taf"]),
                 "cost_total": float(primary_metrics["cost_total"]),
-                "gross_exposure": float(lot_manager.snapshot(session_idx=session_idx).get("gross_exposure", np.nan)),
-                "net_exposure": float(lot_manager.snapshot(session_idx=session_idx).get("net_exposure", np.nan)),
+                "gross_exposure": float(sum(abs(value) for value in target_signed_weights.values())),
+                "net_exposure": float(sum(target_signed_weights.values())),
                 "skip_reason": str(diagnostics.get("skip_reason", "") or diagnostics.get("carry_reason", "")),
             }
             for tag in strategy_tags:
@@ -795,7 +796,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         curve_path = output_root / "equity_curve_compare.csv"
         drawdown_path = output_root / "drawdown_curve_compare.csv"
         summary_path = output_root / "backtest_summary.json"
-        ledger_path = output_root / "final_lot_ledger.json"
         curve_png_path = output_root / "equity_curve_compare.png"
         drawdown_png_path = output_root / "drawdown_curve_compare.png"
 
@@ -807,7 +807,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         daily[curve_existing].to_csv(curve_path, index=False)
         daily[drawdown_existing].to_csv(drawdown_path, index=False)
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        lot_manager.to_json(ledger_path)
         _plot_equity_curves(
             daily=daily,
             benchmark_symbol=benchmark_symbol,
@@ -1754,13 +1753,33 @@ def _filter_symbols_by_recent_price(
     return out
 
 
-def _signed_weights_from_lot(lot_manager: LotManager) -> dict[str, float]:
-    weights = lot_manager.previous_weights()
+def _split_signed_weights(signed_weights: Mapping[str, float]) -> dict[str, dict[str, float]]:
+    long_weights: dict[str, float] = {}
+    short_weights: dict[str, float] = {}
+    for symbol, raw_weight in signed_weights.items():
+        weight = float(raw_weight)
+        symbol_text = str(symbol).strip().upper()
+        if not symbol_text or abs(weight) <= EPS:
+            continue
+        if weight > 0:
+            long_weights[symbol_text] = weight
+        else:
+            short_weights[symbol_text] = abs(weight)
+    return {"long": long_weights, "short": short_weights}
+
+
+def _signed_weights_from_decision_targets(targets: pd.DataFrame) -> dict[str, float]:
+    if targets.empty:
+        return {}
+    required = {"symbol", "signed_weight"}
+    if not required.issubset(targets.columns):
+        raise ValueError(f"decision targets missing columns: {sorted(required - set(targets.columns))}")
     out: dict[str, float] = {}
-    for symbol, value in weights["long"].items():
-        out[str(symbol)] = float(out.get(str(symbol), 0.0) + float(value))
-    for symbol, value in weights["short"].items():
-        out[str(symbol)] = float(out.get(str(symbol), 0.0) - float(value))
+    for row in targets[["symbol", "signed_weight"]].itertuples(index=False):
+        symbol = str(row.symbol).strip().upper()
+        weight = float(row.signed_weight)
+        if symbol and abs(weight) > EPS:
+            out[symbol] = weight
     return out
 
 
