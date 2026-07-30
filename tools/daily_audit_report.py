@@ -812,7 +812,10 @@ def _jsonl_line_summary(path: Path) -> dict[str, Any]:
     return {"exists": True, "line_count": line_count, "parse_error_count": parse_error_count}
 
 
-def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _build_run_evidence_digest_audit(
+    run_dir: Path,
+    decision_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     digest_path = run_dir / "run_evidence_digest.json"
     raw_digest = _read_json(digest_path, {})
     digest = raw_digest if isinstance(raw_digest, dict) else {}
@@ -969,20 +972,41 @@ def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]
     completeness_categories = (
         completeness.get("categories") if isinstance(completeness.get("categories"), dict) else {}
     )
-    completeness_partial_categories = [
-        str(name)
-        for name, item in sorted(completeness_categories.items())
-        if isinstance(item, dict) and item.get("status") != "pass"
-    ]
-    completeness_missing_files = [
-        str(name)
-        for item in completeness_categories.values()
-        if isinstance(item, dict)
-        for name in (item.get("missing") if isinstance(item.get("missing"), list) else [])
-    ]
+    paired_decision_dir = decision_dir
+    if paired_decision_dir is None and run_dir.name.endswith("_execute"):
+        candidate = run_dir.with_name(run_dir.name[: -len("_execute")] + "_decision")
+        if candidate.exists():
+            paired_decision_dir = candidate
+    completeness_partial_categories: list[str] = []
+    completeness_missing_files: list[str] = []
+    completeness_resolved_from_decision: list[dict[str, str]] = []
+    for category_name, raw_item in sorted(completeness_categories.items()):
+        if not isinstance(raw_item, dict):
+            continue
+        missing = [
+            str(name)
+            for name in (raw_item.get("missing") if isinstance(raw_item.get("missing"), list) else [])
+        ]
+        unresolved: list[str] = []
+        for name in missing:
+            decision_path = (paired_decision_dir / name) if paired_decision_dir else None
+            if category_name == "portfolio_intent" and decision_path and decision_path.exists():
+                completeness_resolved_from_decision.append(
+                    {"artifact": name, "path": decision_path.as_posix()}
+                )
+            else:
+                unresolved.append(name)
+        if raw_item.get("status") != "pass" and (unresolved or not missing):
+            completeness_partial_categories.append(str(category_name))
+        completeness_missing_files.extend(unresolved)
     coverage_ratio = present_count / len(rows) if rows else 1.0
     digest_exists = digest_path.exists()
-    completeness_status = str(completeness.get("status") or "")
+    raw_completeness_status = str(completeness.get("status") or "")
+    completeness_status = (
+        "pass"
+        if completeness and not completeness_partial_categories
+        else raw_completeness_status
+    )
     has_completeness_gap = bool(
         completeness_status
         and completeness_status not in {"pass", "not_applicable"}
@@ -1017,10 +1041,16 @@ def _build_run_evidence_digest_audit(run_dir: Path) -> tuple[list[dict[str, Any]
         "file_hash_manifest_file_count": _safe_int(hash_manifest.get("file_count")),
         "file_hash_manifest_total_bytes": _safe_int(hash_manifest.get("total_bytes")),
         "artifact_completeness_status": completeness_status or ("missing" if not completeness else ""),
+        "artifact_completeness_raw_status": raw_completeness_status,
         "artifact_completeness_partial_category_count": len(completeness_partial_categories),
         "artifact_completeness_partial_categories": completeness_partial_categories,
         "artifact_completeness_missing_file_count": len(completeness_missing_files),
         "artifact_completeness_missing_files": completeness_missing_files,
+        "artifact_completeness_resolved_from_paired_decision_count": len(
+            completeness_resolved_from_decision
+        ),
+        "artifact_completeness_resolved_from_paired_decision": completeness_resolved_from_decision,
+        "paired_decision_dir": paired_decision_dir.as_posix() if paired_decision_dir else None,
         "execution_record_count": _safe_int(execution_records.get("record_count") or execution_records.get("payload_count")),
         "filled_record_count": _safe_int(execution_records.get("filled_record_count")),
         "account_field_deltas": account_deltas,
@@ -1331,6 +1361,7 @@ def _build_startup_binding_audit(root: Path = SCHED_ROOT) -> tuple[list[dict[str
     summary = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scope": "current_operational_state_at_audit_generation",
         "root": root.as_posix(),
         "project_root": project_root.as_posix(),
         "status": "fail" if severity_counts.get("error") else "attention" if issue_rows else "pass",
@@ -1389,6 +1420,14 @@ def _scheduler_result_for_dir(run_dir: Path, decision_dir: Path | None = None) -
     return {}
 
 
+def _scheduler_result_path_for_dir(run_dir: Path, decision_dir: Path | None = None) -> Path | None:
+    candidates = [
+        run_dir / "scheduler_task_result.json",
+        decision_dir / "scheduler_task_result.json" if decision_dir else None,
+    ]
+    return next((path for path in candidates if path and path.exists()), None)
+
+
 def _classify_failure(error_type: str, error: str, task_status: str, missing_core: list[str]) -> str:
     error_text = f"{error_type} {error}".lower()
     if task_status in {"completed", "success", "ok"}:
@@ -1424,6 +1463,7 @@ def _build_run_failure_diagnosis(
     rows: list[dict[str, Any]] = []
     artifacts = context.get("artifacts", {}) if isinstance(context.get("artifacts"), dict) else {}
     scheduler_result = _scheduler_result_for_dir(run_dir, decision_dir)
+    scheduler_result_path = _scheduler_result_path_for_dir(run_dir, decision_dir)
     scheduler_context = _read_json(run_dir / "scheduler_task_context.json", {})
     if not scheduler_context and decision_dir:
         scheduler_context = _read_json(decision_dir / "scheduler_task_context.json", {})
@@ -1495,7 +1535,7 @@ def _build_run_failure_diagnosis(
             "task": scheduler_result.get("task"),
         },
         expected="completed/returncode=0 for a finished task",
-        evidence_path=(decision_dir or run_dir) / "scheduler_task_result.json",
+        evidence_path=scheduler_result_path,
         detail="Scheduler task result is the authoritative missed-run or failed-run record when present.",
         next_action="Inspect command_text, stdout_tail, stderr_tail, and retry policy in scheduler_task_result.json.",
     )
@@ -1620,6 +1660,9 @@ def _build_run_failure_diagnosis(
         "issue_count": len(warning_or_fail_rows),
         "issue_count_by_severity": dict(sorted(severity_counts.items())),
         "scheduler_result": scheduler_result,
+        "scheduler_result_path": scheduler_result_path.as_posix() if scheduler_result_path else None,
+        "scheduler_result_scope": "run_specific",
+        "operational_context_scope": "latest_at_audit_generation",
         "scheduler_context": scheduler_context,
         "due_latest": due_flat,
         "runtime_latest": runtime_flat,
@@ -3379,6 +3422,13 @@ def _build_decision_intent_trace(
         if isinstance(plan.get("target_signed_weights"), dict)
         else {}
     )
+    explicit_order_target_weights = (
+        plan.get("target_signed_weights", {})
+        if isinstance(plan.get("target_signed_weights"), dict)
+        and plan.get("target_signed_weights")
+        else None
+    )
+    order_target_weights = explicit_order_target_weights or projected_weights
     decision_by_symbol = {str(row.get("symbol") or "").upper().strip(): row for row in decision_rows}
     order_by_symbol: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for row in order_rows:
@@ -3406,6 +3456,7 @@ def _build_decision_intent_trace(
         set(raw_weights)
         | set(strategy_weights)
         | set(projected_weights)
+        | set(order_target_weights)
         | set(decision_by_symbol)
         | set(order_by_symbol)
         | set(skipped_by_symbol)
@@ -3418,22 +3469,25 @@ def _build_decision_intent_trace(
         raw_weight = _safe_float(raw_weights.get(symbol))
         strategy_weight = _safe_float(strategy_weights.get(symbol))
         projected_weight = _safe_float(projected_weights.get(symbol))
+        order_target_weight = _safe_float(order_target_weights.get(symbol))
         projection_delta_weight = projected_weight - strategy_weight
         capacity_scaling_delta_weight = strategy_weight - raw_weight
         before_mv = _safe_float(decision.get("before_market_value"))
         projected_target_notional = projected_weight * equity if equity else 0.0
+        order_target_notional = order_target_weight * equity if equity else 0.0
         raw_target_notional = raw_weight * equity if equity else 0.0
         strategy_target_notional = strategy_weight * equity if equity else 0.0
-        desired_delta = projected_target_notional - before_mv
+        projected_target_delta = projected_target_notional - before_mv
+        order_builder_delta = order_target_notional - before_mv
         planned_order_count = _safe_int(orders.get("planned_order_count"))
         skip_reasons = [str(item.get("reason") or "") for item in skipped if str(item.get("reason") or "")]
         if planned_order_count > 0:
             order_intent_status = "planned_order"
         elif skipped:
             order_intent_status = "skipped_by_order_builder"
-        elif abs(desired_delta) < min_trade_notional:
+        elif abs(order_builder_delta) < min_trade_notional:
             order_intent_status = "below_min_trade_notional"
-        elif abs(desired_delta) <= min_trade_effective_audit_threshold:
+        elif abs(order_builder_delta) <= min_trade_effective_audit_threshold:
             order_intent_status = "within_min_trade_boundary_tolerance"
         else:
             order_intent_status = "no_order_unexplained_from_plan"
@@ -3443,11 +3497,13 @@ def _build_decision_intent_trace(
                 "raw_target_signed_weight": raw_weight,
                 "strategy_target_signed_weight": strategy_weight,
                 "projected_target_signed_weight": projected_weight,
+                "order_target_signed_weight": order_target_weight,
                 "projection_delta_weight": projection_delta_weight,
                 "capacity_scaling_delta_weight": capacity_scaling_delta_weight,
                 "raw_target_notional_estimate": raw_target_notional,
                 "strategy_target_notional_estimate": strategy_target_notional,
                 "projected_target_notional_estimate": projected_target_notional,
+                "order_target_notional_estimate": order_target_notional,
                 "projection_delta_notional_estimate": projection_delta_weight * equity if equity else 0.0,
                 "capacity_scaling_delta_notional_estimate": (
                     capacity_scaling_delta_weight * equity if equity else 0.0
@@ -3460,7 +3516,9 @@ def _build_decision_intent_trace(
                 "after_side": decision.get("after_side", ""),
                 "before_market_value": before_mv,
                 "after_market_value": _safe_float(decision.get("after_market_value")),
-                "desired_delta_notional_estimate": desired_delta,
+                "projected_target_delta_notional_estimate": projected_target_delta,
+                "order_builder_delta_notional_estimate": order_builder_delta,
+                "desired_delta_notional_estimate": order_builder_delta,
                 "planned_delta_notional": _safe_float(orders.get("planned_delta_notional")),
                 "planned_abs_notional": _safe_float(orders.get("planned_abs_notional")),
                 "planned_order_count": planned_order_count,
@@ -3493,6 +3551,14 @@ def _build_decision_intent_trace(
         "symbol_count": len(rows),
         "raw_target_symbol_count": len([symbol for symbol, weight in raw_weights.items() if abs(_safe_float(weight)) > 0]),
         "projected_target_symbol_count": len([symbol for symbol, weight in projected_weights.items() if abs(_safe_float(weight)) > 0]),
+        "order_target_symbol_count": len(
+            [symbol for symbol, weight in order_target_weights.items() if abs(_safe_float(weight)) > 0]
+        ),
+        "order_target_source": (
+            "target_signed_weights"
+            if explicit_order_target_weights is not None
+            else "projected_weight_fallback"
+        ),
         "projection_changed_symbol_count": len(projection_changed),
         "short_floor_zeroed_symbol_count": sum(1 for row in rows if row.get("projection_reason") == "short_floor_zeroed"),
         "short_floor_reduced_symbol_count": sum(1 for row in rows if row.get("projection_reason") == "short_floor_reduced"),
@@ -3500,10 +3566,19 @@ def _build_decision_intent_trace(
         "projection_reason_counts": dict(sorted(Counter(str(row.get("projection_reason") or "") for row in rows).items())),
         "skip_reason_counts": dict(sorted(Counter(str(reason) for row in skipped_rows for reason in str(row.get("skip_reason") or "").split(";") if reason).items())),
         "gross_projection_delta_notional_abs": sum(abs(_safe_float(row.get("projection_delta_notional_estimate"))) for row in rows),
+        "gross_projected_target_delta_notional_abs": sum(
+            abs(_safe_float(row.get("projected_target_delta_notional_estimate"))) for row in rows
+        ),
+        "gross_order_builder_delta_notional_abs": sum(
+            abs(_safe_float(row.get("order_builder_delta_notional_estimate"))) for row in rows
+        ),
         "gross_desired_delta_notional_abs": sum(abs(_safe_float(row.get("desired_delta_notional_estimate"))) for row in rows),
         "gross_planned_abs_notional": sum(_safe_float(row.get("planned_abs_notional")) for row in rows),
         "skipped_symbol_count": len(skipped_rows),
         "unexplained_no_order_symbol_count": len(unexplained_no_order),
+        "below_min_trade_symbol_count": sum(
+            1 for row in rows if row.get("order_intent_status") == "below_min_trade_notional"
+        ),
         "min_trade_boundary_tolerance": min_trade_boundary_tolerance,
         "min_trade_boundary_symbol_count": sum(
             1 for row in rows if row.get("order_intent_status") == "within_min_trade_boundary_tolerance"
@@ -3524,7 +3599,9 @@ def _build_decision_intent_trace(
         )[:25],
         "note": (
             "Explains raw DecisionEngine target weights versus executable projected target weights. "
-            "Projection changes are commonly caused by whole-share short constraints."
+            "Projection changes are commonly caused by whole-share short constraints. No-order checks use "
+            "the final order-builder target weights because those include adverse-price sizing and the exact "
+            "minimum-trade threshold applied when instructions are created."
         ),
     }
     return rows, summary_payload
@@ -4243,7 +4320,15 @@ def _build_market_price_evidence(
     summary_payload = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "status": "historical_limited" if not execute_price["exists"] else "attention" if missing_rows else "pass",
+        "status": (
+            "historical_limited"
+            if not execute_price["exists"]
+            else "attention"
+            if missing_rows
+            else "partial"
+            if fallback_rows
+            else "pass"
+        ),
         "symbol_count": len(rows),
         "execution_relevant_symbol_count": len(relevant_rows),
         "context_only_symbol_count": len(context_only_rows),
@@ -4271,8 +4356,9 @@ def _build_market_price_evidence(
         "fallback_only_rows": fallback_rows[:50],
         "note": (
             "Execution status is based only on decision/target/position/order/trade/fill symbols. Context-only "
-            "symbols remain in the evidence rows but cannot downgrade status. Historical runs can fall back to "
-            "order_plan reference prices when explicit price snapshots are absent."
+            "symbols remain in the evidence rows but cannot downgrade status. Execution-relevant fallback-only "
+            "prices are usable evidence but make the status partial. Historical runs can fall back to order_plan "
+            "reference prices when explicit price snapshots are absent."
         ),
     }
     return rows, summary_payload
@@ -4300,6 +4386,33 @@ def _intraday_bar_errors(raw: Any) -> list[dict[str, Any]]:
     payload = _intraday_bar_payload(raw)
     errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
     return [dict(item) for item in errors if isinstance(item, dict)]
+
+
+def _evidence_error_symbols(error: Mapping[str, Any]) -> set[str]:
+    symbols: set[str] = set()
+    for key in ("symbol", "symbols", "requested_symbols"):
+        value = error.get(key)
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            symbol = str(item or "").upper().strip()
+            if symbol:
+                symbols.add(symbol)
+    return symbols
+
+
+def _partition_evidence_errors(
+    errors: list[dict[str, Any]],
+    execution_relevant_symbols: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    execution_errors: list[dict[str, Any]] = []
+    context_errors: list[dict[str, Any]] = []
+    for error in errors:
+        symbols = _evidence_error_symbols(error)
+        if not symbols or symbols & execution_relevant_symbols:
+            execution_errors.append(error)
+        else:
+            context_errors.append(error)
+    return execution_errors, context_errors
 
 
 def _bar_time(row: dict[str, Any]) -> str:
@@ -4611,6 +4724,10 @@ def _build_market_context_attribution(
         "snapshot_intraday_pnl": total_snapshot,
         "realized_pnl_estimate": total_realized,
         "snapshot_plus_realized_pnl": total_snapshot + total_realized,
+        "pnl_window_semantics": (
+            "post_trade_snapshot_intraday_unrealized_plus_captured_execution_realized_estimate"
+        ),
+        "pnl_is_execution_window": False,
         "gross_after_market_value": gross_after,
         "net_after_market_value": net_after,
         "net_to_gross_after": net_after / gross_after if gross_after > 0 else None,
@@ -4624,7 +4741,9 @@ def _build_market_context_attribution(
         "benchmark_rows": benchmark_rows,
         "note": (
             "Factor buckets use the largest absolute standardized alpha score for each symbol; "
-            "they are signal context, not position ownership attribution."
+            "they are signal context, not position ownership attribution. PnL combines the post-trade "
+            "snapshot's intraday unrealized value with realized PnL estimated from captured execution fills; "
+            "it is not the sizing-to-post-trade account-equity change."
         ),
     }
     return all_rows, summary_payload
@@ -4768,16 +4887,24 @@ def _build_attribution_dossier(
     intraday_by_symbol = _rows_by_symbol(intraday_bar_rows)
     quote_by_symbol = _rows_by_symbol(quote_rows)
     market_context_by_symbol = _rows_by_symbol(market_context_rows, row_type="symbol")
+    execution_evidence_symbols = {
+        str(row.get("symbol") or "").upper().strip()
+        for evidence_rows in (
+            market_price_evidence_rows,
+            intraday_bar_rows,
+            quote_rows,
+        )
+        for row in evidence_rows
+        if bool(row.get("required_for_execution")) and str(row.get("symbol") or "").strip()
+    }
     symbols = sorted(
         set(symbol_attr_by_symbol)
         | set(transition_by_symbol)
         | set(decision_intent_by_symbol)
         | set(order_constraints_by_symbol)
         | set(drift_by_symbol)
-        | set(market_price_by_symbol)
-        | set(intraday_by_symbol)
-        | set(quote_by_symbol)
         | set(market_context_by_symbol)
+        | execution_evidence_symbols
     )
 
     rows: list[dict[str, Any]] = []
@@ -4807,14 +4934,22 @@ def _build_attribution_dossier(
         price_status = str(price.get("status") or "")
         bar_status = str(bars.get("status") or "")
         quote_status = str(quotes.get("status") or "")
-        if bool(price.get("missing_reference_flag")) or "missing" in price_status:
+        if (
+            not price
+            or bool(price.get("missing_reference_flag"))
+            or price_status not in {"pass", "large_decision_execute_reference_move"}
+        ):
             evidence_tags.append("price_reference_gap")
-        if bar_status in {"historical_limited", "not_available", "attention"}:
+        if not bars or bar_status != "pass":
             evidence_tags.append("intraday_bar_limited")
-        if quote_status in {"historical_limited", "not_available", "attention"}:
+        if not quotes or quote_status in {
+            "historical_limited",
+            "not_available",
+            "attention",
+            "missing_quote",
+            "invalid_quote",
+        }:
             evidence_tags.append("quote_limited")
-        if _safe_float(quotes.get("spread_bps")) > 50.0:
-            evidence_tags.append("wide_spread")
 
         focus_tags: list[str] = []
         if total_pnl < -10.0:
@@ -4837,6 +4972,8 @@ def _build_attribution_dossier(
             focus_tags.append("skipped_order")
         if str(intent.get("projection_reason") or "").startswith("short_floor"):
             focus_tags.append("short_floor_projection")
+        if quote_status == "wide_spread":
+            focus_tags.append("wide_spread")
         focus_tags.extend(evidence_tags)
 
         evidence_gap_count = len(evidence_tags)
@@ -4937,8 +5074,16 @@ def _build_attribution_dossier(
     )
     strict_blockers = strict_attribution_checklist_summary.get("top_blockers", [])
     strict_blockers = strict_blockers if isinstance(strict_blockers, list) else []
-    coverage_gaps = evidence_completeness_summary.get("lowest_coverage_areas", [])
-    coverage_gaps = coverage_gaps if isinstance(coverage_gaps, list) else []
+    coverage_gaps = evidence_completeness_summary.get("coverage_gap_areas", [])
+    if not isinstance(coverage_gaps, list):
+        coverage_gaps = []
+    if not coverage_gaps:
+        lowest_coverage = evidence_completeness_summary.get("lowest_coverage_areas", [])
+        coverage_gaps = [
+            row
+            for row in (lowest_coverage if isinstance(lowest_coverage, list) else [])
+            if isinstance(row, dict) and str(row.get("status") or "") != "pass"
+        ]
     top_loss_symbols = sorted(rows, key=lambda row: _safe_float(row.get("snapshot_plus_realized_pnl")))[:20]
     residual_rows = sorted(
         [row for row in rows if bool(row.get("material_position_residual")) or abs(_safe_float(row.get("position_unexplained_notional"))) > 0],
@@ -4948,7 +5093,11 @@ def _build_attribution_dossier(
     target_gap_rows = sorted(rows, key=lambda row: _safe_float(row.get("target_error_abs")), reverse=True)[:20]
     shortfall_rows = sorted(rows, key=lambda row: _safe_float(row.get("implementation_shortfall_notional")), reverse=True)[:20]
     drift_rows = sorted(rows, key=lambda row: abs(_safe_float(row.get("decision_execute_planned_delta_change"))), reverse=True)[:20]
-    evidence_gap_rows = [row for row in rows if _safe_int(row.get("evidence_gap_count")) > 0][:20]
+    all_evidence_gap_rows = [row for row in rows if _safe_int(row.get("evidence_gap_count")) > 0]
+    evidence_gap_rows = all_evidence_gap_rows[:20]
+    symbol_evidence_gap_item_count = sum(
+        _safe_int(row.get("evidence_gap_count")) for row in all_evidence_gap_rows
+    )
     primary_bucket_counts = Counter(str(row.get("primary_attribution_bucket") or "") for row in rows)
     focus_tag_counts = Counter(
         tag
@@ -4962,6 +5111,7 @@ def _build_attribution_dossier(
         or residual_diagnosis_summary.get("status") == "attention"
         else "partial"
         if not evidence_completeness_summary.get("strict_account_position_replay_ready")
+        or all_evidence_gap_rows
         else "pass"
     )
     summary_payload = {
@@ -4972,6 +5122,7 @@ def _build_attribution_dossier(
         "run_dir": context.get("run_dir"),
         "focus_symbol_count": len(rows),
         "focus_row_count": len(rows),
+        "universe_semantics": "execution_relevant_symbols_only",
         "primary_bucket_counts": dict(sorted(primary_bucket_counts.items())),
         "focus_tag_counts": dict(sorted(focus_tag_counts.items())),
         "equity_change": _safe_float(component_amounts.get("broker_equity_change")),
@@ -4985,7 +5136,10 @@ def _build_attribution_dossier(
         "strict_attribution_ready": strict_attribution_checklist_summary.get("strict_attribution_ready"),
         "strict_attribution_blocking_items": strict_attribution_checklist_summary.get("blocking_item_count"),
         "strict_account_position_replay_ready": evidence_completeness_summary.get("strict_account_position_replay_ready"),
-        "evidence_gap_count": len(coverage_gaps),
+        "evidence_gap_count": len(all_evidence_gap_rows),
+        "symbol_evidence_gap_count": len(all_evidence_gap_rows),
+        "symbol_evidence_gap_item_count": symbol_evidence_gap_item_count,
+        "coverage_area_gap_count": len(coverage_gaps),
         "coverage_gaps": coverage_gaps[:12],
         "strict_blockers": strict_blockers[:12],
         "top_focus_symbols": rows[:25],
@@ -5212,6 +5366,7 @@ def _build_ideal_vs_actual_gap(
         or context.get("account_equity_after")
         or context.get("account_equity_before")
     )
+    safe_equity = max(float(equity), 1e-9)
     symbols = sorted(
         set(symbol_attr_by_symbol)
         | set(transition_by_symbol)
@@ -5252,6 +5407,20 @@ def _build_ideal_vs_actual_gap(
         after_strategy_gap = after_market_value - strategy_target_notional
         after_projected_gap = after_market_value - projected_target_notional
         after_execute_gap = after_market_value - execute_target_notional
+        strategy_target_weight = _optional_float(intent.get("strategy_target_signed_weight"))
+        if strategy_target_weight is None:
+            strategy_target_weight = _optional_float(intent.get("raw_target_signed_weight"))
+        if strategy_target_weight is None:
+            strategy_target_weight = strategy_target_notional / safe_equity
+        projected_target_weight = _optional_float(intent.get("projected_target_signed_weight"))
+        if projected_target_weight is None:
+            projected_target_weight = projected_target_notional / safe_equity
+        execute_projected_target_weight = _optional_float(
+            drift.get("execute_projected_target_signed_weight")
+        )
+        if execute_projected_target_weight is None:
+            execute_projected_target_weight = projected_target_weight
+        actual_signed_weight = after_market_value / safe_equity
         capacity_scaling_gap = strategy_target_notional - raw_target_notional
         projection_gap = projected_target_notional - strategy_target_notional
         projection_gap_abs = abs(projection_gap)
@@ -5326,6 +5495,16 @@ def _build_ideal_vs_actual_gap(
                 ),
                 "projected_target_signed_weight": _safe_float(intent.get("projected_target_signed_weight")),
                 "execute_projected_target_signed_weight": _safe_float(drift.get("execute_projected_target_signed_weight")),
+                "actual_signed_weight": actual_signed_weight,
+                "strategy_actual_weight_error_abs": abs(
+                    actual_signed_weight - strategy_target_weight
+                ),
+                "strategy_executable_weight_error_abs": abs(
+                    execute_projected_target_weight - strategy_target_weight
+                ),
+                "executable_actual_weight_error_abs": abs(
+                    actual_signed_weight - execute_projected_target_weight
+                ),
                 "raw_target_notional_estimate": raw_target_notional,
                 "strategy_target_notional_estimate": strategy_target_notional,
                 "projected_target_notional_estimate": projected_target_notional,
@@ -5415,8 +5594,16 @@ def _build_ideal_vs_actual_gap(
     gross_capacity_scaling_gap_abs = sum(
         _safe_float(row.get("capacity_scaling_gap_abs")) for row in rows
     )
-    safe_equity = max(float(equity), 1e-9)
     symbol_count = len(rows)
+    strategy_actual_weight_error_l1 = sum(
+        _safe_float(row.get("strategy_actual_weight_error_abs")) for row in rows
+    )
+    strategy_executable_weight_error_l1 = sum(
+        _safe_float(row.get("strategy_executable_weight_error_abs")) for row in rows
+    )
+    executable_actual_weight_error_l1 = sum(
+        _safe_float(row.get("executable_actual_weight_error_abs")) for row in rows
+    )
     summary_payload = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -5428,21 +5615,22 @@ def _build_ideal_vs_actual_gap(
         "performance_drag_bucket_counts": dict(
             sorted(Counter(str(row.get("performance_drag_bucket") or "") for row in rows).items())
         ),
-        "strategy_to_actual_weight_error_l1": float(gross_ideal_actual_gap_abs / safe_equity),
-        "strategy_to_actual_weight_error_l1_pct": float(gross_ideal_actual_gap_abs / safe_equity * 100.0),
-        "strategy_to_executable_weight_error_l1": float(gross_projection_gap_abs / safe_equity),
-        "strategy_to_executable_weight_error_l1_pct": float(gross_projection_gap_abs / safe_equity * 100.0),
-        "executable_to_actual_weight_error_l1": float(gross_after_projected_target_gap_abs / safe_equity),
-        "executable_to_actual_weight_error_l1_pct": float(
-            gross_after_projected_target_gap_abs / safe_equity * 100.0
-        ),
+        "weight_error_semantics": "sum_abs_signed_weight_difference",
+        "weight_error_actual_denominator": "post_trade_account_equity",
+        "weight_error_actual_denominator_amount": safe_equity,
+        "strategy_to_actual_weight_error_l1": strategy_actual_weight_error_l1,
+        "strategy_to_actual_weight_error_l1_pct": strategy_actual_weight_error_l1 * 100.0,
+        "strategy_to_executable_weight_error_l1": strategy_executable_weight_error_l1,
+        "strategy_to_executable_weight_error_l1_pct": strategy_executable_weight_error_l1 * 100.0,
+        "executable_to_actual_weight_error_l1": executable_actual_weight_error_l1,
+        "executable_to_actual_weight_error_l1_pct": executable_actual_weight_error_l1 * 100.0,
         "mean_symbol_strategy_to_actual_weight_error": float(
-            gross_ideal_actual_gap_abs / safe_equity / symbol_count
+            strategy_actual_weight_error_l1 / symbol_count
         )
         if symbol_count
         else 0.0,
         "max_symbol_strategy_to_actual_weight_error": float(
-            max((_safe_float(row.get("ideal_actual_gap_abs")) / safe_equity for row in rows), default=0.0)
+            max((_safe_float(row.get("strategy_actual_weight_error_abs")) for row in rows), default=0.0)
         ),
         "gross_ideal_actual_gap_abs": gross_ideal_actual_gap_abs,
         "gross_after_projected_target_gap_abs": gross_after_projected_target_gap_abs,
@@ -5794,6 +5982,10 @@ def _build_intraday_bar_evidence(
         if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
     }
     execution_relevant_symbols = set(fills) | market_execution_symbols
+    execution_errors, context_errors = _partition_evidence_errors(
+        total_errors,
+        execution_relevant_symbols,
+    )
     expected_symbols.update(market_by_symbol)
     expected_symbols.update(fills)
     symbols = sorted(expected_symbols | all_bar_symbols)
@@ -5809,7 +6001,6 @@ def _build_intraday_bar_evidence(
 
     rows: list[dict[str, Any]] = []
     any_raw_exists = before_path.exists() or after_path.exists()
-    source_error_count = len(total_errors)
     for symbol in symbols:
         chosen = after_stats.get(symbol) or before_stats.get(symbol) or {}
         before = before_stats.get(symbol, {})
@@ -5832,8 +6023,6 @@ def _build_intraday_bar_evidence(
         elif _safe_int(chosen.get("bar_count")) <= 0:
             status = "missing_bars"
             hints.append("missing_intraday_bars")
-        elif source_error_count:
-            status = "source_errors"
         else:
             status = "pass"
         reference_position = _range_position_pct(execute_reference, low_price, high_price)
@@ -5909,7 +6098,7 @@ def _build_intraday_bar_evidence(
     all_status_counts = Counter(str(row.get("status") or "") for row in rows)
     if not any_raw_exists:
         status = "historical_limited"
-    elif total_errors or filled_missing:
+    elif execution_errors or filled_missing:
         status = "attention"
     elif missing_rows:
         status = "partial"
@@ -5938,8 +6127,11 @@ def _build_intraday_bar_evidence(
         "fallback_capture_symbols": [
             row.get("symbol") for row in relevant_rows if row.get("fallback_capture_used")
         ],
-        "error_count": len(total_errors),
-        "errors": total_errors[:20],
+        "error_count": len(execution_errors),
+        "errors": execution_errors[:20],
+        "source_error_count": len(total_errors),
+        "context_error_count": len(context_errors),
+        "context_errors": context_errors[:20],
         "max_intraday_range_bps": max(
             (_safe_float(row.get("range_bps")) for row in relevant_rows),
             default=0.0,
@@ -5965,11 +6157,23 @@ def _build_intraday_bar_evidence(
             if "reference_outside_intraday_range" in str(row.get("price_path_hints") or "")
         ][:25],
         "note": (
-            "Execution quality is based only on requested/target/position/fill symbols. Context-only symbols remain "
-            "in the evidence rows but cannot downgrade status. The raw JSON keeps complete bars for replay."
+            "Execution quality is based only on target/position/fill symbols. Context-only symbols and their "
+            "symbol-scoped source errors remain in the evidence rows but cannot downgrade status. The raw JSON "
+            "keeps complete bars for replay."
         ),
     }
     return rows, summary_payload
+
+
+def _configured_quote_spread_threshold(run_dir: Path) -> tuple[float, str]:
+    context = _read_json(run_dir / "run_context.json", {})
+    parsed_args = context.get("parsed_args", {}) if isinstance(context, dict) else {}
+    configured = _optional_float(
+        parsed_args.get("longbridge_max_spread_bps") if isinstance(parsed_args, dict) else None
+    )
+    if configured is not None and configured > 0:
+        return float(configured), "run_context.parsed_args.longbridge_max_spread_bps"
+    return 100.0, "historical_default"
 
 
 def _build_quote_evidence(
@@ -5978,6 +6182,9 @@ def _build_quote_evidence(
     market_price_evidence_rows: list[dict[str, Any]],
     fill_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    wide_spread_threshold_bps, wide_spread_threshold_source = _configured_quote_spread_threshold(
+        run_dir
+    )
     before_path = run_dir / "execution_latest_quotes_snapshot.json"
     post_submission_path = run_dir / "execution_latest_quotes_snapshot_post_submission.json"
     after_path = run_dir / "execution_latest_quotes_snapshot_after.json"
@@ -6003,13 +6210,23 @@ def _build_quote_evidence(
             else []
         )
         requested_set = {str(symbol or "").upper().strip() for symbol in requested if str(symbol or "").strip()}
-        errors = (
+        raw_errors = (
             metadata.get("errors")
             if isinstance(metadata.get("errors"), list)
             else payload.get("errors")
             if isinstance(payload.get("errors"), list)
             else []
         )
+        errors = [dict(error) for error in raw_errors if isinstance(error, dict)]
+        if isinstance(raw, dict) and raw.get("ok") is False:
+            errors.append(
+                {
+                    "scope": "capture_call",
+                    "symbols": sorted(requested_set),
+                    "error_type": raw.get("error_type", ""),
+                    "error": raw.get("error", ""),
+                }
+            )
         requested_symbols.update(requested_set)
         all_quote_symbols.update(quotes)
         all_errors.extend({"source": source, **error} for error in errors if isinstance(error, dict))
@@ -6038,6 +6255,10 @@ def _build_quote_evidence(
         if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
     }
     execution_relevant_symbols = set(fills) | market_execution_symbols
+    execution_errors, context_errors = _partition_evidence_errors(
+        all_errors,
+        execution_relevant_symbols,
+    )
     symbols = sorted(set(market_by_symbol) | set(fills) | all_quote_symbols | requested_symbols)
     any_raw_exists = before_path.exists() or post_submission_path.exists() or after_path.exists()
 
@@ -6114,7 +6335,7 @@ def _build_quote_evidence(
             status = "invalid_quote"
         elif bid <= 0 or ask <= 0 or ask < bid:
             status = "invalid_quote"
-        elif spread_bps > 100.0:
+        elif spread_bps > wide_spread_threshold_bps:
             status = "wide_spread"
         else:
             status = "pass"
@@ -6158,6 +6379,7 @@ def _build_quote_evidence(
                 "mid_price": mid,
                 "spread": spread,
                 "spread_bps": spread_bps,
+                "wide_spread_threshold_bps": wide_spread_threshold_bps,
                 "conditions": _json_cell(quote.get("c", "")),
                 "tape": quote.get("z", ""),
                 "execute_reference_price": reference,
@@ -6182,7 +6404,7 @@ def _build_quote_evidence(
     all_status_counts = Counter(str(row.get("status") or "") for row in rows)
     if not any_raw_exists:
         status = "historical_limited"
-    elif all_errors or invalid_rows:
+    elif execution_errors or invalid_rows:
         status = "attention"
     elif missing_rows or wide_rows:
         status = "partial"
@@ -6204,10 +6426,15 @@ def _build_quote_evidence(
         "context_missing_quote_symbol_count": len(context_missing_rows),
         "invalid_quote_symbol_count": len(invalid_rows),
         "wide_spread_symbol_count": len(wide_rows),
+        "wide_spread_threshold_bps": wide_spread_threshold_bps,
+        "wide_spread_threshold_source": wide_spread_threshold_source,
         "source_invalid_quote_observation_count": source_invalid_quote_observation_count,
         "max_spread_bps": max((_safe_float(row.get("spread_bps")) for row in relevant_rows), default=0.0),
-        "error_count": len(all_errors),
-        "errors": all_errors[:20],
+        "error_count": len(execution_errors),
+        "errors": execution_errors[:20],
+        "source_error_count": len(all_errors),
+        "context_error_count": len(context_errors),
+        "context_errors": context_errors[:20],
         "widest_spreads": sorted(relevant_rows, key=lambda row: _safe_float(row.get("spread_bps")), reverse=True)[:25],
         "worst_fill_vs_mid_adverse": sorted(
             [row for row in rows if _safe_float(row.get("fill_vwap_vs_mid_adverse_bps")) > 0],
@@ -6216,7 +6443,9 @@ def _build_quote_evidence(
         )[:25],
         "note": (
             "Latest bid/ask quotes provide spread and quote-mid context for execution reference and fill prices. "
-            "Historical runs before this capture are marked historical_limited."
+            "Wide-spread status uses the execution run's configured quote validation threshold. Context-only "
+            "symbols and their symbol-scoped source errors cannot downgrade status. Historical runs before this "
+            "capture are marked historical_limited."
         ),
     }
     return rows, summary_payload
@@ -6483,6 +6712,10 @@ def _build_portfolio_history_trace(
             "ok": ok,
             "row_count": len(source_rows),
             "base_value": _safe_float(payload.get("base_value")),
+            "timeframe": str(payload.get("timeframe") or ""),
+            "collected_at_utc": str(raw.get("collected_at_utc") or "")
+            if isinstance(raw, dict)
+            else "",
             "first_timestamp_utc": source_rows[0].get("timestamp_utc") if source_rows else "",
             "last_timestamp_utc": source_rows[-1].get("timestamp_utc") if source_rows else "",
             "first_equity": equities[0] if equities else 0.0,
@@ -6499,6 +6732,18 @@ def _build_portfolio_history_trace(
     summary_equity_after = _safe_float(summary.get("account_equity_post_trade"))
     history_last_equity = _safe_float(after_summary.get("last_equity") or before_summary.get("last_equity"))
     summary_vs_history_after_delta = summary_equity_after - history_last_equity if history_last_equity else 0.0
+    latest_history_summary = after_summary if after_summary.get("row_count") else before_summary
+    latest_history_timestamp = str(latest_history_summary.get("last_timestamp_utc") or "")
+    latest_history_capture = str(latest_history_summary.get("collected_at_utc") or "")
+    history_sample_age_seconds: float | None = None
+    if latest_history_timestamp and latest_history_capture:
+        try:
+            history_sample_age_seconds = (
+                datetime.fromisoformat(latest_history_capture.replace("Z", "+00:00"))
+                - datetime.fromisoformat(latest_history_timestamp.replace("Z", "+00:00"))
+            ).total_seconds()
+        except Exception:
+            history_sample_age_seconds = None
     missing_future = not before_path.exists() and not after_path.exists()
     status = (
         "historical_limited"
@@ -6524,6 +6769,11 @@ def _build_portfolio_history_trace(
         "summary_equity_after": summary_equity_after,
         "history_last_equity": history_last_equity,
         "summary_vs_history_after_delta": summary_vs_history_after_delta,
+        "comparison_semantics": "post_trade_account_snapshot_minus_latest_portfolio_history_sample",
+        "history_timeframe": str(latest_history_summary.get("timeframe") or ""),
+        "latest_history_sample_timestamp_utc": latest_history_timestamp,
+        "latest_history_capture_timestamp_utc": latest_history_capture,
+        "history_sample_age_at_capture_seconds": history_sample_age_seconds,
         "largest_equity_drawdown_from_history": (
             max(_safe_float(row.get("equity")) for row in rows) - min(_safe_float(row.get("equity")) for row in rows)
             if rows
@@ -6531,6 +6781,8 @@ def _build_portfolio_history_trace(
         ),
         "note": (
             "Broker portfolio history is an official account-level time series used to locate when equity/PnL moved. "
+            "The displayed delta compares a point-in-time post-trade account snapshot with the latest sampled history "
+            "bar and is timing context, not an attribution residual. "
             "Historical runs before this capture are marked historical_limited."
         ),
     }
@@ -6737,6 +6989,7 @@ def _account_activity_class(row: dict[str, Any]) -> tuple[str, str, bool, str]:
 def _build_account_activity_attribution(
     *,
     broker_activity_rows: list[dict[str, Any]],
+    broker_account_activities_capture: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for idx, row in enumerate(broker_activity_rows, start=1):
@@ -6790,10 +7043,24 @@ def _build_account_activity_attribution(
         for key in ("external_transfer", "journal_or_cash_movement")
     )
     fee_interest_dividend = sum(_safe_float(net_by_class.get(key)) for key in ("fee", "interest", "dividend"))
+    capture_present = broker_account_activities_capture is not None
+    capture = broker_account_activities_capture or {}
+    capture_ok = capture.get("ok") if "ok" in capture else None
     summary_payload = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "status": "attention" if abs(unknown_net) > 1e-6 else "pass",
+        "status": (
+            "historical_limited"
+            if not capture_present
+            else "attention"
+            if capture_ok is False or abs(unknown_net) > 1e-6
+            else "pass"
+        ),
+        "capture_present": capture_present,
+        "capture_ok": capture_ok,
+        "capture_error_type": capture.get("error_type", ""),
+        "capture_error": capture.get("error", ""),
+        "window_semantics": "broker_activities_effective_on_session_date_captured_post_trade",
         "row_count": len(rows),
         "activity_class_counts": dict(sorted(by_class.items())),
         "strategy_pnl_bucket_counts": dict(sorted(by_bucket.items())),
@@ -6810,7 +7077,8 @@ def _build_account_activity_attribution(
         ][:50],
         "note": (
             "Classifies broker account activities so fills are separated from non-trade cash/equity impacts. "
-            "Only known non-trade equity impacts are used by the equity bridge."
+            "Only known non-trade equity impacts are used by the equity bridge. Capture status reflects the "
+            "session-date broker activity request, not merely whether the parsed row set is empty."
         ),
     }
     return rows, summary_payload
@@ -6842,6 +7110,20 @@ def _build_strict_attribution_checklist(
             "scheduler_task_result",
         ]
     )
+
+    def capture_check(
+        summary: Mapping[str, Any],
+        *,
+        accepted_statuses: set[str],
+        extra_ok: bool = True,
+    ) -> tuple[str, str, bool]:
+        observed_status = str(summary.get("status") or "")
+        if observed_status in accepted_statuses and extra_ok:
+            return "pass", "info", False
+        if not future_capture_expected and observed_status in {"", "historical_limited"}:
+            return "historical_gap", "info", False
+        return "attention", "warning", bool(future_capture_expected)
+
     rows: list[dict[str, Any]] = []
 
     def add_item(
@@ -6891,7 +7173,13 @@ def _build_strict_attribution_checklist(
         ),
         (
             "execution_microstructure",
-            ["broker_fill_activities", "broker_order_snapshots", "broker_orders_all_after", "order_poll_timeline"],
+            [
+                "broker_fill_activities",
+                "broker_account_activities",
+                "broker_order_snapshots",
+                "broker_orders_all_after",
+                "order_poll_timeline",
+            ],
             "Order, fill, broker-order, and poll-timeline evidence are required for execution replay.",
         ),
         (
@@ -6961,10 +7249,38 @@ def _build_strict_attribution_checklist(
     account_state_summary = summaries.get("account_state_bridge", {})
     intraday_bar_summary = summaries.get("intraday_bar_evidence", {})
     quote_summary = summaries.get("quote_evidence", {})
+    decision_intent_summary = summaries.get("decision_intent", {})
     decision_drift_summary = summaries.get("decision_execute_drift", {})
     run_evidence_digest_summary = summaries.get("run_evidence_digest", {})
     startup_binding_summary = summaries.get("startup_binding", {})
     run_failure_summary = summaries.get("run_failure_diagnosis", {})
+    market_price_check = capture_check(
+        price_summary,
+        accepted_statuses={"pass", "partial"},
+        extra_ok=_safe_int(price_summary.get("execute_missing_reference_symbol_count")) <= 0,
+    )
+    portfolio_history_check = capture_check(
+        portfolio_history_summary,
+        accepted_statuses={"pass"},
+    )
+    calendar_check = capture_check(calendar_summary, accepted_statuses={"pass"})
+    account_state_check = capture_check(account_state_summary, accepted_statuses={"pass"})
+    account_activity_check = capture_check(
+        activity_summary,
+        accepted_statuses={"pass"},
+        extra_ok=abs(_safe_float(activity_summary.get("unknown_activity_net_amount"))) <= 1e-6,
+    )
+    corporate_action_check = capture_check(
+        corporate_action_summary,
+        accepted_statuses={"pass", "matched"},
+    )
+    decision_intent_check = capture_check(
+        decision_intent_summary,
+        accepted_statuses={"pass"},
+        extra_ok=_safe_int(
+            decision_intent_summary.get("unexplained_no_order_symbol_count")
+        ) <= 0,
+    )
     add_item(
         "run_health",
         "run_completed_without_executor_error",
@@ -7043,24 +7359,31 @@ def _build_strict_attribution_checklist(
     add_item(
         "market_price",
         "reference_prices_available",
-        "pass" if _safe_int(price_summary.get("execute_missing_reference_symbol_count")) <= 0 else "attention",
-        severity="warning",
-        blocking=_safe_int(price_summary.get("execute_missing_reference_symbol_count")) > 0,
+        market_price_check[0],
+        severity=market_price_check[1],
+        blocking=market_price_check[2],
         present_value=bool(price_summary),
         expected=0,
-        observed=price_summary.get("execute_missing_reference_symbol_count"),
+        observed={
+            "status": price_summary.get("status"),
+            "execute_missing_reference_symbol_count": price_summary.get(
+                "execute_missing_reference_symbol_count"
+            ),
+            "fallback_only_symbol_count": price_summary.get("fallback_only_symbol_count"),
+        },
         evidence_artifacts="48_market_price_evidence.csv; 49_market_price_evidence_summary.json",
-        detail="Every target/position symbol should have a usable execution reference price.",
+        detail=(
+            "Every target/position/fill symbol should have a usable execution reference price. Fallback-only "
+            "prices remain usable but make the source panel partial."
+        ),
         next_action="Inspect missing price symbols and Alpaca latest-trade/fallback coverage.",
     )
     add_item(
         "portfolio_history",
         "portfolio_history_capture_ok",
-        "pass"
-        if portfolio_history_summary.get("status") in {"pass", "historical_limited"}
-        else "attention",
-        severity="warning" if portfolio_history_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and portfolio_history_summary.get("status") == "attention"),
+        portfolio_history_check[0],
+        severity=portfolio_history_check[1],
+        blocking=portfolio_history_check[2],
         present_value=bool(portfolio_history_summary),
         expected="pass",
         observed=portfolio_history_summary.get("status"),
@@ -7071,9 +7394,9 @@ def _build_strict_attribution_checklist(
     add_item(
         "market_calendar",
         "calendar_capture_ok",
-        "pass" if calendar_summary.get("status") in {"pass", "historical_limited"} else "attention",
-        severity="warning" if calendar_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and calendar_summary.get("status") == "attention"),
+        calendar_check[0],
+        severity=calendar_check[1],
+        blocking=calendar_check[2],
         present_value=bool(calendar_summary),
         expected="pass",
         observed=calendar_summary.get("status"),
@@ -7084,9 +7407,9 @@ def _build_strict_attribution_checklist(
     add_item(
         "broker_state",
         "account_state_bridge_ok",
-        "pass" if account_state_summary.get("status") in {"pass", "historical_limited"} else "attention",
-        severity="warning" if account_state_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and account_state_summary.get("status") == "attention"),
+        account_state_check[0],
+        severity=account_state_check[1],
+        blocking=account_state_check[2],
         present_value=bool(account_state_summary),
         expected="pass",
         observed=account_state_summary.get("status"),
@@ -7098,13 +7421,28 @@ def _build_strict_attribution_checklist(
         "market_price",
         "intraday_bar_capture_ok",
         "pass"
-        if intraday_bar_summary.get("status") in {"pass", "partial", "historical_limited"}
+        if intraday_bar_summary.get("status") == "pass"
+        and _safe_int(intraday_bar_summary.get("missing_bar_symbol_count")) == 0
+        and _safe_int(intraday_bar_summary.get("error_count")) == 0
+        else "historical_gap"
+        if not future_capture_expected
         else "attention",
-        severity="warning" if intraday_bar_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and intraday_bar_summary.get("status") == "attention"),
+        severity="warning" if future_capture_expected else "info",
+        blocking=bool(
+            future_capture_expected
+            and (
+                intraday_bar_summary.get("status") != "pass"
+                or _safe_int(intraday_bar_summary.get("missing_bar_symbol_count")) > 0
+                or _safe_int(intraday_bar_summary.get("error_count")) > 0
+            )
+        ),
         present_value=bool(intraday_bar_summary),
-        expected="pass_or_partial",
-        observed=intraday_bar_summary.get("status"),
+        expected="pass with zero execution-relevant missing bars and source errors",
+        observed={
+            "status": intraday_bar_summary.get("status"),
+            "missing_bar_symbol_count": intraday_bar_summary.get("missing_bar_symbol_count"),
+            "error_count": intraday_bar_summary.get("error_count"),
+        },
         evidence_artifacts="58_intraday_bar_evidence.csv; 59_intraday_bar_summary.json",
         detail="Intraday 1-minute bars should be captured and parseable for relevant target/position/fill symbols.",
         next_action="Inspect execution_intraday_bars_1min*.json for API errors or missing filled symbols.",
@@ -7112,12 +7450,34 @@ def _build_strict_attribution_checklist(
     add_item(
         "market_price",
         "quote_capture_ok",
-        "pass" if quote_summary.get("status") in {"pass", "partial", "historical_limited"} else "attention",
-        severity="warning" if quote_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and quote_summary.get("status") == "attention"),
+        "pass"
+        if quote_summary.get("status") in {"pass", "partial"}
+        and _safe_int(quote_summary.get("missing_quote_symbol_count")) == 0
+        and _safe_int(quote_summary.get("invalid_quote_symbol_count")) == 0
+        and _safe_int(quote_summary.get("error_count")) == 0
+        else "historical_gap"
+        if not future_capture_expected
+        else "attention",
+        severity="warning" if future_capture_expected else "info",
+        blocking=bool(
+            future_capture_expected
+            and (
+                quote_summary.get("status") not in {"pass", "partial"}
+                or _safe_int(quote_summary.get("missing_quote_symbol_count")) > 0
+                or _safe_int(quote_summary.get("invalid_quote_symbol_count")) > 0
+                or _safe_int(quote_summary.get("error_count")) > 0
+            )
+        ),
         present_value=bool(quote_summary),
-        expected="pass_or_partial",
-        observed=quote_summary.get("status"),
+        expected="captured valid quotes for every execution-relevant symbol; wide spreads remain quality context",
+        observed={
+            "status": quote_summary.get("status"),
+            "missing_quote_symbol_count": quote_summary.get("missing_quote_symbol_count"),
+            "invalid_quote_symbol_count": quote_summary.get("invalid_quote_symbol_count"),
+            "wide_spread_symbol_count": quote_summary.get("wide_spread_symbol_count"),
+            "wide_spread_threshold_bps": quote_summary.get("wide_spread_threshold_bps"),
+            "error_count": quote_summary.get("error_count"),
+        },
         evidence_artifacts="60_quote_evidence.csv; 61_quote_summary.json",
         detail="Latest bid/ask quotes should be captured and parseable for relevant target/position/fill symbols.",
         next_action="Inspect execution_latest_quotes_snapshot.json for API errors, missing quotes, or invalid spreads.",
@@ -7125,12 +7485,16 @@ def _build_strict_attribution_checklist(
     add_item(
         "account_activity",
         "account_activity_known_or_empty",
-        "pass" if abs(_safe_float(activity_summary.get("unknown_activity_net_amount"))) <= 1e-6 else "attention",
-        severity="warning",
-        blocking=abs(_safe_float(activity_summary.get("unknown_activity_net_amount"))) > 1e-6,
+        account_activity_check[0],
+        severity=account_activity_check[1],
+        blocking=account_activity_check[2],
         present_value=bool(activity_summary),
         expected=0.0,
-        observed=activity_summary.get("unknown_activity_net_amount"),
+        observed={
+            "status": activity_summary.get("status"),
+            "capture_ok": activity_summary.get("capture_ok"),
+            "unknown_activity_net_amount": activity_summary.get("unknown_activity_net_amount"),
+        },
         evidence_artifacts="50_account_activity_attribution.csv; 51_account_activity_attribution_summary.json",
         detail="Unclassified account activities can hide dividends, fees, transfers, or broker adjustments.",
         next_action="Classify unknown activity types and decide whether they are strategy PnL or external cashflow.",
@@ -7138,17 +7502,43 @@ def _build_strict_attribution_checklist(
     add_item(
         "corporate_actions",
         "corporate_action_capture_ok",
-        "pass"
-        if corporate_action_summary.get("status") in {"pass", "matched", "historical_limited"}
-        else "attention",
-        severity="warning" if corporate_action_summary.get("status") == "attention" else "info",
-        blocking=bool(future_capture_expected and corporate_action_summary.get("status") == "attention"),
+        corporate_action_check[0],
+        severity=corporate_action_check[1],
+        blocking=corporate_action_check[2],
         present_value=bool(corporate_action_summary),
         expected="pass_or_matched",
         observed=corporate_action_summary.get("status"),
         evidence_artifacts="54_corporate_action_trace.csv; 55_corporate_action_summary.json",
         detail="Corporate-action evidence should be captured and parseable for relevant target/position symbols.",
         next_action="Inspect broker_corporate_actions.json errors or action rows matching residual/account activity symbols.",
+    )
+    add_item(
+        "decision_execute",
+        "decision_intent_explained",
+        decision_intent_check[0],
+        severity=decision_intent_check[1],
+        blocking=decision_intent_check[2],
+        present_value=bool(decision_intent_summary),
+        expected="pass with zero unexplained no-order symbols",
+        observed={
+            "status": decision_intent_summary.get("status"),
+            "unexplained_no_order_symbol_count": decision_intent_summary.get(
+                "unexplained_no_order_symbol_count"
+            ),
+            "below_min_trade_symbol_count": decision_intent_summary.get(
+                "below_min_trade_symbol_count"
+            ),
+            "min_trade_boundary_symbol_count": decision_intent_summary.get(
+                "min_trade_boundary_symbol_count"
+            ),
+            "order_target_source": decision_intent_summary.get("order_target_source"),
+        },
+        evidence_artifacts="42_decision_intent_trace.csv; 43_decision_intent_summary.json",
+        detail=(
+            "Every material final order-builder target delta should have a planned/skipped order or an "
+            "explicit minimum-trade explanation."
+        ),
+        next_action="Inspect no_order_unexplained_from_plan rows and compare final order-target weights with order_plan.json.",
     )
     add_item(
         "decision_execute",
@@ -7186,7 +7576,7 @@ def _build_strict_attribution_checklist(
         "startup_binding_observable",
         "pass" if startup_binding_summary.get("status") == "pass" else "attention",
         severity="warning",
-        blocking=startup_binding_summary.get("status") not in {"pass", None, ""},
+        blocking=False,
         present_value=bool(startup_binding_summary),
         expected="pass",
         observed={
@@ -7198,7 +7588,10 @@ def _build_strict_attribution_checklist(
             "process_health_status": startup_binding_summary.get("process_health_status"),
         },
         evidence_artifacts="74_startup_binding_checks.csv; 75_startup_binding_summary.json; daemon/startup.bat.log; daemon/scheduler_due_latest.json; daemon/scheduler_runtime_latest.json",
-        detail="Operational startup evidence should show autostart registration, visible Start.bat path, pid files, due check, and scheduler heartbeat.",
+        detail=(
+            "This is current operational state captured when the audit was generated. It is displayed for "
+            "operations but cannot prove or invalidate the historical execution's attribution evidence."
+        ),
         next_action="Register the Windows logon task, restart with Start.bat, then refresh process health if startup binding is not pass.",
     )
 
@@ -7714,6 +8107,7 @@ def _build_evidence_completeness(
     ]
     rows: list[dict[str, Any]] = []
     for area, keys, note in groups:
+        scope = "current_operational" if area == "operational_startup" else "run_attribution"
         present_keys = [key for key in keys if present(key)]
         missing_keys = [key for key in keys if key not in present_keys]
         coverage = len(present_keys) / len(keys) if keys else 1.0
@@ -7728,6 +8122,7 @@ def _build_evidence_completeness(
         rows.append(
             {
                 "area": area,
+                "scope": scope,
                 "status": status,
                 "present_count": len(present_keys),
                 "expected_count": len(keys),
@@ -7754,7 +8149,7 @@ def _build_evidence_completeness(
         "run_evidence_digest_strict_missing_files": summaries.get("run_evidence_digest", {}).get(
             "strict_missing_file_count"
         ),
-        "startup_binding": summaries.get("startup_binding", {}).get("status"),
+        "current_startup_binding": summaries.get("startup_binding", {}).get("status"),
         "run_failure_diagnosis": summaries.get("run_failure_diagnosis", {}).get("status"),
         "run_failure_class": summaries.get("run_failure_diagnosis", {}).get("failure_class"),
     }
@@ -7771,6 +8166,16 @@ def _build_evidence_completeness(
         )
         and summaries.get("position_snapshot_integrity", {}).get("status") == "pass"
     )
+    coverage_gap_areas = [
+        row
+        for row in rows
+        if row.get("scope") == "run_attribution" and str(row.get("status") or "") != "pass"
+    ]
+    operational_context_gap_areas = [
+        row
+        for row in rows
+        if row.get("scope") == "current_operational" and str(row.get("status") or "") != "pass"
+    ]
     summary_payload = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -7779,8 +8184,19 @@ def _build_evidence_completeness(
         "core_replay_ready": next((row.get("status") == "pass" for row in rows if row.get("area") == "core_replay"), False),
         "strict_account_position_replay_ready": bool(strict_ready),
         "strict_inputs": strict_inputs,
-        "lowest_coverage_areas": sorted(rows, key=lambda row: _safe_float(row.get("coverage_ratio")))[:5],
-        "note": "Historical runs can be core-replay ready but not strict account/position replay ready until future raw/stability artifacts exist.",
+        "coverage_gap_area_count": len(coverage_gap_areas),
+        "coverage_gap_areas": coverage_gap_areas,
+        "operational_context_gap_area_count": len(operational_context_gap_areas),
+        "operational_context_gap_areas": operational_context_gap_areas,
+        "lowest_coverage_areas": sorted(
+            [row for row in rows if row.get("scope") == "run_attribution"],
+            key=lambda row: _safe_float(row.get("coverage_ratio")),
+        )[:5],
+        "note": (
+            "Historical runs can be core-replay ready but not strict account/position replay ready until future "
+            "raw/stability artifacts exist. Current startup evidence is reported separately and excluded from "
+            "historical attribution coverage."
+        ),
     }
     return rows, summary_payload
 
@@ -8200,11 +8616,14 @@ def _build_audit_checks(
     startup_binding = startup_binding_summary or {}
     if startup_binding:
         add_check(
-            "startup_binding_evidence_present",
-            "pass" if startup_binding.get("status") == "pass" else "warning",
-            severity="warning",
-            detail="Startup binding audit should prove Start.bat, autostart, pid files, due check, and runtime heartbeat are observable.",
-            expected="pass",
+            "current_startup_binding_context",
+            "not_applicable",
+            severity="info",
+            detail=(
+                "Startup binding is current operational context captured at audit generation time and is excluded "
+                "from the historical run's core audit status."
+            ),
+            expected="reported_separately",
             observed={
                 "status": startup_binding.get("status"),
                 "issue_count": startup_binding.get("issue_count"),
@@ -8215,11 +8634,11 @@ def _build_audit_checks(
             },
         )
         add_check(
-            "startup_autostart_registered",
-            "pass" if startup_binding.get("autostart_registered") else "warning",
-            severity="warning",
-            detail="The Windows logon task should be registered so reboot/login starts the visible tray-bound program.",
-            expected=True,
+            "current_startup_autostart_context",
+            "not_applicable",
+            severity="info",
+            detail="Autostart registration is operational state, not evidence about a completed trade run.",
+            expected="reported_separately",
             observed=startup_binding.get("autostart_registered"),
         )
 
@@ -10371,6 +10790,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     )
     account_activity_attribution_rows, account_activity_attribution_summary = _build_account_activity_attribution(
         broker_activity_rows=broker_activity_rows,
+        broker_account_activities_capture=(
+            broker_account_activities
+            if (run_dir / "broker_account_activities.json").exists()
+            and isinstance(broker_account_activities, dict)
+            else None
+        ),
     )
     broker_order_universe_rows, broker_order_universe_summary = _build_broker_order_universe(
         run_dir=run_dir,
@@ -10398,7 +10823,10 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         summary if isinstance(summary, dict) else {},
     )
     account_config_rows, account_config_summary = _build_account_config_diff(run_dir)
-    run_evidence_digest_rows, run_evidence_digest_summary = _build_run_evidence_digest_audit(run_dir)
+    run_evidence_digest_rows, run_evidence_digest_summary = _build_run_evidence_digest_audit(
+        run_dir,
+        decision_dir,
+    )
     event_timeline_rows, event_timeline_summary = _build_event_timeline(
         run_dir=run_dir,
         records=records if isinstance(records, list) else [],
@@ -10885,6 +11313,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             "corporate_action_trace": corporate_action_summary,
             "portfolio_history_trace": portfolio_history_summary,
             "calendar_trace": calendar_summary,
+            "decision_intent": decision_intent_summary,
             "decision_execute_drift": decision_execute_drift_summary,
         },
     )
@@ -11202,12 +11631,15 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_json(audit_dir / "41_target_transition_summary.json", target_transition_summary)
     decision_intent_fields = [
         "symbol", "raw_target_signed_weight", "strategy_target_signed_weight",
-        "projected_target_signed_weight", "capacity_scaling_delta_weight", "projection_delta_weight",
+        "projected_target_signed_weight", "order_target_signed_weight",
+        "capacity_scaling_delta_weight", "projection_delta_weight",
         "raw_target_notional_estimate", "strategy_target_notional_estimate",
-        "projected_target_notional_estimate", "capacity_scaling_delta_notional_estimate",
+        "projected_target_notional_estimate", "order_target_notional_estimate",
+        "capacity_scaling_delta_notional_estimate",
         "projection_delta_notional_estimate", "projection_reason", "raw_target_side",
         "strategy_target_side", "projected_target_side", "before_side", "after_side", "before_market_value",
-        "after_market_value", "desired_delta_notional_estimate", "planned_delta_notional",
+        "after_market_value", "projected_target_delta_notional_estimate",
+        "order_builder_delta_notional_estimate", "desired_delta_notional_estimate", "planned_delta_notional",
         "planned_abs_notional", "planned_order_count", "filled_qty_from_order_trace",
         "remaining_qty_from_order_trace", "order_intent_status", "skip_reason", "skip_count",
         "min_trade_notional", "min_trade_boundary_tolerance", "min_trade_effective_audit_threshold",
@@ -11305,6 +11737,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "gap_rank", "symbol", "primary_gap_bucket", "performance_drag_bucket", "gap_score",
         "raw_target_signed_weight", "strategy_target_signed_weight",
         "projected_target_signed_weight", "execute_projected_target_signed_weight",
+        "actual_signed_weight", "strategy_actual_weight_error_abs",
+        "strategy_executable_weight_error_abs", "executable_actual_weight_error_abs",
         "raw_target_notional_estimate", "strategy_target_notional_estimate",
         "projected_target_notional_estimate",
         "execute_target_notional_estimate", "after_market_value",
@@ -11551,6 +11985,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "run_evidence_digest_artifact_completeness_partial_category_count": run_evidence_digest_summary.get(
             "artifact_completeness_partial_category_count"
         ),
+        "run_evidence_digest_resolved_from_paired_decision_count": run_evidence_digest_summary.get(
+            "artifact_completeness_resolved_from_paired_decision_count"
+        ),
         "startup_binding_status": startup_binding_summary.get("status"),
         "startup_binding_issue_count": startup_binding_summary.get("issue_count"),
         "startup_autostart_registered": startup_binding_summary.get("autostart_registered"),
@@ -11564,6 +12001,15 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "target_transition_attention_symbols": target_transition_summary.get("attention_symbol_count"),
         "decision_intent_rows": len(decision_intent_rows),
         "decision_intent_status": decision_intent_summary.get("status"),
+        "decision_intent_unexplained_no_order_symbols": decision_intent_summary.get(
+            "unexplained_no_order_symbol_count"
+        ),
+        "decision_intent_below_min_trade_symbols": decision_intent_summary.get(
+            "below_min_trade_symbol_count"
+        ),
+        "decision_intent_min_trade_boundary_symbols": decision_intent_summary.get(
+            "min_trade_boundary_symbol_count"
+        ),
         "order_constraint_rows": len(order_constraint_rows),
         "order_constraint_skipped_orders": order_constraint_summary.get("skipped_order_count"),
         "decision_execute_drift_rows": len(decision_execute_drift_rows),
@@ -11579,12 +12025,16 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "market_price_context_missing_reference_symbols": market_price_evidence_summary.get(
             "context_missing_reference_symbol_count"
         ),
+        "market_price_fallback_only_symbols": market_price_evidence_summary.get(
+            "fallback_only_symbol_count"
+        ),
         "market_price_large_reference_moves": market_price_evidence_summary.get(
             "large_decision_execute_reference_move_count"
         ),
         "market_context_rows": len(market_context_rows),
         "market_context_status": market_context_summary.get("status"),
         "market_context_snapshot_plus_realized_pnl": market_context_summary.get("snapshot_plus_realized_pnl"),
+        "market_context_pnl_window_semantics": market_context_summary.get("pnl_window_semantics"),
         "market_context_net_beta_exposure_to_gross": market_context_summary.get("net_beta_exposure_to_gross"),
         "market_context_benchmark_symbols_with_bars": len(
             market_context_summary.get("benchmark_symbols_with_bars", [])
@@ -11599,12 +12049,37 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         if isinstance(attribution_dossier_summary.get("top_focus_symbols"), list)
         else 0,
         "attribution_dossier_primary_bucket_counts": attribution_dossier_summary.get("primary_bucket_counts"),
+        "attribution_dossier_symbol_evidence_gap_count": attribution_dossier_summary.get(
+            "symbol_evidence_gap_count"
+        ),
+        "attribution_dossier_symbol_evidence_gap_item_count": attribution_dossier_summary.get(
+            "symbol_evidence_gap_item_count"
+        ),
+        "attribution_dossier_coverage_area_gap_count": attribution_dossier_summary.get(
+            "coverage_area_gap_count"
+        ),
         "ideal_actual_gap_rows": len(ideal_actual_gap_rows),
         "ideal_actual_gap_status": ideal_actual_gap_summary.get("status"),
         "ideal_actual_gap_material_symbols": ideal_actual_gap_summary.get("material_gap_symbol_count"),
         "ideal_actual_gap_gross_abs": ideal_actual_gap_summary.get("gross_ideal_actual_gap_abs"),
         "ideal_actual_gap_order_gap_notional": ideal_actual_gap_summary.get("gross_order_gap_notional"),
         "ideal_actual_gap_primary_bucket_counts": ideal_actual_gap_summary.get("primary_gap_bucket_counts"),
+        "weight_error_semantics": ideal_actual_gap_summary.get("weight_error_semantics"),
+        "weight_error_actual_denominator": ideal_actual_gap_summary.get(
+            "weight_error_actual_denominator"
+        ),
+        "weight_error_actual_denominator_amount": ideal_actual_gap_summary.get(
+            "weight_error_actual_denominator_amount"
+        ),
+        "strategy_to_actual_weight_error_l1": ideal_actual_gap_summary.get(
+            "strategy_to_actual_weight_error_l1"
+        ),
+        "strategy_to_executable_weight_error_l1": ideal_actual_gap_summary.get(
+            "strategy_to_executable_weight_error_l1"
+        ),
+        "executable_to_actual_weight_error_l1": ideal_actual_gap_summary.get(
+            "executable_to_actual_weight_error_l1"
+        ),
         "executable_target_projection_rows": len(executable_projection_rows),
         "executable_target_projection_status": executable_projection_summary.get("status"),
         "executable_target_projection_weight_error_l1": executable_projection_summary.get(
@@ -11627,6 +12102,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         ),
         "intraday_bar_filled_symbols_missing": intraday_bar_summary.get("filled_symbols_missing_bars_count"),
         "intraday_bar_error_count": intraday_bar_summary.get("error_count"),
+        "intraday_bar_context_error_count": intraday_bar_summary.get("context_error_count"),
         "intraday_bar_max_range_bps": intraday_bar_summary.get("max_intraday_range_bps"),
         "quote_evidence_rows": len(quote_rows),
         "quote_status": quote_summary.get("status"),
@@ -11635,7 +12111,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "quote_context_missing_symbols": quote_summary.get("context_missing_quote_symbol_count"),
         "quote_invalid_symbols": quote_summary.get("invalid_quote_symbol_count"),
         "quote_wide_spread_symbols": quote_summary.get("wide_spread_symbol_count"),
+        "quote_wide_spread_threshold_bps": quote_summary.get("wide_spread_threshold_bps"),
         "quote_error_count": quote_summary.get("error_count"),
+        "quote_context_error_count": quote_summary.get("context_error_count"),
         "quote_max_spread_bps": quote_summary.get("max_spread_bps"),
         "calendar_rows": len(calendar_rows),
         "calendar_status": calendar_summary.get("status"),
@@ -11645,6 +12123,11 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "calendar_session_is_half_day": calendar_summary.get("session_is_half_day"),
         "calendar_error_count": calendar_summary.get("error_count"),
         "account_activity_attribution_rows": len(account_activity_attribution_rows),
+        "account_activity_status": account_activity_attribution_summary.get("status"),
+        "account_activity_capture_ok": account_activity_attribution_summary.get("capture_ok"),
+        "account_activity_window_semantics": account_activity_attribution_summary.get(
+            "window_semantics"
+        ),
         "account_activity_unknown_net_amount": account_activity_attribution_summary.get("unknown_activity_net_amount"),
         "corporate_action_rows": len(corporate_action_rows),
         "corporate_action_status": corporate_action_summary.get("status"),
@@ -11655,6 +12138,13 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "portfolio_history_rows": len(portfolio_history_rows),
         "portfolio_history_status": portfolio_history_summary.get("status"),
         "portfolio_history_summary_vs_after_delta": portfolio_history_summary.get("summary_vs_history_after_delta"),
+        "portfolio_history_timeframe": portfolio_history_summary.get("history_timeframe"),
+        "portfolio_history_latest_sample_timestamp_utc": portfolio_history_summary.get(
+            "latest_history_sample_timestamp_utc"
+        ),
+        "portfolio_history_sample_age_seconds": portfolio_history_summary.get(
+            "history_sample_age_at_capture_seconds"
+        ),
         "strict_attribution_blocking_items": strict_attribution_checklist_summary.get("blocking_item_count"),
         "strict_attribution_ready": strict_attribution_checklist_summary.get("strict_attribution_ready"),
         "position_snapshot_integrity_status": position_snapshot_integrity_summary.get("status"),
@@ -11676,7 +12166,10 @@ def generate_task_health_audit(task_dir: Path) -> dict[str, Any]:
     summary = _read_json(task_dir / "execution_summary.json", {})
     plan = _read_json(task_dir / "order_plan.json", {})
     records = _read_json(task_dir / "execution_records.json", [])
-    run_evidence_digest_rows, run_evidence_digest_summary = _build_run_evidence_digest_audit(task_dir)
+    run_evidence_digest_rows, run_evidence_digest_summary = _build_run_evidence_digest_audit(
+        task_dir,
+        _infer_decision_dir(task_dir),
+    )
     context = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run_dir": task_dir.as_posix(),
@@ -12123,6 +12616,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(run_evidence_digest, dict)
                 else 0,
+                "run_evidence_digest_resolved_from_paired_decision_count": _safe_int(
+                    run_evidence_digest.get("artifact_completeness_resolved_from_paired_decision_count")
+                )
+                if isinstance(run_evidence_digest, dict)
+                else 0,
                 "startup_binding_status": startup_binding.get("status")
                 if isinstance(startup_binding, dict)
                 else "",
@@ -12188,6 +12686,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(market_context, dict)
                 else 0.0,
+                "market_context_pnl_window_semantics": market_context.get("pnl_window_semantics")
+                if isinstance(market_context, dict)
+                else "",
                 "market_context_net_beta_exposure_to_gross": _optional_float(
                     market_context.get("net_beta_exposure_to_gross")
                 )
@@ -12208,6 +12709,16 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 if isinstance(attribution_dossier, dict) and isinstance(attribution_dossier.get("top_focus_symbols"), list)
                 else 0,
                 "attribution_evidence_gap_count": _safe_int(attribution_dossier.get("evidence_gap_count"))
+                if isinstance(attribution_dossier, dict)
+                else 0,
+                "attribution_symbol_evidence_gap_item_count": _safe_int(
+                    attribution_dossier.get("symbol_evidence_gap_item_count")
+                )
+                if isinstance(attribution_dossier, dict)
+                else 0,
+                "attribution_coverage_area_gap_count": _safe_int(
+                    attribution_dossier.get("coverage_area_gap_count")
+                )
                 if isinstance(attribution_dossier, dict)
                 else 0,
                 "attribution_primary_bucket_counts": _json_cell(attribution_dossier.get("primary_bucket_counts"))
@@ -12269,6 +12780,19 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 else "",
                 "strategy_to_actual_weight_error_l1": _optional_float(
                     ideal_actual_gap.get("strategy_to_actual_weight_error_l1")
+                )
+                if isinstance(ideal_actual_gap, dict)
+                else None,
+                "weight_error_semantics": ideal_actual_gap.get("weight_error_semantics")
+                if isinstance(ideal_actual_gap, dict)
+                else "",
+                "weight_error_actual_denominator": ideal_actual_gap.get(
+                    "weight_error_actual_denominator"
+                )
+                if isinstance(ideal_actual_gap, dict)
+                else "",
+                "weight_error_actual_denominator_amount": _optional_float(
+                    ideal_actual_gap.get("weight_error_actual_denominator_amount")
                 )
                 if isinstance(ideal_actual_gap, dict)
                 else None,
@@ -12584,6 +13108,21 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "decision_intent_status": decision_intent.get("status")
                 if isinstance(decision_intent, dict)
                 else "",
+                "decision_intent_unexplained_no_order_symbols": _safe_int(
+                    decision_intent.get("unexplained_no_order_symbol_count")
+                )
+                if isinstance(decision_intent, dict)
+                else 0,
+                "decision_intent_below_min_trade_symbols": _safe_int(
+                    decision_intent.get("below_min_trade_symbol_count")
+                )
+                if isinstance(decision_intent, dict)
+                else 0,
+                "decision_intent_min_trade_boundary_symbols": _safe_int(
+                    decision_intent.get("min_trade_boundary_symbol_count")
+                )
+                if isinstance(decision_intent, dict)
+                else 0,
                 "decision_projection_changed_symbols": _safe_int(decision_intent.get("projection_changed_symbol_count"))
                 if isinstance(decision_intent, dict)
                 else 0,
@@ -12696,6 +13235,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "intraday_bar_error_count": _safe_int(intraday_bars.get("error_count"))
                 if isinstance(intraday_bars, dict)
                 else 0,
+                "intraday_bar_context_error_count": _safe_int(
+                    intraday_bars.get("context_error_count")
+                )
+                if isinstance(intraday_bars, dict)
+                else 0,
                 "intraday_bar_max_range_bps": _safe_float(intraday_bars.get("max_intraday_range_bps"))
                 if isinstance(intraday_bars, dict)
                 else 0.0,
@@ -12723,7 +13267,15 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "quote_wide_spread_symbols": _safe_int(quotes.get("wide_spread_symbol_count"))
                 if isinstance(quotes, dict)
                 else 0,
+                "quote_wide_spread_threshold_bps": _safe_float(
+                    quotes.get("wide_spread_threshold_bps")
+                )
+                if isinstance(quotes, dict)
+                else 0.0,
                 "quote_error_count": _safe_int(quotes.get("error_count"))
+                if isinstance(quotes, dict)
+                else 0,
+                "quote_context_error_count": _safe_int(quotes.get("context_error_count"))
                 if isinstance(quotes, dict)
                 else 0,
                 "quote_max_spread_bps": _safe_float(quotes.get("max_spread_bps"))
@@ -12732,6 +13284,15 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "account_activity_rows": _safe_int(account_activity_attr.get("row_count"))
                 if isinstance(account_activity_attr, dict)
                 else 0,
+                "account_activity_status": account_activity_attr.get("status")
+                if isinstance(account_activity_attr, dict)
+                else "",
+                "account_activity_capture_ok": account_activity_attr.get("capture_ok")
+                if isinstance(account_activity_attr, dict)
+                else None,
+                "account_activity_window_semantics": account_activity_attr.get("window_semantics")
+                if isinstance(account_activity_attr, dict)
+                else "",
                 "account_activity_unknown_net_amount": _safe_float(
                     account_activity_attr.get("unknown_activity_net_amount")
                 )
@@ -12777,6 +13338,19 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "portfolio_history_rows": _safe_int(portfolio_history.get("row_count"))
                 if isinstance(portfolio_history, dict)
                 else 0,
+                "portfolio_history_timeframe": portfolio_history.get("history_timeframe")
+                if isinstance(portfolio_history, dict)
+                else "",
+                "portfolio_history_latest_sample_timestamp_utc": portfolio_history.get(
+                    "latest_history_sample_timestamp_utc"
+                )
+                if isinstance(portfolio_history, dict)
+                else "",
+                "portfolio_history_sample_age_seconds": _optional_float(
+                    portfolio_history.get("history_sample_age_at_capture_seconds")
+                )
+                if isinstance(portfolio_history, dict)
+                else None,
                 "portfolio_history_summary_vs_after_delta": _safe_float(
                     portfolio_history.get("summary_vs_history_after_delta")
                 )
@@ -12897,6 +13471,7 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 ),
                 "intraday_bar_filled_symbols_missing": row.get("intraday_bar_filled_symbols_missing"),
                 "intraday_bar_error_count": row.get("intraday_bar_error_count"),
+                "intraday_bar_context_error_count": row.get("intraday_bar_context_error_count"),
                 "quote_status": row.get("quote_status"),
                 "quote_execution_relevant_symbols": row.get("quote_execution_relevant_symbols"),
                 "quote_missing_symbols": row.get("quote_missing_symbols"),
@@ -12904,6 +13479,7 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "quote_invalid_symbols": row.get("quote_invalid_symbols"),
                 "quote_wide_spread_symbols": row.get("quote_wide_spread_symbols"),
                 "quote_error_count": row.get("quote_error_count"),
+                "quote_context_error_count": row.get("quote_context_error_count"),
                 "calendar_status": row.get("calendar_status"),
                 "calendar_rows": row.get("calendar_rows"),
                 "calendar_session_date_in_calendar": row.get("calendar_session_date_in_calendar"),
@@ -12942,6 +13518,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                     "ideal_actual_gap_performance_drag_bucket_counts"
                 ),
                 "account_activity_unknown_net_amount": row.get("account_activity_unknown_net_amount"),
+                "account_activity_capture_ok": row.get("account_activity_capture_ok"),
+                "account_activity_window_semantics": row.get("account_activity_window_semantics"),
                 "corporate_action_status": row.get("corporate_action_status"),
                 "corporate_action_rows": row.get("corporate_action_rows"),
                 "corporate_action_matched_position_residual_symbols": row.get(
@@ -13066,6 +13644,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 _safe_int(row.get("intraday_bar_filled_symbols_missing")) for row in rows
             ),
             "intraday_bar_error_count": sum(_safe_int(row.get("intraday_bar_error_count")) for row in rows),
+            "intraday_bar_context_error_count": sum(
+                _safe_int(row.get("intraday_bar_context_error_count")) for row in rows
+            ),
             "quote_missing_symbols": sum(_safe_int(row.get("quote_missing_symbols")) for row in rows),
             "quote_context_missing_symbols": sum(
                 _safe_int(row.get("quote_context_missing_symbols")) for row in rows
@@ -13073,6 +13654,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "quote_invalid_symbols": sum(_safe_int(row.get("quote_invalid_symbols")) for row in rows),
             "quote_wide_spread_symbols": sum(_safe_int(row.get("quote_wide_spread_symbols")) for row in rows),
             "quote_error_count": sum(_safe_int(row.get("quote_error_count")) for row in rows),
+            "quote_context_error_count": sum(
+                _safe_int(row.get("quote_context_error_count")) for row in rows
+            ),
             "calendar_rows": sum(_safe_int(row.get("calendar_rows")) for row in rows),
             "calendar_error_count": sum(_safe_int(row.get("calendar_error_count")) for row in rows),
             "calendar_official_gap_count": _safe_int(official_calendar_gaps.get("gap_count")),
@@ -13260,6 +13844,7 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "run_evidence_digest_run_event_count", "run_evidence_digest_hash_manifest_file_count",
             "run_evidence_digest_artifact_completeness_status",
             "run_evidence_digest_artifact_completeness_partial_category_count",
+            "run_evidence_digest_resolved_from_paired_decision_count",
             "startup_binding_status", "startup_binding_issue_count", "startup_autostart_registered",
             "startup_process_health_status", "startup_scheduler_due_latest_exists",
             "startup_scheduler_runtime_latest_exists", "startup_due_session_date",
@@ -13267,9 +13852,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "run_failure_status", "run_failure_task_status", "run_failure_class",
             "run_failure_error_type", "run_failure_error", "run_failure_missing_core_artifacts",
             "market_context_status", "market_context_snapshot_plus_realized_pnl",
+            "market_context_pnl_window_semantics",
             "market_context_net_beta_exposure_to_gross", "market_context_benchmark_symbols_with_bars",
             "attribution_dossier_status", "attribution_focus_symbol_count",
             "attribution_top_focus_symbol_count", "attribution_evidence_gap_count",
+            "attribution_symbol_evidence_gap_item_count", "attribution_coverage_area_gap_count",
             "attribution_primary_bucket_counts",
             "ideal_actual_gap_status", "ideal_actual_gap_material_symbols",
             "ideal_actual_gap_gross_abs", "ideal_actual_gap_after_projected_abs",
@@ -13280,6 +13867,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "ideal_actual_gap_order_gap_notional", "ideal_actual_gap_pnl_loss_abs",
             "ideal_actual_gap_primary_bucket_counts",
             "ideal_actual_gap_performance_drag_bucket_counts",
+            "weight_error_semantics", "weight_error_actual_denominator",
+            "weight_error_actual_denominator_amount",
             "strategy_to_actual_weight_error_l1", "strategy_to_executable_weight_error_l1",
             "executable_to_actual_weight_error_l1", "mean_symbol_strategy_to_actual_weight_error",
             "max_symbol_strategy_to_actual_weight_error", "executable_projection_status",
@@ -13324,6 +13913,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "target_transition_attention_symbols", "target_transition_material_residual_symbols",
             "target_gap_symbol_count_without_position_residual",
             "gross_target_error_abs_without_position_residual", "decision_intent_status",
+            "decision_intent_unexplained_no_order_symbols",
+            "decision_intent_below_min_trade_symbols",
+            "decision_intent_min_trade_boundary_symbols",
             "decision_projection_changed_symbols", "decision_short_floor_zeroed_symbols",
             "decision_short_floor_reduced_symbols", "decision_gross_projection_delta_notional_abs",
             "decision_skipped_symbol_count", "order_constraint_planned_orders",
@@ -13338,15 +13930,18 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "intraday_bar_status", "intraday_bar_symbols", "intraday_bar_bar_symbols",
             "intraday_bar_execution_relevant_symbols", "intraday_bar_missing_symbols",
             "intraday_bar_context_missing_symbols", "intraday_bar_filled_symbols_missing",
-            "intraday_bar_error_count", "intraday_bar_max_range_bps",
+            "intraday_bar_error_count", "intraday_bar_context_error_count",
+            "intraday_bar_max_range_bps",
             "quote_status", "quote_symbols", "quote_quote_symbols", "quote_execution_relevant_symbols",
             "quote_missing_symbols", "quote_context_missing_symbols",
             "quote_invalid_symbols", "quote_wide_spread_symbols", "quote_error_count",
-            "quote_max_spread_bps",
+            "quote_context_error_count",
+            "quote_max_spread_bps", "quote_wide_spread_threshold_bps",
             "calendar_status", "calendar_rows", "calendar_session_date_in_calendar",
             "calendar_expected_previous_trading_date", "calendar_expected_next_trading_date",
             "calendar_session_is_half_day", "calendar_error_count",
-            "account_activity_rows", "account_activity_unknown_net_amount",
+            "account_activity_status", "account_activity_rows", "account_activity_capture_ok",
+            "account_activity_window_semantics", "account_activity_unknown_net_amount",
             "account_activity_non_trade_equity_impact", "account_activity_trade_fill_cashflow",
             "corporate_action_status", "corporate_action_rows",
             "corporate_action_matched_position_residual_symbols",
@@ -13354,6 +13949,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "corporate_action_residual_symbols_without_action",
             "portfolio_history_status", "portfolio_history_rows",
             "portfolio_history_summary_vs_after_delta", "portfolio_history_largest_equity_range",
+            "portfolio_history_timeframe", "portfolio_history_latest_sample_timestamp_utc",
+            "portfolio_history_sample_age_seconds",
             "strict_attribution_status", "strict_attribution_ready", "strict_attribution_blocking_items",
             "strict_account_position_replay_ready",
         ],

@@ -194,6 +194,9 @@ class DataAggregator:
                     summary["market_price_context_missing_reference_symbols"] = (
                         audit.get("market_price_context_missing_reference_symbols") if run_type == "execute" else 0
                     )
+                    summary["market_price_fallback_only_symbols"] = (
+                        audit.get("market_price_fallback_only_symbols") if run_type == "execute" else 0
+                    )
                     summary["market_price_large_reference_moves"] = (
                         audit.get("market_price_large_reference_moves") if run_type == "execute" else 0
                     )
@@ -215,6 +218,9 @@ class DataAggregator:
                     summary["intraday_bar_error_count"] = (
                         audit.get("intraday_bar_error_count") if run_type == "execute" else 0
                     )
+                    summary["intraday_bar_context_error_count"] = (
+                        audit.get("intraday_bar_context_error_count") if run_type == "execute" else 0
+                    )
                     summary["quote_status"] = audit.get("quote_status") if run_type == "execute" else "not_applicable"
                     summary["quote_execution_relevant_symbols"] = (
                         audit.get("quote_execution_relevant_symbols") if run_type == "execute" else 0
@@ -231,7 +237,40 @@ class DataAggregator:
                     summary["quote_wide_spread_symbols"] = (
                         audit.get("quote_wide_spread_symbols") if run_type == "execute" else 0
                     )
+                    summary["quote_wide_spread_threshold_bps"] = (
+                        audit.get("quote_wide_spread_threshold_bps") if run_type == "execute" else 0
+                    )
                     summary["quote_error_count"] = audit.get("quote_error_count") if run_type == "execute" else 0
+                    summary["quote_context_error_count"] = (
+                        audit.get("quote_context_error_count") if run_type == "execute" else 0
+                    )
+                    summary["account_activity_status"] = (
+                        audit.get("account_activity_status") if run_type == "execute" else "not_applicable"
+                    )
+                    summary["decision_intent_status"] = (
+                        audit.get("decision_intent_status") if run_type == "execute" else "not_applicable"
+                    )
+                    summary["decision_intent_unexplained_no_order_symbols"] = (
+                        audit.get("decision_intent_unexplained_no_order_symbols") if run_type == "execute" else 0
+                    )
+                    summary["decision_intent_below_min_trade_symbols"] = (
+                        audit.get("decision_intent_below_min_trade_symbols") if run_type == "execute" else 0
+                    )
+                    summary["decision_intent_min_trade_boundary_symbols"] = (
+                        audit.get("decision_intent_min_trade_boundary_symbols") if run_type == "execute" else 0
+                    )
+                    summary["account_activity_capture_ok"] = (
+                        audit.get("account_activity_capture_ok") if run_type == "execute" else None
+                    )
+                    summary["account_activity_window_semantics"] = (
+                        audit.get("account_activity_window_semantics") if run_type == "execute" else ""
+                    )
+                    summary["account_activity_unknown_net_amount"] = (
+                        audit.get("account_activity_unknown_net_amount") if run_type == "execute" else 0
+                    )
+                    summary["account_activity_non_trade_equity_impact"] = (
+                        audit.get("account_activity_non_trade_equity_impact") if run_type == "execute" else 0
+                    )
                     summary["corporate_action_status"] = (
                         audit.get("corporate_action_status") if run_type == "execute" else "not_applicable"
                     )
@@ -243,6 +282,15 @@ class DataAggregator:
                         audit.get("portfolio_history_status") if run_type == "execute" else "not_applicable"
                     )
                     summary["portfolio_history_rows"] = audit.get("portfolio_history_rows") if run_type == "execute" else 0
+                    summary["portfolio_history_summary_vs_after_delta"] = (
+                        audit.get("portfolio_history_summary_vs_after_delta") if run_type == "execute" else 0
+                    )
+                    summary["portfolio_history_timeframe"] = (
+                        audit.get("portfolio_history_timeframe") if run_type == "execute" else ""
+                    )
+                    summary["portfolio_history_sample_age_seconds"] = (
+                        audit.get("portfolio_history_sample_age_seconds") if run_type == "execute" else None
+                    )
                     summary["calendar_status"] = (
                         audit.get("calendar_status") if run_type == "execute" else "not_applicable"
                     )
@@ -288,6 +336,9 @@ class DataAggregator:
                     summary["market_context_snapshot_plus_realized_pnl"] = (
                         audit.get("market_context_snapshot_plus_realized_pnl") if run_type == "execute" else 0
                     )
+                    summary["market_context_pnl_window_semantics"] = (
+                        audit.get("market_context_pnl_window_semantics") if run_type == "execute" else ""
+                    )
                     summary["market_context_net_beta_exposure_to_gross"] = (
                         audit.get("market_context_net_beta_exposure_to_gross") if run_type == "execute" else None
                     )
@@ -302,6 +353,12 @@ class DataAggregator:
                     )
                     summary["attribution_evidence_gap_count"] = (
                         audit.get("attribution_evidence_gap_count") if run_type == "execute" else 0
+                    )
+                    summary["attribution_symbol_evidence_gap_item_count"] = (
+                        audit.get("attribution_symbol_evidence_gap_item_count") if run_type == "execute" else 0
+                    )
+                    summary["attribution_coverage_area_gap_count"] = (
+                        audit.get("attribution_coverage_area_gap_count") if run_type == "execute" else 0
                     )
                     summary["attribution_primary_bucket_counts"] = (
                         audit.get("attribution_primary_bucket_counts") if run_type == "execute" else ""
@@ -327,6 +384,9 @@ class DataAggregator:
                     summary["run_evidence_digest_artifact_completeness_partial_category_count"] = (
                         audit.get("run_evidence_digest_artifact_completeness_partial_category_count", 0)
                     )
+                    summary["run_evidence_digest_resolved_from_paired_decision_count"] = (
+                        audit.get("run_evidence_digest_resolved_from_paired_decision_count", 0)
+                    )
                     summary["startup_binding_status"] = (
                         audit.get("startup_binding_status", "not_applicable")
                     )
@@ -341,6 +401,9 @@ class DataAggregator:
                     )
                     summary["run_failure_status"] = (
                         audit.get("run_failure_status", "not_applicable")
+                    )
+                    summary["run_failure_task_status"] = (
+                        audit.get("run_failure_task_status", "")
                     )
                     summary["run_failure_class"] = (
                         audit.get("run_failure_class", "")

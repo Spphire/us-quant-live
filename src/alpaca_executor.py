@@ -7218,6 +7218,29 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
     return categories
 
 
+def _paired_decision_artifact_path(output_root: Path, artifact_name: str) -> Path | None:
+    if not output_root.name.endswith("_execute") or not artifact_name.startswith("alpha_core_panel_"):
+        return None
+    run_context = _read_json_artifact(output_root / "run_context.json", {})
+    parsed_args = run_context.get("parsed_args", {}) if isinstance(run_context, Mapping) else {}
+    targets_input = (
+        parsed_args.get("decision_targets_input_path")
+        if isinstance(parsed_args, Mapping)
+        else None
+    )
+    candidate_roots: list[Path] = []
+    if targets_input:
+        candidate_roots.append(Path(str(targets_input)).resolve().parent)
+    candidate_roots.append(
+        output_root.with_name(output_root.name[: -len("_execute")] + "_decision")
+    )
+    for root in candidate_roots:
+        candidate = root / artifact_name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _write_artifact_completeness_snapshot(output_root: Path) -> Path:
     path = output_root / "artifact_completeness_snapshot.json"
     context = _run_submission_context(output_root)
@@ -7227,10 +7250,18 @@ def _write_artifact_completeness_snapshot(output_root: Path) -> Path:
         rows = []
         for name in names:
             item = output_root / name
+            source_scope = "run"
+            if not item.exists():
+                paired_item = _paired_decision_artifact_path(output_root, name)
+                if paired_item is not None:
+                    item = paired_item
+                    source_scope = "paired_decision"
             rows.append(
                 {
                     "artifact": name,
                     "exists": item.exists(),
+                    "path": item.as_posix(),
+                    "source_scope": source_scope,
                     "bytes": item.stat().st_size if item.exists() else None,
                     "sha256": _sha256_file(item) if item.exists() else None,
                 }
