@@ -5718,6 +5718,7 @@ def _build_intraday_bar_evidence(
     ]
     bars_by_source_symbol: dict[str, dict[str, list[dict[str, Any]]]] = {}
     source_summaries: dict[str, dict[str, Any]] = {}
+    requested_symbols: set[str] = set()
     expected_symbols: set[str] = set()
     all_bar_symbols: set[str] = set()
     total_errors: list[dict[str, Any]] = []
@@ -5731,6 +5732,7 @@ def _build_intraday_bar_evidence(
             grouped[symbol].append(row)
         requested = _intraday_bar_requested_symbols(raw)
         errors = _intraday_bar_errors(raw)
+        requested_symbols.update(requested)
         expected_symbols.update(requested)
         all_bar_symbols.update(grouped)
         total_errors.extend({"source": source, **error} for error in errors)
@@ -5765,6 +5767,12 @@ def _build_intraday_bar_evidence(
         if str(row.get("symbol") or "").strip()
     }
     fills = _fill_by_symbol(fill_rows)
+    market_execution_symbols = {
+        symbol
+        for symbol, row in market_by_symbol.items()
+        if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
+    }
+    execution_relevant_symbols = requested_symbols | set(fills) | market_execution_symbols
     expected_symbols.update(market_by_symbol)
     expected_symbols.update(fills)
     symbols = sorted(expected_symbols | all_bar_symbols)
@@ -5787,6 +5795,7 @@ def _build_intraday_bar_evidence(
         after = after_stats.get(symbol, {})
         market = market_by_symbol.get(symbol, {})
         fill = fills.get(symbol, {})
+        required_for_execution = symbol in execution_relevant_symbols
         open_price = _safe_float(chosen.get("open"))
         high_price = _safe_float(chosen.get("high"))
         low_price = _safe_float(chosen.get("low"))
@@ -5828,6 +5837,7 @@ def _build_intraday_bar_evidence(
             {
                 "symbol": symbol,
                 "status": status,
+                "required_for_execution": required_for_execution,
                 "source_used": chosen.get("source", ""),
                 "capture_feeds": chosen.get("capture_feeds", ""),
                 "capture_sources": chosen.get("capture_sources", ""),
@@ -5868,10 +5878,14 @@ def _build_intraday_bar_evidence(
             }
         )
 
-    missing_rows = [row for row in rows if row.get("status") == "missing_bars"]
-    filled_rows = [row for row in rows if _safe_int(row.get("fill_count")) > 0]
+    relevant_rows = [row for row in rows if bool(row.get("required_for_execution"))]
+    context_only_rows = [row for row in rows if not bool(row.get("required_for_execution"))]
+    missing_rows = [row for row in relevant_rows if row.get("status") == "missing_bars"]
+    context_missing_rows = [row for row in context_only_rows if row.get("status") == "missing_bars"]
+    filled_rows = [row for row in relevant_rows if _safe_int(row.get("fill_count")) > 0]
     filled_missing = [row for row in filled_rows if row.get("status") == "missing_bars"]
-    status_counts = Counter(str(row.get("status") or "") for row in rows)
+    status_counts = Counter(str(row.get("status") or "") for row in relevant_rows)
+    all_status_counts = Counter(str(row.get("status") or "") for row in rows)
     if not any_raw_exists:
         status = "historical_limited"
     elif total_errors or filled_missing:
@@ -5888,21 +5902,29 @@ def _build_intraday_bar_evidence(
         "sources": source_summaries,
         "symbol_count": len(rows),
         "bar_symbol_count": len(all_bar_symbols),
+        "execution_relevant_symbol_count": len(relevant_rows),
+        "context_only_symbol_count": len(context_only_rows),
         "status_counts": dict(sorted(status_counts.items())),
+        "all_symbol_status_counts": dict(sorted(all_status_counts.items())),
         "missing_bar_symbol_count": len(missing_rows),
         "missing_bar_symbols": [row.get("symbol") for row in missing_rows][:100],
+        "context_missing_bar_symbol_count": len(context_missing_rows),
+        "context_missing_bar_symbols": [row.get("symbol") for row in context_missing_rows][:100],
         "filled_symbol_count": len(filled_rows),
         "filled_symbols_missing_bars": [row.get("symbol") for row in filled_missing][:100],
         "filled_symbols_missing_bars_count": len(filled_missing),
-        "fallback_capture_symbol_count": sum(bool(row.get("fallback_capture_used")) for row in rows),
+        "fallback_capture_symbol_count": sum(bool(row.get("fallback_capture_used")) for row in relevant_rows),
         "fallback_capture_symbols": [
-            row.get("symbol") for row in rows if row.get("fallback_capture_used")
+            row.get("symbol") for row in relevant_rows if row.get("fallback_capture_used")
         ],
         "error_count": len(total_errors),
         "errors": total_errors[:20],
-        "max_intraday_range_bps": max((_safe_float(row.get("range_bps")) for row in rows), default=0.0),
+        "max_intraday_range_bps": max(
+            (_safe_float(row.get("range_bps")) for row in relevant_rows),
+            default=0.0,
+        ),
         "worst_intraday_ranges": sorted(
-            rows,
+            relevant_rows,
             key=lambda row: _safe_float(row.get("range_bps")),
             reverse=True,
         )[:25],
@@ -5917,11 +5939,13 @@ def _build_intraday_bar_evidence(
             reverse=True,
         )[:25],
         "reference_outside_range_rows": [
-            row for row in rows if "reference_outside_intraday_range" in str(row.get("price_path_hints") or "")
+            row
+            for row in relevant_rows
+            if "reference_outside_intraday_range" in str(row.get("price_path_hints") or "")
         ][:25],
         "note": (
-            "Aggregates raw 1-minute bars for relevant symbols. The raw JSON keeps complete bars; this summary links "
-            "reference prices and fills to intraday open/high/low/close/VWAP for execution-timing attribution."
+            "Execution quality is based only on requested/target/position/fill symbols. Context-only symbols remain "
+            "in the evidence rows but cannot downgrade status. The raw JSON keeps complete bars for replay."
         ),
     }
     return rows, summary_payload
@@ -8464,7 +8488,8 @@ def _build_audit_checks(
             expected="pass, partial, or historical_limited",
             observed={
                 "status": intraday_bars.get("status"),
-                "symbol_count": intraday_bars.get("symbol_count"),
+                "symbol_count": intraday_bars.get("execution_relevant_symbol_count"),
+                "context_missing_bar_symbol_count": intraday_bars.get("context_missing_bar_symbol_count"),
                 "filled_symbols_missing_bars_count": intraday_bars.get("filled_symbols_missing_bars_count"),
                 "error_count": intraday_bars.get("error_count"),
             },
@@ -9973,8 +9998,8 @@ def _write_review(
             ["symbol", "status", "decision_reference_price_used", "execute_reference_price_used", "decision_execute_reference_change_bps", "execute_reference_source_inferred"],
         ),
         "\n## Intraday Price Path Evidence\n",
-        f"- Status: `{intraday_bars.get('status')}`; symbols: `{intraday_bars.get('symbol_count')}`; bar symbols: `{intraday_bars.get('bar_symbol_count')}`\n",
-        f"- Missing bar symbols: `{intraday_bars.get('missing_bar_symbol_count')}`; filled symbols missing bars: `{intraday_bars.get('filled_symbols_missing_bars_count')}`; capture errors: `{intraday_bars.get('error_count')}`\n",
+        f"- Status: `{intraday_bars.get('status')}`; execution symbols: `{intraday_bars.get('execution_relevant_symbol_count')}`; bar symbols: `{intraday_bars.get('bar_symbol_count')}`\n",
+        f"- Missing execution bars: `{intraday_bars.get('missing_bar_symbol_count')}`; context-only missing bars: `{intraday_bars.get('context_missing_bar_symbol_count')}`; filled symbols missing bars: `{intraday_bars.get('filled_symbols_missing_bars_count')}`; capture errors: `{intraday_bars.get('error_count')}`\n",
         f"- Max intraday range bps: `{intraday_bars.get('max_intraday_range_bps')}`\n",
         "\n### Worst Fill vs Intraday VWAP\n",
         _markdown_table(
@@ -11310,7 +11335,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         execution_attempt_outcomes,
     )
     intraday_bar_fields = [
-        "symbol", "status", "source_used", "capture_feeds", "capture_sources",
+        "symbol", "status", "required_for_execution", "source_used", "capture_feeds", "capture_sources",
         "fallback_capture_used", "before_bar_count", "after_bar_count", "bar_count",
         "first_bar_time", "last_bar_time", "open", "high", "low", "close", "vwap",
         "volume", "trade_count", "range_bps", "close_vs_open_bps",
@@ -11564,7 +11589,13 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         ),
         "intraday_bar_evidence_rows": len(intraday_bar_rows),
         "intraday_bar_status": intraday_bar_summary.get("status"),
+        "intraday_bar_execution_relevant_symbols": intraday_bar_summary.get(
+            "execution_relevant_symbol_count"
+        ),
         "intraday_bar_missing_symbols": intraday_bar_summary.get("missing_bar_symbol_count"),
+        "intraday_bar_context_missing_symbols": intraday_bar_summary.get(
+            "context_missing_bar_symbol_count"
+        ),
         "intraday_bar_filled_symbols_missing": intraday_bar_summary.get("filled_symbols_missing_bars_count"),
         "intraday_bar_error_count": intraday_bar_summary.get("error_count"),
         "intraday_bar_max_range_bps": intraday_bar_summary.get("max_intraday_range_bps"),
@@ -12605,7 +12636,17 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "intraday_bar_bar_symbols": _safe_int(intraday_bars.get("bar_symbol_count"))
                 if isinstance(intraday_bars, dict)
                 else 0,
+                "intraday_bar_execution_relevant_symbols": _safe_int(
+                    intraday_bars.get("execution_relevant_symbol_count")
+                )
+                if isinstance(intraday_bars, dict)
+                else 0,
                 "intraday_bar_missing_symbols": _safe_int(intraday_bars.get("missing_bar_symbol_count"))
+                if isinstance(intraday_bars, dict)
+                else 0,
+                "intraday_bar_context_missing_symbols": _safe_int(
+                    intraday_bars.get("context_missing_bar_symbol_count")
+                )
                 if isinstance(intraday_bars, dict)
                 else 0,
                 "intraday_bar_filled_symbols_missing": _safe_int(
@@ -12801,7 +12842,13 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "market_price_missing_reference_symbols": row.get("market_price_missing_reference_symbols"),
                 "market_price_large_reference_moves": row.get("market_price_large_reference_moves"),
                 "intraday_bar_status": row.get("intraday_bar_status"),
+                "intraday_bar_execution_relevant_symbols": row.get(
+                    "intraday_bar_execution_relevant_symbols"
+                ),
                 "intraday_bar_missing_symbols": row.get("intraday_bar_missing_symbols"),
+                "intraday_bar_context_missing_symbols": row.get(
+                    "intraday_bar_context_missing_symbols"
+                ),
                 "intraday_bar_filled_symbols_missing": row.get("intraday_bar_filled_symbols_missing"),
                 "intraday_bar_error_count": row.get("intraday_bar_error_count"),
                 "quote_status": row.get("quote_status"),
@@ -12962,6 +13009,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             ),
             "intraday_bar_missing_symbols": sum(
                 _safe_int(row.get("intraday_bar_missing_symbols")) for row in rows
+            ),
+            "intraday_bar_context_missing_symbols": sum(
+                _safe_int(row.get("intraday_bar_context_missing_symbols")) for row in rows
             ),
             "intraday_bar_filled_symbols_missing": sum(
                 _safe_int(row.get("intraday_bar_filled_symbols_missing")) for row in rows
@@ -13236,7 +13286,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "market_price_missing_reference_symbols", "market_price_fallback_only_symbols",
             "market_price_large_reference_moves", "market_price_max_abs_reference_move_bps",
             "intraday_bar_status", "intraday_bar_symbols", "intraday_bar_bar_symbols",
-            "intraday_bar_missing_symbols", "intraday_bar_filled_symbols_missing",
+            "intraday_bar_execution_relevant_symbols", "intraday_bar_missing_symbols",
+            "intraday_bar_context_missing_symbols", "intraday_bar_filled_symbols_missing",
             "intraday_bar_error_count", "intraday_bar_max_range_bps",
             "quote_status", "quote_symbols", "quote_quote_symbols", "quote_execution_relevant_symbols",
             "quote_missing_symbols", "quote_context_missing_symbols",

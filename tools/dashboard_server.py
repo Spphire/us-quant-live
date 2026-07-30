@@ -188,8 +188,14 @@ class DataAggregator:
                     summary["intraday_bar_status"] = (
                         audit.get("intraday_bar_status") if run_type == "execute" else "not_applicable"
                     )
+                    summary["intraday_bar_execution_relevant_symbols"] = (
+                        audit.get("intraday_bar_execution_relevant_symbols") if run_type == "execute" else 0
+                    )
                     summary["intraday_bar_missing_symbols"] = (
                         audit.get("intraday_bar_missing_symbols") if run_type == "execute" else 0
+                    )
+                    summary["intraday_bar_context_missing_symbols"] = (
+                        audit.get("intraday_bar_context_missing_symbols") if run_type == "execute" else 0
                     )
                     summary["intraday_bar_filled_symbols_missing"] = (
                         audit.get("intraday_bar_filled_symbols_missing") if run_type == "execute" else 0

@@ -9,6 +9,7 @@ from daily_audit_report import (
     _build_account_state_bridge,
     _build_decision_intent_trace,
     _build_equity_pnl_bridge,
+    _build_intraday_bar_evidence,
     _build_quote_evidence,
     _build_residual_diagnosis,
 )
@@ -117,6 +118,53 @@ def test_quote_capture_uses_valid_fallback_and_execution_universe(tmp_path: Path
     assert summary["invalid_quote_symbol_count"] == 0
     assert summary["context_missing_quote_symbol_count"] == 2
     assert summary["source_invalid_quote_observation_count"] == 1
+
+
+def test_intraday_bars_exclude_context_only_symbols_from_status(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "execution_intraday_bars_1min.json",
+        {
+            "ok": True,
+            "requested_symbols": ["AAA"],
+            "bars": [
+                {
+                    "symbol": "AAA",
+                    "t": "2026-07-29T14:00:00Z",
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 1000,
+                    "vw": 100.2,
+                }
+            ],
+            "errors": [],
+        },
+    )
+    market_rows = [
+        {
+            "symbol": "AAA",
+            "in_execute_target_symbols": True,
+            "in_execute_broker_position_before": False,
+            "execute_reference_price_used": 100.0,
+        },
+        {"symbol": "CTX1", "in_execute_target_symbols": False, "in_execute_broker_position_before": False},
+        {"symbol": "CTX2", "in_execute_target_symbols": False, "in_execute_broker_position_before": False},
+    ]
+
+    rows, summary = _build_intraday_bar_evidence(
+        run_dir=tmp_path,
+        market_price_evidence_rows=market_rows,
+        fill_rows=[{"symbol": "AAA", "qty": 1, "price": 100.1, "side": "buy"}],
+    )
+    by_symbol = {row["symbol"]: row for row in rows}
+
+    assert by_symbol["AAA"]["required_for_execution"] is True
+    assert by_symbol["CTX1"]["required_for_execution"] is False
+    assert summary["status"] == "pass"
+    assert summary["execution_relevant_symbol_count"] == 1
+    assert summary["missing_bar_symbol_count"] == 0
+    assert summary["context_missing_bar_symbol_count"] == 2
 
 
 def test_decision_intent_treats_minimum_trade_edge_as_explained() -> None:
