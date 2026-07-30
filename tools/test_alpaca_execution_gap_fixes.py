@@ -37,6 +37,7 @@ from src.alpaca_executor import (  # noqa: E402
     _submit_and_track_orders,
     _submit_staged_regt_orders,
     _total_regt_buying_power_capacity,
+    _write_json_file_if_absent,
 )
 from src.executable_target_projector import project_executable_targets  # noqa: E402
 from vendors import AlpacaRequestError, LongbridgeQuoteError  # noqa: E402
@@ -50,6 +51,14 @@ from tools.daily_audit_report import (  # noqa: E402
     _build_quote_evidence,
 )
 from tools.execution_quality import _logical_records  # noqa: E402
+
+
+def test_first_run_json_evidence_is_not_overwritten() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "broker_day_open_snapshot.json"
+        assert _write_json_file_if_absent(path, {"capture": "first"}) is True
+        assert _write_json_file_if_absent(path, {"capture": "restart"}) is False
+        assert json.loads(path.read_text(encoding="utf-8")) == {"capture": "first"}
 
 
 class _NeverFillClient:
@@ -2006,6 +2015,7 @@ def main() -> int:
         ("Decision phase timing persistence", test_decision_phase_timings_persist_progress_and_failure),
         ("Persistent run event logging", test_run_events_are_persisted_immediately_with_sequence_and_elapsed_time),
         ("Target capability drift evidence", test_target_capability_drift_explains_new_nonshortable_target),
+        ("Immutable first-run day-open evidence", test_first_run_json_evidence_is_not_overwritten),
         ("Post-submission quote audit", test_quote_audit_prefers_immediate_post_submission_snapshot),
     ]
     failed = 0

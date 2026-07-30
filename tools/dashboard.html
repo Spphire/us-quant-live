@@ -677,11 +677,14 @@
                 statusRunning: 'Running',
                 statusStarted: 'Started',
                 chartEquityTitle: 'Portfolio Equity (Last 30 Days)',
-                chartSideReturnTitle: 'Daily Long / Short Returns (Execution Snapshot)',
+                chartSideReturnTitle: 'Daily P&L Contribution vs Account Return',
                 chartWeightErrorTitle: 'Daily Weight Error (L1)',
                 chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
-                seriesLongReturn: 'Long return',
-                seriesShortReturn: 'Short return',
+                seriesLongReturn: 'Long contribution',
+                seriesShortReturn: 'Short contribution',
+                seriesAccountReturn: 'Account daily return',
+                seriesNonTradeContribution: 'Fees / income contribution',
+                seriesResidualContribution: 'Unattributed residual',
                 seriesStrategyActual: 'Strategy to actual',
                 seriesStrategyExecutable: 'Strategy to executable',
                 seriesExecutableActual: 'Executable to actual',
@@ -818,11 +821,14 @@
                 statusRunning: '运行中',
                 statusStarted: '已启动',
                 chartEquityTitle: '账户权益曲线（最近30天）',
-                chartSideReturnTitle: '每日多空侧收益率（执行后快照）',
+                chartSideReturnTitle: '每日多空收益贡献与账户日收益',
                 chartWeightErrorTitle: '每日权重误差（L1）',
                 chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
-                seriesLongReturn: '多头收益率',
-                seriesShortReturn: '空头收益率',
+                seriesLongReturn: '多头收益贡献',
+                seriesShortReturn: '空头收益贡献',
+                seriesAccountReturn: '账户日收益',
+                seriesNonTradeContribution: '费用与收益项贡献',
+                seriesResidualContribution: '未归因残差',
                 seriesStrategyActual: '策略到实际',
                 seriesStrategyExecutable: '策略到可执行',
                 seriesExecutableActual: '可执行到实际',
@@ -1135,8 +1141,7 @@
             const sourceRows = rows.filter(row => {
                 if (Number(row.capital_epoch || 1) !== activeEpoch) return false;
                 if (String(row.run_type || '').toLowerCase() !== 'execute') return false;
-                return auditMetric(row, 'long_snapshot_intraday_return') !== null
-                    || auditMetric(row, 'short_snapshot_intraday_return') !== null;
+                return auditMetric(row, 'daily_account_return') !== null;
             });
             const byDate = new Map();
             for (const row of sourceRows) {
@@ -1148,12 +1153,19 @@
                 .slice(-30)
                 .map(row => ({
                     label: historyDateKey(row),
-                    longReturnPct: auditMetric(row, 'long_snapshot_intraday_return', 100),
-                    shortReturnPct: auditMetric(row, 'short_snapshot_intraday_return', 100),
-                    longPnl: auditMetric(row, 'long_snapshot_intraday_pnl'),
-                    shortPnl: auditMetric(row, 'short_snapshot_intraday_pnl'),
-                    longExposure: auditMetric(row, 'long_gross_exposure_after'),
-                    shortExposure: auditMetric(row, 'short_gross_exposure_after'),
+                    longContributionPct: auditMetric(row, 'daily_long_equity_contribution', 100),
+                    shortContributionPct: auditMetric(row, 'daily_short_equity_contribution', 100),
+                    nonTradeContributionPct: auditMetric(row, 'daily_known_non_trade_equity_contribution', 100),
+                    residualContributionPct: auditMetric(row, 'daily_unattributed_equity_contribution', 100),
+                    accountReturnPct: auditMetric(row, 'daily_account_return', 100),
+                    accountPnl: auditMetric(row, 'daily_account_pnl'),
+                    accountLastEquity: auditMetric(row, 'daily_account_last_equity'),
+                    longPnl: auditMetric(row, 'daily_long_pnl'),
+                    shortPnl: auditMetric(row, 'daily_short_pnl'),
+                    nonTradePnl: auditMetric(row, 'daily_known_non_trade_pnl'),
+                    residualPnl: auditMetric(row, 'daily_unattributed_residual_pnl'),
+                    residualAbsBps: auditMetric(row, 'daily_side_pnl_residual_abs_bps'),
+                    status: String(row.daily_side_pnl_attribution_status || 'unavailable'),
                     runDir: row.run_dir || ''
                 }));
         }
@@ -1738,12 +1750,24 @@
         function renderSideReturnChart(history) {
             const series = buildSideReturnSeries(history);
             const labels = series.map(point => point.label);
-            const longValues = series.map(point => point.longReturnPct);
-            const shortValues = series.map(point => point.shortReturnPct);
-            const colors = { long: '#60a5fa', short: '#f59e0b' };
+            const longValues = series.map(point => point.longContributionPct);
+            const shortValues = series.map(point => point.shortContributionPct);
+            const nonTradeValues = series.map(point => point.nonTradeContributionPct);
+            const residualValues = series.map(point => point.residualContributionPct);
+            const accountValues = series.map(point => point.accountReturnPct);
+            const colors = {
+                long: '#60a5fa',
+                short: '#f59e0b',
+                nonTrade: '#94a3b8',
+                residual: '#f87171',
+                account: '#34d399'
+            };
             const key = [
                 { color: colors.long, label: t('seriesLongReturn') },
-                { color: colors.short, label: t('seriesShortReturn') }
+                { color: colors.short, label: t('seriesShortReturn') },
+                { color: colors.nonTrade, label: t('seriesNonTradeContribution') },
+                { color: colors.residual, label: t('seriesResidualContribution') },
+                { color: colors.account, label: t('seriesAccountReturn') }
             ];
             const chartHTML = `
                 <div class="panel performance-chart-panel" id="sideReturnChartPanel">
@@ -1765,23 +1789,28 @@
                 const first = labels[0] || 'n/a';
                 const last = labels[labels.length - 1] || 'n/a';
                 const renderer = typeof Chart === 'undefined' ? 'canvas fallback' : 'Chart.js';
+                const partialDays = series.filter(point => point.status === 'partial').length;
+                const reconciledDays = series.filter(point => point.status === 'reconciled').length;
                 metaEl.textContent = labels.length
-                    ? `${first} to ${last} · ${labels.length} execute snapshots · ${renderer}`
-                    : `No side-return snapshots · ${renderer}`;
+                    ? `${first} to ${last} · ${labels.length} days · reconciled ${reconciledDays} · partial ${partialDays} · ${renderer}`
+                    : `No aligned daily P&L evidence · ${renderer}`;
             }
 
             const canvas = document.getElementById('sideReturnChart');
             if (!canvas) return;
             const fallbackData = [
                 { color: colors.long, data: longValues },
-                { color: colors.short, data: shortValues }
+                { color: colors.short, data: shortValues },
+                { color: colors.nonTrade, data: nonTradeValues },
+                { color: colors.residual, data: residualValues },
+                { color: colors.account, data: accountValues }
             ];
             if (typeof Chart === 'undefined') {
                 renderMultiAxisLineFallback(
                     canvas,
                     labels,
                     fallbackData,
-                    'No daily side-return evidence'
+                    'No aligned daily P&L evidence'
                 );
                 return;
             }
@@ -1789,31 +1818,59 @@
             delete canvas.dataset.fallbackChart;
             delete canvas.dataset.fallbackLabels;
             charts.sideReturn = new Chart(canvas.getContext('2d'), {
-                type: 'line',
+                type: 'bar',
                 data: {
                     labels,
                     datasets: [
                         {
+                            type: 'bar',
                             label: t('seriesLongReturn'),
                             data: longValues,
                             borderColor: colors.long,
-                            backgroundColor: 'rgba(96, 165, 250, 0.08)',
-                            borderWidth: 2.5,
-                            pointRadius: 3,
-                            pointHoverRadius: 6,
-                            tension: 0.25,
-                            spanGaps: false
+                            backgroundColor: 'rgba(96, 165, 250, 0.55)',
+                            borderWidth: 1,
+                            stack: 'pnl-components'
                         },
                         {
+                            type: 'bar',
                             label: t('seriesShortReturn'),
                             data: shortValues,
                             borderColor: colors.short,
-                            backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                            backgroundColor: 'rgba(245, 158, 11, 0.55)',
+                            borderWidth: 1,
+                            stack: 'pnl-components'
+                        },
+                        {
+                            type: 'bar',
+                            label: t('seriesNonTradeContribution'),
+                            data: nonTradeValues,
+                            borderColor: colors.nonTrade,
+                            backgroundColor: 'rgba(148, 163, 184, 0.5)',
+                            borderWidth: 1,
+                            stack: 'pnl-components'
+                        },
+                        {
+                            type: 'bar',
+                            label: t('seriesResidualContribution'),
+                            data: residualValues,
+                            borderColor: colors.residual,
+                            backgroundColor: 'rgba(248, 113, 113, 0.45)',
+                            borderWidth: 1,
+                            stack: 'pnl-components'
+                        },
+                        {
+                            type: 'line',
+                            label: t('seriesAccountReturn'),
+                            data: accountValues,
+                            borderColor: colors.account,
+                            backgroundColor: 'rgba(52, 211, 153, 0.08)',
                             borderWidth: 2.5,
                             pointRadius: 3,
                             pointHoverRadius: 6,
-                            tension: 0.25,
-                            spanGaps: false
+                            tension: 0.2,
+                            spanGaps: false,
+                            stack: 'account-return',
+                            order: 0
                         }
                     ]
                 },
@@ -1836,8 +1893,11 @@
                                     const point = series[items?.[0]?.dataIndex ?? -1];
                                     if (!point) return '';
                                     return [
-                                        `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} / ${formatOptionalCurrency(point.longExposure)}`,
-                                        `${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)} / ${formatOptionalCurrency(point.shortExposure)}`
+                                        `${t('seriesAccountReturn')}: ${formatOptionalCurrency(point.accountPnl)} / ${formatOptionalCurrency(point.accountLastEquity)}`,
+                                        `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} | ${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)}`,
+                                        `${t('seriesNonTradeContribution')}: ${formatOptionalCurrency(point.nonTradePnl)}`,
+                                        `${t('seriesResidualContribution')}: ${formatOptionalCurrency(point.residualPnl)} (${formatNumber(point.residualAbsBps)} bps)`,
+                                        `status: ${escapeHTML(point.status)}`
                                     ];
                                 }
                             }
@@ -1845,6 +1905,7 @@
                     },
                     scales: {
                         y: {
+                            stacked: true,
                             ticks: {
                                 color: '#8b92a8',
                                 callback: value => `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(2)}%`
@@ -1855,6 +1916,7 @@
                             }
                         },
                         x: {
+                            stacked: true,
                             ticks: {
                                 color: '#8b92a8',
                                 font: {size: 10},

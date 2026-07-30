@@ -25,6 +25,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+try:
+    from tools.daily_pnl_attribution import build_daily_side_pnl_attribution
+except ModuleNotFoundError:
+    from daily_pnl_attribution import build_daily_side_pnl_attribution
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCHED_ROOT = PROJECT_ROOT / "artifacts" / "daily_alpaca_scheduler"
 FACTOR_COLUMNS = [
@@ -10715,6 +10720,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "81_executable_target_projection_summary.json",
         "82_position_capacity_summary.json",
         "83_execution_attempt_outcome_summary.json",
+        "84_daily_side_pnl_attribution_summary.json",
         "daily_review.md",
     ]:
         try:
@@ -11257,6 +11263,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         decision_rows,
         execution_attempt_outcomes,
     )
+    daily_side_pnl_attribution = build_daily_side_pnl_attribution(
+        account_after_capture=_read_json(run_dir / "broker_account_after.json", {}),
+        risk_snapshot=risk,
+        account_activity_summary=account_activity_attribution_summary,
+        opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+    )
     equity_pnl_bridge = _build_equity_pnl_bridge(
         run_dir=run_dir,
         summary=summary if isinstance(summary, dict) else {},
@@ -11790,6 +11802,10 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         audit_dir / "83_execution_attempt_outcome_summary.json",
         execution_attempt_outcomes,
     )
+    _write_json(
+        audit_dir / "84_daily_side_pnl_attribution_summary.json",
+        daily_side_pnl_attribution,
+    )
     intraday_bar_fields = [
         "symbol", "status", "required_for_execution", "source_used", "capture_feeds", "capture_sources",
         "fallback_capture_used", "before_bar_count", "after_bar_count", "bar_count",
@@ -12123,6 +12139,15 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "calendar_session_is_half_day": calendar_summary.get("session_is_half_day"),
         "calendar_error_count": calendar_summary.get("error_count"),
         "account_activity_attribution_rows": len(account_activity_attribution_rows),
+        "daily_side_pnl_attribution_status": daily_side_pnl_attribution.get("status"),
+        "daily_account_pnl": daily_side_pnl_attribution.get("account_daily_pnl"),
+        "daily_account_return": daily_side_pnl_attribution.get("account_daily_return"),
+        "daily_long_equity_contribution": daily_side_pnl_attribution.get("long_equity_contribution"),
+        "daily_short_equity_contribution": daily_side_pnl_attribution.get("short_equity_contribution"),
+        "daily_unattributed_residual_pnl": daily_side_pnl_attribution.get("unattributed_residual_pnl"),
+        "daily_unattributed_equity_contribution": daily_side_pnl_attribution.get(
+            "unattributed_equity_contribution"
+        ),
         "account_activity_status": account_activity_attribution_summary.get("status"),
         "account_activity_capture_ok": account_activity_attribution_summary.get("capture_ok"),
         "account_activity_window_semantics": account_activity_attribution_summary.get(

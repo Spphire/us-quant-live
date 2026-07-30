@@ -29,6 +29,11 @@ from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+try:
+    from tools.daily_pnl_attribution import build_daily_side_pnl_attribution
+except ModuleNotFoundError:
+    from daily_pnl_attribution import build_daily_side_pnl_attribution
+
 
 class DataAggregator:
     """Aggregate and cache data from artifacts directory."""
@@ -1555,7 +1560,7 @@ class DataAggregator:
         return self._read_json_file(self.artifacts_root / "audit_rollup.json")
 
     def _read_side_return_snapshot(self, run_dir: Path) -> dict[str, Any]:
-        """Read broker intraday PnL and normalize it by post-trade side exposure."""
+        """Expose legacy side snapshots plus account-consistent daily contributions."""
         risk = self._read_json_file(run_dir / "audit" / "07_risk_snapshot.json")
         by_side = risk.get("snapshot_intraday_pnl_by_side", {})
         if not isinstance(by_side, dict):
@@ -1575,6 +1580,19 @@ class DataAggregator:
                 return None
             return pnl / exposure
 
+        daily_attribution = self._read_json_file(
+            run_dir / "audit" / "84_daily_side_pnl_attribution_summary.json"
+        )
+        if not daily_attribution:
+            daily_attribution = build_daily_side_pnl_attribution(
+                account_after_capture=self._read_json_file(run_dir / "broker_account_after.json"),
+                risk_snapshot=risk,
+                account_activity_summary=self._read_json_file(
+                    run_dir / "audit" / "51_account_activity_attribution_summary.json"
+                ),
+                opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+            )
+
         return {
             "side_return_snapshot_source": (
                 "audit/07_risk_snapshot.json" if risk else ""
@@ -1590,6 +1608,36 @@ class DataAggregator:
             "short_snapshot_intraday_return": normalized_return(
                 short_pnl,
                 short_exposure,
+            ),
+            "daily_side_pnl_attribution_status": daily_attribution.get("status", "unavailable"),
+            "daily_side_pnl_window_semantics": daily_attribution.get("window_semantics", ""),
+            "daily_side_pnl_denominator_semantics": daily_attribution.get(
+                "denominator_semantics", ""
+            ),
+            "daily_side_pnl_semantics": daily_attribution.get("side_pnl_semantics", ""),
+            "daily_account_last_equity": daily_attribution.get("account_last_equity"),
+            "daily_account_pnl": daily_attribution.get("account_daily_pnl"),
+            "daily_account_return": daily_attribution.get("account_daily_return"),
+            "daily_long_pnl": daily_attribution.get("long_pnl"),
+            "daily_short_pnl": daily_attribution.get("short_pnl"),
+            "daily_known_non_trade_pnl": daily_attribution.get("known_non_trade_pnl"),
+            "daily_unattributed_residual_pnl": daily_attribution.get("unattributed_residual_pnl"),
+            "daily_long_equity_contribution": daily_attribution.get("long_equity_contribution"),
+            "daily_short_equity_contribution": daily_attribution.get("short_equity_contribution"),
+            "daily_known_non_trade_equity_contribution": daily_attribution.get(
+                "known_non_trade_equity_contribution"
+            ),
+            "daily_unattributed_equity_contribution": daily_attribution.get(
+                "unattributed_equity_contribution"
+            ),
+            "daily_side_pnl_residual_abs_bps": daily_attribution.get(
+                "residual_abs_bps_of_last_equity"
+            ),
+            "daily_side_pnl_reconciliation_threshold_bps": daily_attribution.get(
+                "reconciliation_threshold_bps"
+            ),
+            "daily_side_opening_snapshot_available": daily_attribution.get(
+                "opening_snapshot_available", False
             ),
         }
 

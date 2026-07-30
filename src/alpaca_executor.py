@@ -874,7 +874,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         shorting_enabled = bool(account_before.get("shorting_enabled", True))
 
         positions_before = client.list_positions()
+        positions_before_captured_at_utc = _utc_now()
         _write_json_file(output_root / "broker_positions_before_raw.json", positions_before)
+        if should_submit:
+            day_open_snapshot_path = output_root / "broker_day_open_snapshot.json"
+            day_open_snapshot_created = _write_json_file_if_absent(
+                day_open_snapshot_path,
+                {
+                    "schema_version": "1.0",
+                    "session_date": decision_date.isoformat(),
+                    "captured_at_utc": positions_before_captured_at_utc,
+                    "account_captured_at_utc": account_before_captured_at_utc,
+                    "capture_semantics": "first_submit_enabled_executor_preflight_for_session",
+                    "account": account_before,
+                    "positions": positions_before,
+                },
+            )
+            _mark_event(
+                run_events,
+                "broker_day_open_snapshot_bound",
+                {
+                    "path": day_open_snapshot_path.as_posix(),
+                    "created": day_open_snapshot_created,
+                    "position_count": len(positions_before),
+                },
+            )
         position_account_stability_before = _collect_position_account_stability(
             client=client,
             initial_positions=positions_before,
@@ -6838,6 +6862,17 @@ def _write_json_file(path: Path, payload: Any) -> None:
         json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default),
         encoding="utf-8",
     )
+
+
+def _write_json_file_if_absent(path: Path, payload: Any) -> bool:
+    """Atomically preserve first-run evidence across same-session restarts."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False, default=_json_default)
+    except FileExistsError:
+        return False
+    return True
 
 
 def _write_jsonl_file(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
