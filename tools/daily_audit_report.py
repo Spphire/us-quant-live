@@ -4136,6 +4136,12 @@ def _build_market_price_evidence(
         | set(execute_trades)
         | set(fill_by_symbol)
     )
+    execution_relevant_symbols = (
+        set(execute_price["target_symbols"])
+        | set(execute_price["broker_position_symbols_before"])
+        | set(execute_plan_prices)
+        | set(fill_by_symbol)
+    )
     missing_execute = set(execute_price.get("missing_symbols", []))
     rows: list[dict[str, Any]] = []
     for symbol in symbols:
@@ -4181,6 +4187,7 @@ def _build_market_price_evidence(
             {
                 "symbol": symbol,
                 "status": status,
+                "required_for_execution": symbol in execution_relevant_symbols,
                 "in_decision_target_or_position": symbol in decision_by_symbol,
                 "in_execute_target_symbols": symbol in set(execute_price["target_symbols"]),
                 "in_execute_broker_position_before": symbol in set(execute_price["broker_position_symbols_before"]),
@@ -4219,37 +4226,53 @@ def _build_market_price_evidence(
             }
         )
 
-    status_counts = Counter(str(row.get("status") or "") for row in rows)
-    large_reference_moves = [row for row in rows if row.get("status") == "large_decision_execute_reference_move"]
-    missing_rows = [row for row in rows if str(row.get("status") or "").startswith("missing")]
-    fallback_rows = [row for row in rows if row.get("status") == "fallback_only"]
+    relevant_rows = [row for row in rows if bool(row.get("required_for_execution"))]
+    context_only_rows = [row for row in rows if not bool(row.get("required_for_execution"))]
+    status_counts = Counter(str(row.get("status") or "") for row in relevant_rows)
+    all_status_counts = Counter(str(row.get("status") or "") for row in rows)
+    large_reference_moves = [
+        row for row in relevant_rows if row.get("status") == "large_decision_execute_reference_move"
+    ]
+    missing_rows = [
+        row for row in relevant_rows if str(row.get("status") or "").startswith("missing")
+    ]
+    context_missing_rows = [
+        row for row in context_only_rows if str(row.get("status") or "").startswith("missing")
+    ]
+    fallback_rows = [row for row in relevant_rows if row.get("status") == "fallback_only"]
     summary_payload = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": "historical_limited" if not execute_price["exists"] else "attention" if missing_rows else "pass",
         "symbol_count": len(rows),
+        "execution_relevant_symbol_count": len(relevant_rows),
+        "context_only_symbol_count": len(context_only_rows),
         "status_counts": dict(sorted(status_counts.items())),
+        "all_symbol_status_counts": dict(sorted(all_status_counts.items())),
         "decision_price_snapshot_exists": bool(decision_price["exists"]),
         "execute_price_snapshot_exists": bool(execute_price["exists"]),
         "decision_latest_trade_count": len(decision_trades),
         "execute_latest_trade_count": len(execute_trades),
-        "execute_missing_reference_symbol_count": len(missing_execute),
+        "execute_missing_reference_symbol_count": len(missing_rows),
+        "context_missing_reference_symbol_count": len(context_missing_rows),
         "fallback_only_symbol_count": len(fallback_rows),
         "large_decision_execute_reference_move_count": len(large_reference_moves),
         "max_abs_decision_execute_reference_change_bps": max(
-            (abs(_safe_float(row.get("decision_execute_reference_change_bps"))) for row in rows),
+            (abs(_safe_float(row.get("decision_execute_reference_change_bps"))) for row in relevant_rows),
             default=0.0,
         ),
         "largest_decision_execute_reference_moves": sorted(
-            rows,
+            relevant_rows,
             key=lambda row: abs(_safe_float(row.get("decision_execute_reference_change_bps"))),
             reverse=True,
         )[:25],
         "missing_reference_rows": missing_rows[:50],
+        "context_missing_reference_rows": context_missing_rows[:50],
         "fallback_only_rows": fallback_rows[:50],
         "note": (
-            "Expands execution_price_snapshot and latest trade evidence by symbol. "
-            "Historical runs can fall back to order_plan reference prices when explicit price snapshots are absent."
+            "Execution status is based only on decision/target/position/order/trade/fill symbols. Context-only "
+            "symbols remain in the evidence rows but cannot downgrade status. Historical runs can fall back to "
+            "order_plan reference prices when explicit price snapshots are absent."
         ),
     }
     return rows, summary_payload
@@ -5718,7 +5741,6 @@ def _build_intraday_bar_evidence(
     ]
     bars_by_source_symbol: dict[str, dict[str, list[dict[str, Any]]]] = {}
     source_summaries: dict[str, dict[str, Any]] = {}
-    requested_symbols: set[str] = set()
     expected_symbols: set[str] = set()
     all_bar_symbols: set[str] = set()
     total_errors: list[dict[str, Any]] = []
@@ -5732,7 +5754,6 @@ def _build_intraday_bar_evidence(
             grouped[symbol].append(row)
         requested = _intraday_bar_requested_symbols(raw)
         errors = _intraday_bar_errors(raw)
-        requested_symbols.update(requested)
         expected_symbols.update(requested)
         all_bar_symbols.update(grouped)
         total_errors.extend({"source": source, **error} for error in errors)
@@ -5772,7 +5793,7 @@ def _build_intraday_bar_evidence(
         for symbol, row in market_by_symbol.items()
         if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
     }
-    execution_relevant_symbols = requested_symbols | set(fills) | market_execution_symbols
+    execution_relevant_symbols = set(fills) | market_execution_symbols
     expected_symbols.update(market_by_symbol)
     expected_symbols.update(fills)
     symbols = sorted(expected_symbols | all_bar_symbols)
@@ -6016,7 +6037,7 @@ def _build_quote_evidence(
         for symbol, row in market_by_symbol.items()
         if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
     }
-    execution_relevant_symbols = set(requested_symbols) | set(fills) | market_execution_symbols
+    execution_relevant_symbols = set(fills) | market_execution_symbols
     symbols = sorted(set(market_by_symbol) | set(fills) | all_quote_symbols | requested_symbols)
     any_raw_exists = before_path.exists() or post_submission_path.exists() or after_path.exists()
 
@@ -9987,7 +10008,8 @@ def _write_review(
         ),
         "\n## Market Price Evidence\n",
         f"- Status: `{market_price.get('status')}`; symbols: `{market_price.get('symbol_count')}`; execute price snapshot exists: `{market_price.get('execute_price_snapshot_exists')}`\n",
-        f"- Missing reference symbols: `{market_price.get('execute_missing_reference_symbol_count')}`; fallback-only symbols: `{market_price.get('fallback_only_symbol_count')}`; large decision/execute reference moves: `{market_price.get('large_decision_execute_reference_move_count')}`\n",
+        f"- Execution symbols: `{market_price.get('execution_relevant_symbol_count')}`; missing execution references: `{market_price.get('execute_missing_reference_symbol_count')}`; context-only missing references: `{market_price.get('context_missing_reference_symbol_count')}`\n",
+        f"- Fallback-only execution symbols: `{market_price.get('fallback_only_symbol_count')}`; large decision/execute reference moves: `{market_price.get('large_decision_execute_reference_move_count')}`; max move bps: `{market_price.get('max_abs_decision_execute_reference_change_bps')}`\n",
         "\n### Largest Reference Price Moves\n",
         _markdown_table(
             (
@@ -11225,7 +11247,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_csv(audit_dir / "46_decision_execute_drift.csv", decision_execute_drift_rows, decision_execute_drift_fields)
     _write_json(audit_dir / "47_decision_execute_drift_summary.json", decision_execute_drift_summary)
     market_price_evidence_fields = [
-        "symbol", "status", "in_decision_target_or_position", "in_execute_target_symbols",
+        "symbol", "status", "required_for_execution", "in_decision_target_or_position", "in_execute_target_symbols",
         "in_execute_broker_position_before", "decision_feed", "execute_feed",
         "decision_price_snapshot_exists", "execute_price_snapshot_exists",
         "decision_snapshot_collected_at_utc", "execute_snapshot_collected_at_utc",
@@ -11547,8 +11569,15 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "decision_execute_drift_rows": len(decision_execute_drift_rows),
         "decision_execute_drift_material_symbols": decision_execute_drift_summary.get("material_changed_symbol_count"),
         "market_price_evidence_rows": len(market_price_evidence_rows),
+        "market_price_status": market_price_evidence_summary.get("status"),
+        "market_price_execution_relevant_symbols": market_price_evidence_summary.get(
+            "execution_relevant_symbol_count"
+        ),
         "market_price_missing_reference_symbols": market_price_evidence_summary.get(
             "execute_missing_reference_symbol_count"
+        ),
+        "market_price_context_missing_reference_symbols": market_price_evidence_summary.get(
+            "context_missing_reference_symbol_count"
         ),
         "market_price_large_reference_moves": market_price_evidence_summary.get(
             "large_decision_execute_reference_move_count"
@@ -12609,8 +12638,18 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "market_price_snapshot_exists": bool(market_price.get("execute_price_snapshot_exists"))
                 if isinstance(market_price, dict)
                 else False,
+                "market_price_execution_relevant_symbols": _safe_int(
+                    market_price.get("execution_relevant_symbol_count")
+                )
+                if isinstance(market_price, dict)
+                else 0,
                 "market_price_missing_reference_symbols": _safe_int(
                     market_price.get("execute_missing_reference_symbol_count")
+                )
+                if isinstance(market_price, dict)
+                else 0,
+                "market_price_context_missing_reference_symbols": _safe_int(
+                    market_price.get("context_missing_reference_symbol_count")
                 )
                 if isinstance(market_price, dict)
                 else 0,
@@ -12839,7 +12878,14 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "decision_intent_status": row.get("decision_intent_status"),
                 "order_constraint_skipped_orders": row.get("order_constraint_skipped_orders"),
                 "decision_execute_material_changed_symbols": row.get("decision_execute_material_changed_symbols"),
+                "market_price_status": row.get("market_price_status"),
+                "market_price_execution_relevant_symbols": row.get(
+                    "market_price_execution_relevant_symbols"
+                ),
                 "market_price_missing_reference_symbols": row.get("market_price_missing_reference_symbols"),
+                "market_price_context_missing_reference_symbols": row.get(
+                    "market_price_context_missing_reference_symbols"
+                ),
                 "market_price_large_reference_moves": row.get("market_price_large_reference_moves"),
                 "intraday_bar_status": row.get("intraday_bar_status"),
                 "intraday_bar_execution_relevant_symbols": row.get(
@@ -13000,6 +13046,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             ),
             "market_price_missing_reference_symbols": sum(
                 _safe_int(row.get("market_price_missing_reference_symbols")) for row in rows
+            ),
+            "market_price_context_missing_reference_symbols": sum(
+                _safe_int(row.get("market_price_context_missing_reference_symbols")) for row in rows
             ),
             "market_price_fallback_only_symbols": sum(
                 _safe_int(row.get("market_price_fallback_only_symbols")) for row in rows
@@ -13283,7 +13332,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "decision_execute_changed_symbols", "decision_execute_material_changed_symbols",
             "decision_execute_gross_target_drift", "decision_execute_gross_order_delta_drift",
             "market_price_status", "market_price_snapshot_exists",
-            "market_price_missing_reference_symbols", "market_price_fallback_only_symbols",
+            "market_price_execution_relevant_symbols", "market_price_missing_reference_symbols",
+            "market_price_context_missing_reference_symbols", "market_price_fallback_only_symbols",
             "market_price_large_reference_moves", "market_price_max_abs_reference_move_bps",
             "intraday_bar_status", "intraday_bar_symbols", "intraday_bar_bar_symbols",
             "intraday_bar_execution_relevant_symbols", "intraday_bar_missing_symbols",

@@ -10,6 +10,7 @@ from daily_audit_report import (
     _build_decision_intent_trace,
     _build_equity_pnl_bridge,
     _build_intraday_bar_evidence,
+    _build_market_price_evidence,
     _build_quote_evidence,
     _build_residual_diagnosis,
 )
@@ -165,6 +166,52 @@ def test_intraday_bars_exclude_context_only_symbols_from_status(tmp_path: Path) 
     assert summary["execution_relevant_symbol_count"] == 1
     assert summary["missing_bar_symbol_count"] == 0
     assert summary["context_missing_bar_symbol_count"] == 2
+
+
+def test_market_prices_exclude_context_only_symbols_from_status(tmp_path: Path) -> None:
+    decision_dir = tmp_path / "decision"
+    execute_dir = tmp_path / "execute"
+    decision_dir.mkdir()
+    execute_dir.mkdir()
+    _write_json(
+        decision_dir / "execution_price_snapshot.json",
+        {
+            "feed": "iex",
+            "target_symbols": ["AAA"],
+            "broker_position_symbols_before": [],
+            "reference_prices": {"AAA": 100.0, "CTX": 200.0},
+            "fallback_prices": {},
+            "missing_reference_price_symbols": [],
+        },
+    )
+    _write_json(
+        execute_dir / "execution_price_snapshot.json",
+        {
+            "feed": "us_lv1_nbbo",
+            "target_symbols": ["AAA"],
+            "broker_position_symbols_before": [],
+            "reference_prices": {"AAA": 101.0},
+            "fallback_prices": {},
+            "missing_reference_price_symbols": [],
+        },
+    )
+
+    rows, summary = _build_market_price_evidence(
+        run_dir=execute_dir,
+        decision_dir=decision_dir,
+        decision_plan={},
+        execute_plan={},
+        decision_rows=[{"symbol": "AAA"}],
+        fill_rows=[],
+    )
+    by_symbol = {row["symbol"]: row for row in rows}
+
+    assert by_symbol["AAA"]["required_for_execution"] is True
+    assert by_symbol["CTX"]["required_for_execution"] is False
+    assert summary["status"] == "pass"
+    assert summary["execution_relevant_symbol_count"] == 1
+    assert summary["execute_missing_reference_symbol_count"] == 0
+    assert summary["context_missing_reference_symbol_count"] == 1
 
 
 def test_decision_intent_treats_minimum_trade_edge_as_explained() -> None:

@@ -185,6 +185,18 @@ class DataAggregator:
                         audit.get("residual_diagnosis_status") if run_type == "execute" else "not_applicable"
                     )
                     summary["market_price_status"] = audit.get("market_price_status") if run_type == "execute" else "not_applicable"
+                    summary["market_price_execution_relevant_symbols"] = (
+                        audit.get("market_price_execution_relevant_symbols") if run_type == "execute" else 0
+                    )
+                    summary["market_price_missing_reference_symbols"] = (
+                        audit.get("market_price_missing_reference_symbols") if run_type == "execute" else 0
+                    )
+                    summary["market_price_context_missing_reference_symbols"] = (
+                        audit.get("market_price_context_missing_reference_symbols") if run_type == "execute" else 0
+                    )
+                    summary["market_price_large_reference_moves"] = (
+                        audit.get("market_price_large_reference_moves") if run_type == "execute" else 0
+                    )
                     summary["intraday_bar_status"] = (
                         audit.get("intraday_bar_status") if run_type == "execute" else "not_applicable"
                     )
