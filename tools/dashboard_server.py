@@ -198,8 +198,14 @@ class DataAggregator:
                         audit.get("intraday_bar_error_count") if run_type == "execute" else 0
                     )
                     summary["quote_status"] = audit.get("quote_status") if run_type == "execute" else "not_applicable"
+                    summary["quote_execution_relevant_symbols"] = (
+                        audit.get("quote_execution_relevant_symbols") if run_type == "execute" else 0
+                    )
                     summary["quote_missing_symbols"] = (
                         audit.get("quote_missing_symbols") if run_type == "execute" else 0
+                    )
+                    summary["quote_context_missing_symbols"] = (
+                        audit.get("quote_context_missing_symbols") if run_type == "execute" else 0
                     )
                     summary["quote_invalid_symbols"] = (
                         audit.get("quote_invalid_symbols") if run_type == "execute" else 0
@@ -236,6 +242,15 @@ class DataAggregator:
                     )
                     summary["account_state_bridge_status"] = (
                         audit.get("account_state_bridge_status") if run_type == "execute" else "not_applicable"
+                    )
+                    summary["account_state_window_semantics"] = (
+                        audit.get("account_state_window_semantics") if run_type == "execute" else ""
+                    )
+                    summary["account_state_window_start_source"] = (
+                        audit.get("account_state_window_start_source") if run_type == "execute" else ""
+                    )
+                    summary["account_state_preflight_to_sizing_equity_delta"] = (
+                        audit.get("account_state_preflight_to_sizing_equity_delta") if run_type == "execute" else 0
                     )
                     summary["account_state_equity_delta"] = (
                         audit.get("account_state_equity_delta") if run_type == "execute" else 0

@@ -2186,6 +2186,7 @@ def _build_execution_attribution_outputs(
 
 def _build_equity_pnl_bridge(
     *,
+    run_dir: Path,
     summary: dict[str, Any],
     risk: dict[str, Any],
     position_rows: list[dict[str, Any]],
@@ -2194,9 +2195,65 @@ def _build_equity_pnl_bridge(
     broker_activity_summary: dict[str, Any],
     account_activity_attribution_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    equity_before = _safe_float(summary.get("account_equity"))
-    equity_after = _safe_float(summary.get("account_equity_post_trade"))
+    snapshots = _load_account_snapshots(run_dir)
+    window_before = snapshots.get("before", {}) if isinstance(snapshots.get("before"), dict) else {}
+    window_after = snapshots.get("after", {}) if isinstance(snapshots.get("after"), dict) else {}
+    preflight = snapshots.get("preflight", {}) if isinstance(snapshots.get("preflight"), dict) else {}
+
+    def account_value(payload: Mapping[str, Any], *fields: str) -> float | None:
+        for field in fields:
+            value = _optional_float(payload.get(field))
+            if value is not None:
+                return value
+        return None
+
+    equity_before_snapshot = account_value(window_before, "portfolio_value", "equity")
+    equity_after_snapshot = account_value(window_after, "portfolio_value", "equity")
+    equity_before = (
+        equity_before_snapshot
+        if equity_before_snapshot is not None
+        else _safe_float(summary.get("account_equity"))
+    )
+    equity_after = (
+        equity_after_snapshot
+        if equity_after_snapshot is not None
+        else _safe_float(summary.get("account_equity_post_trade"))
+    )
     equity_change = equity_after - equity_before
+    preflight_equity = account_value(preflight, "portfolio_value", "equity")
+    preflight_to_sizing_equity_change = (
+        equity_before - preflight_equity if preflight_equity is not None else None
+    )
+    cash_before = account_value(window_before, "cash")
+    cash_after = account_value(window_after, "cash")
+    long_mv_before = account_value(window_before, "long_market_value")
+    long_mv_after = account_value(window_after, "long_market_value")
+    short_mv_before = account_value(window_before, "short_market_value")
+    short_mv_after = account_value(window_after, "short_market_value")
+    account_identity_available = None not in (
+        cash_before,
+        cash_after,
+        long_mv_before,
+        long_mv_after,
+        short_mv_before,
+        short_mv_after,
+    )
+    cash_delta = (cash_after - cash_before) if cash_before is not None and cash_after is not None else None
+    long_mv_delta = (
+        long_mv_after - long_mv_before
+        if long_mv_before is not None and long_mv_after is not None
+        else None
+    )
+    short_mv_delta = (
+        short_mv_after - short_mv_before
+        if short_mv_before is not None and short_mv_after is not None
+        else None
+    )
+    account_identity_explained_change = (
+        _safe_float(cash_delta) + _safe_float(long_mv_delta) + _safe_float(short_mv_delta)
+        if account_identity_available
+        else None
+    )
     snapshot_intraday_pnl = sum(_safe_float(row.get("unrealized_intraday_pl_snapshot")) for row in position_rows)
     snapshot_position_delta_mv = sum(_safe_float(row.get("delta_market_value")) for row in position_rows)
     realized_pnl = _safe_float(realized_summary.get("realized_pnl_total")) if isinstance(realized_summary, dict) else 0.0
@@ -2220,18 +2277,53 @@ def _build_equity_pnl_bridge(
         )
     trade_fill_cashflow_net = _safe_float(account_activity_attr.get("trade_fill_cashflow_net_amount"))
     unknown_activity_net = _safe_float(account_activity_attr.get("unknown_activity_net_amount"))
-    explained_components = {
-        "snapshot_unrealized_intraday_pnl": snapshot_intraday_pnl,
-        "realized_pnl_estimate": realized_pnl,
-        "non_trade_account_activity_net_amount": non_trade_account_activity_net,
-    }
-    explained_sum = sum(_safe_float(value) for value in explained_components.values())
+    legacy_pnl_residual = equity_change - snapshot_intraday_pnl - realized_pnl - non_trade_account_activity_net
+    execution_window_residual = (
+        equity_change - _safe_float(account_identity_explained_change)
+        if account_identity_available
+        else legacy_pnl_residual
+    )
+    bridge_semantics = (
+        "execution_window_account_identity"
+        if account_identity_available
+        else "legacy_equity_vs_daily_pnl_context"
+    )
     rows = [
         {
             "component": "broker_equity_change",
             "amount": equity_change,
-            "method": "broker_account_after.portfolio_value - broker_account_before_or_sizing.portfolio_value",
+            "method": "post_trade account equity - sizing account equity",
             "strictness": "broker_snapshot",
+        },
+        {
+            "component": "preflight_to_sizing_equity_change",
+            "amount": preflight_to_sizing_equity_change,
+            "method": "sizing account equity - preflight account equity; outside the execution bridge window",
+            "strictness": "timing_context",
+        },
+        {
+            "component": "execution_window_cash_delta",
+            "amount": cash_delta,
+            "method": "post_trade cash - sizing cash",
+            "strictness": "broker_account_identity",
+        },
+        {
+            "component": "execution_window_long_market_value_delta",
+            "amount": long_mv_delta,
+            "method": "post_trade long_market_value - sizing long_market_value",
+            "strictness": "broker_account_identity",
+        },
+        {
+            "component": "execution_window_short_market_value_delta",
+            "amount": short_mv_delta,
+            "method": "post_trade short_market_value - sizing short_market_value",
+            "strictness": "broker_account_identity",
+        },
+        {
+            "component": "execution_window_account_identity_explained_change",
+            "amount": account_identity_explained_change,
+            "method": "cash delta + long market value delta + short market value delta",
+            "strictness": "broker_account_identity",
         },
         {
             "component": "snapshot_unrealized_intraday_pnl",
@@ -2276,10 +2368,20 @@ def _build_equity_pnl_bridge(
             "strictness": "raw_broker_account_activity_unknown",
         },
         {
+            "component": "unexplained_execution_window_equity_residual",
+            "amount": execution_window_residual,
+            "method": (
+                "broker equity change - cash delta - long market value delta - short market value delta"
+                if account_identity_available
+                else "legacy broker equity change - daily PnL context components"
+            ),
+            "strictness": "execution_window_residual",
+        },
+        {
             "component": "unexplained_after_snapshot_intraday_realized_activity",
-            "amount": equity_change - explained_sum,
-            "method": "broker_equity_change - snapshot_unrealized_intraday_pnl - realized_pnl_estimate - non_trade_account_activity_net_amount",
-            "strictness": "residual_bridge_gap",
+            "amount": execution_window_residual,
+            "method": "compatibility alias for unexplained_execution_window_equity_residual",
+            "strictness": "compatibility_alias",
         },
     ]
     by_side = risk.get("snapshot_intraday_pnl_by_side", {}) if isinstance(risk.get("snapshot_intraday_pnl_by_side"), dict) else {}
@@ -2290,8 +2392,15 @@ def _build_equity_pnl_bridge(
         "account_equity_before": equity_before,
         "account_equity_after": equity_after,
         "account_equity_change": equity_change,
-        "account_equity_source_before": summary.get("account_equity_source", ""),
+        "account_equity_source_before": snapshots.get("before_source") or summary.get("account_equity_source", ""),
         "account_equity_source_after": summary.get("account_equity_post_trade_source", ""),
+        "account_equity_captured_at_utc_before": snapshots.get("before_captured_at_utc", ""),
+        "account_equity_captured_at_utc_after": snapshots.get("after_captured_at_utc", ""),
+        "preflight_account_equity": preflight_equity,
+        "preflight_account_equity_captured_at_utc": snapshots.get("preflight_captured_at_utc", ""),
+        "preflight_to_sizing_equity_change": preflight_to_sizing_equity_change,
+        "bridge_semantics": bridge_semantics,
+        "account_identity_available": bool(account_identity_available),
         "components": rows,
         "component_amounts": {str(row["component"]): _safe_float(row["amount"]) for row in rows},
         "snapshot_intraday_pnl_by_side": by_side,
@@ -2405,24 +2514,53 @@ def _payload_dict(raw: Any) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _file_timestamp_utc(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="milliseconds")
+    except OSError:
+        return ""
+
+
 def _load_account_snapshots(run_dir: Path) -> dict[str, Any]:
-    before_raw = _read_json(run_dir / "broker_account_before.json", {})
-    sizing_raw = _read_json(run_dir / "broker_account_for_sizing.json", {})
-    after_raw = _read_json(run_dir / "broker_account_after.json", {})
+    preflight_path = run_dir / "broker_account_before.json"
+    sizing_path = run_dir / "broker_account_for_sizing.json"
+    after_path = run_dir / "broker_account_after.json"
+    timeline = _read_json(run_dir / "broker_account_snapshot_timeline.json", {})
+    timeline_snapshots = timeline.get("snapshots", {}) if isinstance(timeline.get("snapshots"), dict) else {}
+    before_raw = _read_json(preflight_path, {})
+    sizing_raw = _read_json(sizing_path, {})
+    after_raw = _read_json(after_path, {})
     before_payload = _payload_dict(before_raw)
     sizing_payload = _payload_dict(sizing_raw)
     after_payload = _payload_dict(after_raw)
-    before_source = "broker_account_before.json" if before_payload else "broker_account_for_sizing.json" if sizing_payload else ""
+    execution_before = sizing_payload or before_payload
+    execution_before_source = "broker_account_for_sizing.json" if sizing_payload else "broker_account_before.json" if before_payload else ""
+
+    def captured_at(name: str, path: Path) -> str:
+        item = timeline_snapshots.get(name, {}) if isinstance(timeline_snapshots.get(name), dict) else {}
+        return str(item.get("captured_at_utc") or _file_timestamp_utc(path))
+
     return {
-        "before": before_payload or sizing_payload,
-        "before_source": before_source,
-        "before_raw_exists": (run_dir / "broker_account_before.json").exists(),
+        "before": execution_before,
+        "before_source": execution_before_source,
+        "before_captured_at_utc": captured_at("sizing", sizing_path)
+        if sizing_payload
+        else captured_at("preflight", preflight_path),
+        "before_raw_exists": preflight_path.exists(),
+        "preflight": before_payload,
+        "preflight_source": "broker_account_before.json" if before_payload else "",
+        "preflight_captured_at_utc": captured_at("preflight", preflight_path),
         "sizing": sizing_payload,
         "sizing_source": "broker_account_for_sizing.json" if sizing_payload else "",
-        "sizing_raw_exists": (run_dir / "broker_account_for_sizing.json").exists(),
+        "sizing_captured_at_utc": captured_at("sizing", sizing_path),
+        "sizing_raw_exists": sizing_path.exists(),
         "after": after_payload,
         "after_source": "broker_account_after.json" if after_payload else "",
-        "after_raw_exists": (run_dir / "broker_account_after.json").exists(),
+        "after_captured_at_utc": captured_at("post_trade", after_path),
+        "after_raw_exists": after_path.exists(),
+        "window_semantics": "sizing_to_post_trade" if sizing_payload else "preflight_to_post_trade",
     }
 
 
@@ -2559,6 +2697,7 @@ def _build_account_state_bridge(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     snapshots = _load_account_snapshots(run_dir)
     before = snapshots["before"]
+    preflight = snapshots.get("preflight", {}) if isinstance(snapshots.get("preflight"), dict) else {}
     after = snapshots["after"]
     rows: list[dict[str, Any]] = []
     fields = sorted(set(ACCOUNT_STATE_BRIDGE_FIELDS) | {str(row.get("field")) for row in account_field_rows if row.get("field")})
@@ -2620,6 +2759,17 @@ def _build_account_state_bridge(
     summary_equity_before = _safe_float(summary.get("account_equity"))
     summary_equity_after = _safe_float(summary.get("account_equity_post_trade"))
     summary_equity_delta = summary_equity_after - summary_equity_before
+    preflight_equity = _optional_float(preflight.get("portfolio_value"))
+    if preflight_equity is None:
+        preflight_equity = _optional_float(preflight.get("equity"))
+    execution_window_equity_before = value_before("portfolio_value")
+    if execution_window_equity_before is None:
+        execution_window_equity_before = value_before("equity")
+    preflight_to_sizing_equity_delta = (
+        execution_window_equity_before - preflight_equity
+        if execution_window_equity_before is not None and preflight_equity is not None
+        else None
+    )
     component_amounts = equity_pnl_bridge.get("component_amounts", {}) if isinstance(equity_pnl_bridge, dict) else {}
     equity_bridge_change = _safe_float(component_amounts.get("broker_equity_change"))
     cash_delta = delta_for("cash")
@@ -2667,6 +2817,13 @@ def _build_account_state_bridge(
         "exists_after": bool(after),
         "source_before": snapshots["before_source"],
         "source_after": snapshots["after_source"],
+        "window_semantics": snapshots.get("window_semantics", ""),
+        "window_start_captured_at_utc": snapshots.get("before_captured_at_utc", ""),
+        "window_end_captured_at_utc": snapshots.get("after_captured_at_utc", ""),
+        "preflight_source": snapshots.get("preflight_source", ""),
+        "preflight_captured_at_utc": snapshots.get("preflight_captured_at_utc", ""),
+        "preflight_equity": preflight_equity,
+        "preflight_to_sizing_equity_delta": preflight_to_sizing_equity_delta,
         "row_count": len(rows),
         "numeric_row_count": sum(1 for row in rows if row.get("delta") not in ("", None)),
         "group_delta_totals": dict(sorted(group_delta_totals.items())),
@@ -3243,6 +3400,8 @@ def _build_decision_intent_trace(
 
     equity = _safe_float(plan.get("account_equity") or summary.get("account_equity") or summary.get("account_equity_post_trade"))
     min_trade_notional = _safe_float(plan.get("min_trade_notional"), default=200.0)
+    min_trade_boundary_tolerance = max(0.01, min_trade_notional * 0.02)
+    min_trade_effective_audit_threshold = min_trade_notional + min_trade_boundary_tolerance
     symbols = sorted(
         set(raw_weights)
         | set(strategy_weights)
@@ -3274,6 +3433,8 @@ def _build_decision_intent_trace(
             order_intent_status = "skipped_by_order_builder"
         elif abs(desired_delta) < min_trade_notional:
             order_intent_status = "below_min_trade_notional"
+        elif abs(desired_delta) <= min_trade_effective_audit_threshold:
+            order_intent_status = "within_min_trade_boundary_tolerance"
         else:
             order_intent_status = "no_order_unexplained_from_plan"
         rows.append(
@@ -3309,6 +3470,8 @@ def _build_decision_intent_trace(
                 "skip_reason": ";".join(skip_reasons),
                 "skip_count": len(skipped),
                 "min_trade_notional": min_trade_notional,
+                "min_trade_boundary_tolerance": min_trade_boundary_tolerance,
+                "min_trade_effective_audit_threshold": min_trade_effective_audit_threshold,
                 "composite_score": _safe_float(decision.get("composite_score")),
                 "reversal_score": _safe_float(decision.get("reversal_score")),
                 "momentum_score": _safe_float(decision.get("momentum_score")),
@@ -3341,6 +3504,10 @@ def _build_decision_intent_trace(
         "gross_planned_abs_notional": sum(_safe_float(row.get("planned_abs_notional")) for row in rows),
         "skipped_symbol_count": len(skipped_rows),
         "unexplained_no_order_symbol_count": len(unexplained_no_order),
+        "min_trade_boundary_tolerance": min_trade_boundary_tolerance,
+        "min_trade_boundary_symbol_count": sum(
+            1 for row in rows if row.get("order_intent_status") == "within_min_trade_boundary_tolerance"
+        ),
         "target_short_floor_diagnostics": plan.get("target_short_floor_diagnostics") if isinstance(plan, dict) else {},
         "executable_target_projection": plan.get("executable_target_projection")
         if isinstance(plan.get("executable_target_projection"), dict)
@@ -5820,25 +5987,45 @@ def _build_quote_evidence(
         if str(row.get("symbol") or "").strip()
     }
     fills = _fill_by_symbol(fill_rows)
+    market_execution_symbols = {
+        symbol
+        for symbol, row in market_by_symbol.items()
+        if bool(row.get("in_execute_target_symbols")) or bool(row.get("in_execute_broker_position_before"))
+    }
+    execution_relevant_symbols = set(requested_symbols) | set(fills) | market_execution_symbols
     symbols = sorted(set(market_by_symbol) | set(fills) | all_quote_symbols | requested_symbols)
     any_raw_exists = before_path.exists() or post_submission_path.exists() or after_path.exists()
+
+    def quote_is_valid(quote: Mapping[str, Any]) -> bool:
+        if not quote or quote.get("validation_error"):
+            return False
+        bid = _safe_float(quote.get("bp") or quote.get("bid_price"))
+        ask = _safe_float(quote.get("ap") or quote.get("ask_price"))
+        return bool(bid > 0 and ask > 0 and ask >= bid)
+
+    source_invalid_quote_observation_count = sum(
+        1
+        for source_quotes in quotes_by_source.values()
+        for quote in source_quotes.values()
+        if not quote_is_valid(quote)
+    )
     rows: list[dict[str, Any]] = []
     for symbol in symbols:
         before_quote = quotes_by_source.get("before_submit", {}).get(symbol, {})
         post_submission_quote = quotes_by_source.get("post_submission", {}).get(symbol, {})
         after_quote = quotes_by_source.get("after_execution", {}).get(symbol, {})
-        quote = post_submission_quote or after_quote or before_quote
-        source_used = (
-            "post_submission"
-            if post_submission_quote
-            else "after_execution"
-            if after_quote
-            else "before_submit"
-            if before_quote
-            else ""
+        candidates = [
+            ("post_submission", post_submission_quote),
+            ("after_execution", after_quote),
+            ("before_submit", before_quote),
+        ]
+        source_used, quote = next(
+            ((source, candidate) for source, candidate in candidates if quote_is_valid(candidate)),
+            next(((source, candidate) for source, candidate in candidates if candidate), ("", {})),
         )
         market = market_by_symbol.get(symbol, {})
         fill = fills.get(symbol, {})
+        required_for_execution = symbol in execution_relevant_symbols
         before_bid = _safe_float(before_quote.get("bp") or before_quote.get("bid_price"))
         before_ask = _safe_float(before_quote.get("ap") or before_quote.get("ask_price"))
         before_mid = (before_bid + before_ask) / 2.0 if before_bid > 0 and before_ask > 0 else 0.0
@@ -5899,6 +6086,7 @@ def _build_quote_evidence(
             {
                 "symbol": symbol,
                 "status": status,
+                "required_for_execution": required_for_execution,
                 "source_used": source_used,
                 "quote_provider": quote.get("provider", ""),
                 "quote_feed": quote.get("feed", ""),
@@ -5939,10 +6127,14 @@ def _build_quote_evidence(
             }
         )
 
-    missing_rows = [row for row in rows if row.get("status") == "missing_quote"]
-    invalid_rows = [row for row in rows if row.get("status") == "invalid_quote"]
-    wide_rows = [row for row in rows if row.get("status") == "wide_spread"]
-    status_counts = Counter(str(row.get("status") or "") for row in rows)
+    relevant_rows = [row for row in rows if bool(row.get("required_for_execution"))]
+    context_only_rows = [row for row in rows if not bool(row.get("required_for_execution"))]
+    missing_rows = [row for row in relevant_rows if row.get("status") == "missing_quote"]
+    invalid_rows = [row for row in relevant_rows if row.get("status") == "invalid_quote"]
+    wide_rows = [row for row in relevant_rows if row.get("status") == "wide_spread"]
+    context_missing_rows = [row for row in context_only_rows if row.get("status") == "missing_quote"]
+    status_counts = Counter(str(row.get("status") or "") for row in relevant_rows)
+    all_status_counts = Counter(str(row.get("status") or "") for row in rows)
     if not any_raw_exists:
         status = "historical_limited"
     elif all_errors or invalid_rows:
@@ -5958,15 +6150,20 @@ def _build_quote_evidence(
         "raw_artifact_exists": bool(any_raw_exists),
         "sources": source_summaries,
         "symbol_count": len(rows),
+        "execution_relevant_symbol_count": len(relevant_rows),
+        "context_only_symbol_count": len(context_only_rows),
         "quote_symbol_count": len(all_quote_symbols),
         "status_counts": dict(sorted(status_counts.items())),
+        "all_symbol_status_counts": dict(sorted(all_status_counts.items())),
         "missing_quote_symbol_count": len(missing_rows),
+        "context_missing_quote_symbol_count": len(context_missing_rows),
         "invalid_quote_symbol_count": len(invalid_rows),
         "wide_spread_symbol_count": len(wide_rows),
-        "max_spread_bps": max((_safe_float(row.get("spread_bps")) for row in rows), default=0.0),
+        "source_invalid_quote_observation_count": source_invalid_quote_observation_count,
+        "max_spread_bps": max((_safe_float(row.get("spread_bps")) for row in relevant_rows), default=0.0),
         "error_count": len(all_errors),
         "errors": all_errors[:20],
-        "widest_spreads": sorted(rows, key=lambda row: _safe_float(row.get("spread_bps")), reverse=True)[:25],
+        "widest_spreads": sorted(relevant_rows, key=lambda row: _safe_float(row.get("spread_bps")), reverse=True)[:25],
         "worst_fill_vs_mid_adverse": sorted(
             [row for row in rows if _safe_float(row.get("fill_vwap_vs_mid_adverse_bps")) > 0],
             key=lambda row: _safe_float(row.get("fill_vwap_vs_mid_adverse_bps")),
@@ -7233,8 +7430,14 @@ def _build_residual_diagnosis(
         )
 
     component_amounts = equity_pnl_bridge.get("component_amounts", {}) if isinstance(equity_pnl_bridge, dict) else {}
-    equity_residual = _safe_float(component_amounts.get("unexplained_after_snapshot_intraday_realized_activity"))
+    equity_residual = _safe_float(
+        component_amounts.get(
+            "unexplained_execution_window_equity_residual",
+            component_amounts.get("unexplained_after_snapshot_intraday_realized_activity"),
+        )
+    )
     equity_change = _safe_float(component_amounts.get("broker_equity_change"))
+    bridge_semantics = str(equity_pnl_bridge.get("bridge_semantics") or "legacy")
     strict_account_fields_available = bool(account_field_summary.get("exists_before")) and bool(
         account_field_summary.get("exists_after")
     )
@@ -7252,7 +7455,9 @@ def _build_residual_diagnosis(
                 "evidence_artifacts": "29_equity_pnl_bridge.csv; 30_equity_pnl_bridge.json; 31_account_field_diff.csv; 64_account_state_bridge.csv; 65_account_state_bridge_summary.json",
                 "examples": _json_cell(component_amounts),
                 "interpretation": (
-                    "Broker equity changed more than captured snapshot PnL, realized estimate, and account activities explain."
+                    "Sizing-to-post-trade account equity does not reconcile with cash and signed market-value deltas."
+                    if strict_account_fields_available and bridge_semantics == "execution_window_account_identity"
+                    else "Broker equity changed more than the available legacy PnL context explains."
                     if strict_account_fields_available
                     else "Historical run has an equity bridge residual, but raw account before/after fields are missing, so this is evidence-limited rather than a core audit failure."
                 ),
@@ -8482,25 +8687,6 @@ def _build_audit_checks(
         ),
         expected=True,
         observed=evidence_completeness.get("strict_account_position_replay_ready"),
-    )
-
-    strict_checklist = strict_attribution_checklist_summary or {}
-    strict_ready = bool(strict_checklist.get("strict_attribution_ready"))
-    strict_status = str(strict_checklist.get("status") or "")
-    strict_blockers = _safe_int(strict_checklist.get("blocking_item_count"))
-    add_check(
-        "strict_attribution_checklist_ready",
-        "pass"
-        if strict_ready or (strict_status == "historical_limited" and strict_blockers <= 0)
-        else "warning",
-        severity="warning" if strict_blockers > 0 else "info",
-        detail="Strict attribution checklist should have no blocking items before treating performance attribution as complete.",
-        expected="ready or historical_limited_without_blockers",
-        observed={
-            "status": strict_status,
-            "strict_attribution_ready": strict_ready,
-            "blocking_item_count": strict_blockers,
-        },
     )
 
     attribution_dossier = attribution_dossier_summary or {}
@@ -10597,6 +10783,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         execution_attempt_outcomes,
     )
     equity_pnl_bridge = _build_equity_pnl_bridge(
+        run_dir=run_dir,
         summary=summary if isinstance(summary, dict) else {},
         risk=risk,
         position_rows=position_rows,
@@ -10976,7 +11163,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "after_market_value", "desired_delta_notional_estimate", "planned_delta_notional",
         "planned_abs_notional", "planned_order_count", "filled_qty_from_order_trace",
         "remaining_qty_from_order_trace", "order_intent_status", "skip_reason", "skip_count",
-        "min_trade_notional", "composite_score", "reversal_score", "momentum_score",
+        "min_trade_notional", "min_trade_boundary_tolerance", "min_trade_effective_audit_threshold",
+        "composite_score", "reversal_score", "momentum_score",
         "small_size_score", "low_beta_score", "cash_quality_score", "beta", "sic2_sector",
     ]
     _write_csv(audit_dir / "42_decision_intent_trace.csv", decision_intent_rows, decision_intent_fields)
@@ -11138,7 +11326,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_csv(audit_dir / "58_intraday_bar_evidence.csv", intraday_bar_rows, intraday_bar_fields)
     _write_json(audit_dir / "59_intraday_bar_summary.json", intraday_bar_summary)
     quote_fields = [
-        "symbol", "status", "source_used", "quote_time", "before_quote_time",
+        "symbol", "status", "required_for_execution", "source_used", "quote_time", "before_quote_time",
         "post_submission_quote_time", "after_quote_time", "before_mid_price",
         "post_submission_mid_price", "after_mid_price", "before_spread_bps",
         "post_submission_spread_bps", "after_spread_bps",
@@ -11280,6 +11468,17 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "account_field_diff_rows": len(account_field_rows),
         "account_state_bridge_rows": len(account_state_bridge_rows),
         "account_state_bridge_status": account_state_bridge_summary.get("status"),
+        "account_state_window_semantics": account_state_bridge_summary.get("window_semantics"),
+        "account_state_window_start_source": account_state_bridge_summary.get("source_before"),
+        "account_state_window_start_captured_at_utc": account_state_bridge_summary.get(
+            "window_start_captured_at_utc"
+        ),
+        "account_state_window_end_captured_at_utc": account_state_bridge_summary.get(
+            "window_end_captured_at_utc"
+        ),
+        "account_state_preflight_to_sizing_equity_delta": account_state_bridge_summary.get(
+            "preflight_to_sizing_equity_delta"
+        ),
         "account_state_equity_delta": account_state_bridge_summary.get("equity_delta"),
         "account_state_cash_delta": account_state_bridge_summary.get("cash_delta"),
         "account_state_gross_exposure_delta": account_state_bridge_summary.get("gross_exposure_delta"),
@@ -11371,7 +11570,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "intraday_bar_max_range_bps": intraday_bar_summary.get("max_intraday_range_bps"),
         "quote_evidence_rows": len(quote_rows),
         "quote_status": quote_summary.get("status"),
+        "quote_execution_relevant_symbols": quote_summary.get("execution_relevant_symbol_count"),
         "quote_missing_symbols": quote_summary.get("missing_quote_symbol_count"),
+        "quote_context_missing_symbols": quote_summary.get("context_missing_quote_symbol_count"),
         "quote_invalid_symbols": quote_summary.get("invalid_quote_symbol_count"),
         "quote_wide_spread_symbols": quote_summary.get("wide_spread_symbol_count"),
         "quote_error_count": quote_summary.get("error_count"),
@@ -11779,6 +11980,17 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "account_state_bridge_status": account_state.get("status")
                 if isinstance(account_state, dict)
                 else "",
+                "account_state_window_semantics": account_state.get("window_semantics")
+                if isinstance(account_state, dict)
+                else "",
+                "account_state_window_start_source": account_state.get("source_before")
+                if isinstance(account_state, dict)
+                else "",
+                "account_state_preflight_to_sizing_equity_delta": _optional_float(
+                    account_state.get("preflight_to_sizing_equity_delta")
+                )
+                if isinstance(account_state, dict)
+                else None,
                 "account_state_equity_delta": _optional_float(account_state.get("equity_delta"))
                 if isinstance(account_state, dict)
                 else None,
@@ -12416,7 +12628,13 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "quote_quote_symbols": _safe_int(quotes.get("quote_symbol_count"))
                 if isinstance(quotes, dict)
                 else 0,
+                "quote_execution_relevant_symbols": _safe_int(quotes.get("execution_relevant_symbol_count"))
+                if isinstance(quotes, dict)
+                else 0,
                 "quote_missing_symbols": _safe_int(quotes.get("missing_quote_symbol_count"))
+                if isinstance(quotes, dict)
+                else 0,
+                "quote_context_missing_symbols": _safe_int(quotes.get("context_missing_quote_symbol_count"))
                 if isinstance(quotes, dict)
                 else 0,
                 "quote_invalid_symbols": _safe_int(quotes.get("invalid_quote_symbol_count"))
@@ -12587,7 +12805,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "intraday_bar_filled_symbols_missing": row.get("intraday_bar_filled_symbols_missing"),
                 "intraday_bar_error_count": row.get("intraday_bar_error_count"),
                 "quote_status": row.get("quote_status"),
+                "quote_execution_relevant_symbols": row.get("quote_execution_relevant_symbols"),
                 "quote_missing_symbols": row.get("quote_missing_symbols"),
+                "quote_context_missing_symbols": row.get("quote_context_missing_symbols"),
                 "quote_invalid_symbols": row.get("quote_invalid_symbols"),
                 "quote_wide_spread_symbols": row.get("quote_wide_spread_symbols"),
                 "quote_error_count": row.get("quote_error_count"),
@@ -12599,6 +12819,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 "calendar_session_is_half_day": row.get("calendar_session_is_half_day"),
                 "calendar_error_count": row.get("calendar_error_count"),
                 "account_state_bridge_status": row.get("account_state_bridge_status"),
+                "account_state_window_semantics": row.get("account_state_window_semantics"),
+                "account_state_window_start_source": row.get("account_state_window_start_source"),
+                "account_state_preflight_to_sizing_equity_delta": row.get(
+                    "account_state_preflight_to_sizing_equity_delta"
+                ),
                 "account_state_equity_delta": row.get("account_state_equity_delta"),
                 "account_state_cash_delta": row.get("account_state_cash_delta"),
                 "account_state_gross_exposure_delta": row.get("account_state_gross_exposure_delta"),
@@ -12743,6 +12968,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             ),
             "intraday_bar_error_count": sum(_safe_int(row.get("intraday_bar_error_count")) for row in rows),
             "quote_missing_symbols": sum(_safe_int(row.get("quote_missing_symbols")) for row in rows),
+            "quote_context_missing_symbols": sum(
+                _safe_int(row.get("quote_context_missing_symbols")) for row in rows
+            ),
             "quote_invalid_symbols": sum(_safe_int(row.get("quote_invalid_symbols")) for row in rows),
             "quote_wide_spread_symbols": sum(_safe_int(row.get("quote_wide_spread_symbols")) for row in rows),
             "quote_error_count": sum(_safe_int(row.get("quote_error_count")) for row in rows),
@@ -12919,7 +13147,9 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "session_date", "session_idx", "audit_status", "audit_issues", "equity_before",
             "equity_after", "equity_change", "snapshot_intraday_pnl", "realized_pnl_estimate",
             "execution_shortfall_cost_estimate", "equity_bridge_residual",
-            "account_state_bridge_status", "account_state_equity_delta",
+            "account_state_bridge_status", "account_state_window_semantics",
+            "account_state_window_start_source", "account_state_preflight_to_sizing_equity_delta",
+            "account_state_equity_delta",
             "account_state_cash_delta", "account_state_gross_exposure_delta",
             "account_state_net_exposure_delta", "account_state_buying_power_delta",
             "account_state_maintenance_margin_delta", "account_state_equity_delta_vs_summary_delta",
@@ -13008,7 +13238,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "intraday_bar_status", "intraday_bar_symbols", "intraday_bar_bar_symbols",
             "intraday_bar_missing_symbols", "intraday_bar_filled_symbols_missing",
             "intraday_bar_error_count", "intraday_bar_max_range_bps",
-            "quote_status", "quote_symbols", "quote_quote_symbols", "quote_missing_symbols",
+            "quote_status", "quote_symbols", "quote_quote_symbols", "quote_execution_relevant_symbols",
+            "quote_missing_symbols", "quote_context_missing_symbols",
             "quote_invalid_symbols", "quote_wide_spread_symbols", "quote_error_count",
             "quote_max_spread_bps",
             "calendar_status", "calendar_rows", "calendar_session_date_in_calendar",

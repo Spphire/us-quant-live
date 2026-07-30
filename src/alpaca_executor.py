@@ -865,6 +865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         )
         account_before = client.get_account()
+        account_before_captured_at_utc = _utc_now()
         _write_json_file(output_root / "broker_account_before.json", account_before)
         _write_json_file(
             output_root / "broker_account_configurations_before.json",
@@ -1502,6 +1503,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--gross-capacity-target-ratio must be between 0 and 1.")
 
         account_for_sizing = client.get_account()
+        account_for_sizing_captured_at_utc = _utc_now()
         _write_json_file(output_root / "broker_account_for_sizing.json", account_for_sizing)
         shorting_enabled = bool(account_for_sizing.get("shorting_enabled", shorting_enabled))
         sizing_equity, sizing_equity_source = _resolve_account_equity(
@@ -2183,8 +2185,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload_key="account_payload",
             fallback=account_after_initial,
         )
+        account_after_captured_at_utc = _utc_now()
         _write_json_file(output_root / "broker_positions_after_raw.json", positions_after)
         _write_json_file(output_root / "broker_account_after.json", account_after)
+        account_snapshot_timeline_path = output_root / "broker_account_snapshot_timeline.json"
+        _write_json_file(
+            account_snapshot_timeline_path,
+            {
+                "schema_version": "1.0",
+                "window_semantics": "preflight_then_sizing_to_post_trade",
+                "snapshots": {
+                    "preflight": {
+                        "path": (output_root / "broker_account_before.json").as_posix(),
+                        "captured_at_utc": account_before_captured_at_utc,
+                    },
+                    "sizing": {
+                        "path": (output_root / "broker_account_for_sizing.json").as_posix(),
+                        "captured_at_utc": account_for_sizing_captured_at_utc,
+                    },
+                    "post_trade": {
+                        "path": (output_root / "broker_account_after.json").as_posix(),
+                        "captured_at_utc": account_after_captured_at_utc,
+                    },
+                },
+            },
+        )
         _write_json_file(
             output_root / "broker_account_configurations_after.json",
             _safe_broker_call("get_account_configurations_after", client.get_account_configurations),
@@ -2409,10 +2434,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "decision_date": decision_date.isoformat(),
             "session_idx": int(resolved_session_idx),
             "order_plan_input_path": plan_input_path,
+            "account_equity_preflight": float(equity_before),
+            "account_equity_preflight_source": str(equity_before_source),
+            "account_equity_preflight_captured_at_utc": account_before_captured_at_utc,
             "account_equity": float(sizing_equity),
             "account_equity_source": str(sizing_equity_source),
+            "account_equity_captured_at_utc": account_for_sizing_captured_at_utc,
             "account_equity_post_trade": float(equity_after),
             "account_equity_post_trade_source": str(equity_after_source),
+            "account_equity_post_trade_captured_at_utc": account_after_captured_at_utc,
+            "account_equity_window_semantics": "sizing_to_post_trade",
             "trigger_mode": str(args.trigger_mode),
             "target_ny_time": str(args.target_ny_time),
             "execution_mode": str(args.execution_mode),
@@ -2530,6 +2561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "broker_account_before_json": (output_root / "broker_account_before.json").as_posix(),
                 "broker_account_for_sizing_json": (output_root / "broker_account_for_sizing.json").as_posix(),
                 "broker_account_after_json": (output_root / "broker_account_after.json").as_posix(),
+                "broker_account_snapshot_timeline_json": account_snapshot_timeline_path.as_posix(),
                 "broker_account_configurations_before_json": (
                     output_root / "broker_account_configurations_before.json"
                 ).as_posix(),
