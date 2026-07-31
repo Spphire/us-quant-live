@@ -28,6 +28,19 @@ def _build_fixture(root: Path) -> DataAggregator:
         },
     )
 
+    previous = artifacts_root / "20260728_execute"
+    _write_json(
+        previous / "execution_summary.json",
+        {
+            "decision_date": "2026-07-28",
+            "ok": True,
+            "submitted": True,
+            "account_equity_post_trade": 100000.0,
+            "account_equity_post_trade_captured_at_utc": "2026-07-28T14:00:00+00:00",
+        },
+    )
+    _write_json(previous / "broker_account_after.json", {"equity": "100000"})
+
     complete = artifacts_root / "20260729_execute"
     _write_json(
         complete / "execution_summary.json",
@@ -36,6 +49,7 @@ def _build_fixture(root: Path) -> DataAggregator:
             "ok": True,
             "submitted": True,
             "account_equity_post_trade": 100090.0,
+            "account_equity_post_trade_captured_at_utc": "2026-07-29T14:00:00+00:00",
         },
     )
     _write_json(
@@ -71,6 +85,7 @@ def _build_fixture(root: Path) -> DataAggregator:
             "ok": True,
             "submitted": True,
             "account_equity_post_trade": 100115.0,
+            "account_equity_post_trade_captured_at_utc": "2026-07-30T14:00:00+00:00",
         },
     )
     _write_json(
@@ -102,6 +117,9 @@ def test_side_returns_are_normalized_by_side_exposure() -> None:
         assert row["side_return_snapshot_source"] == "audit/07_risk_snapshot.json", row
         assert row["daily_account_pnl"] == 90.0, row
         assert row["daily_account_return"] == 0.0009, row
+        assert row["daily_account_cycle_start_equity"] == 100000.0, row
+        assert row["daily_account_cycle_end_equity"] == 100090.0, row
+        assert row["daily_account_cycle_start_run_dir"] == "20260728_execute", row
         assert row["daily_long_equity_contribution"] == 0.0015, row
         assert row["daily_short_equity_contribution"] == -0.0005, row
         assert row["daily_known_non_trade_equity_contribution"] == -0.0001, row
@@ -117,6 +135,7 @@ def test_zero_exposure_does_not_emit_a_false_zero_return() -> None:
         assert row["long_snapshot_intraday_return"] is None, row
         assert row["short_snapshot_intraday_return"] == 0.01, row
         assert row["daily_account_pnl"] == 25.0, row
+        assert row["daily_account_cycle_start_equity"] == 100090.0, row
         assert row["daily_unattributed_residual_pnl"] == 0.0, row
         assert row["daily_side_pnl_attribution_status"] == "reconciled", row
 
@@ -128,7 +147,11 @@ def test_material_unattributed_daily_gap_is_partial() -> None:
         run_dir = root / "artifacts" / "daily_alpaca_scheduler" / "20260731_execute"
         _write_json(
             run_dir / "execution_summary.json",
-            {"decision_date": "2026-07-31", "account_equity_post_trade": 100500.0},
+            {
+                "decision_date": "2026-07-31",
+                "account_equity_post_trade": 100500.0,
+                "account_equity_post_trade_captured_at_utc": "2026-07-31T14:00:00+00:00",
+            },
         )
         _write_json(
             run_dir / "broker_account_after.json",
@@ -145,9 +168,9 @@ def test_material_unattributed_daily_gap_is_partial() -> None:
 
         history = aggregator.get_history(limit=10)
         row = next(item for item in history if item.get("run_dir") == "20260731_execute")
-        assert row["daily_account_pnl"] == 500.0, row
-        assert row["daily_unattributed_residual_pnl"] == 550.0, row
-        assert row["daily_unattributed_equity_contribution"] == 0.0055, row
+        assert row["daily_account_pnl"] == 385.0, row
+        assert row["daily_unattributed_residual_pnl"] == 435.0, row
+        assert row["daily_unattributed_equity_contribution"] == 435.0 / 100115.0, row
         assert row["daily_side_pnl_attribution_status"] == "partial", row
 
 

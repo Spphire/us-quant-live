@@ -1559,6 +1559,41 @@ class DataAggregator:
         """Read audit_rollup.json if available."""
         return self._read_json_file(self.artifacts_root / "audit_rollup.json")
 
+    def _previous_completed_execute_cycle(
+        self,
+        run_dir: Path,
+        current_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Find the prior same-epoch execute completion for cycle PnL."""
+        current_date = self._run_dir_session_date(run_dir, current_summary)
+        current_epoch = current_summary.get("capital_epoch")
+        candidates: list[tuple[str, Path, dict[str, Any]]] = []
+        for candidate in self._iter_run_dirs():
+            if candidate == run_dir or not candidate.name.endswith("_execute"):
+                continue
+            candidate_summary = self._read_json_file(candidate / "execution_summary.json")
+            if not candidate_summary:
+                continue
+            candidate_date = self._run_dir_session_date(candidate, candidate_summary)
+            if not candidate_date or candidate_date >= current_date:
+                continue
+            if current_epoch is not None and candidate_summary.get("capital_epoch") not in (None, current_epoch):
+                continue
+            if not (candidate / "broker_account_after.json").exists():
+                continue
+            candidates.append((candidate_date, candidate, candidate_summary))
+        if not candidates:
+            return {}
+        _, previous_run_dir, previous_summary = max(candidates, key=lambda item: item[0])
+        account = self._read_json_file(previous_run_dir / "broker_account_after.json")
+        if not account:
+            return {}
+        return {
+            "payload": account,
+            "captured_at_utc": previous_summary.get("account_equity_post_trade_captured_at_utc", ""),
+            "run_dir": previous_run_dir.name,
+        }
+
     def _read_side_return_snapshot(self, run_dir: Path) -> dict[str, Any]:
         """Expose legacy side snapshots plus account-consistent daily contributions."""
         risk = self._read_json_file(run_dir / "audit" / "07_risk_snapshot.json")
@@ -1584,13 +1619,24 @@ class DataAggregator:
             run_dir / "audit" / "84_daily_side_pnl_attribution_summary.json"
         )
         if not daily_attribution:
+            current_summary = self._read_json_file(run_dir / "execution_summary.json")
+            cycle_start_capture = self._previous_completed_execute_cycle(
+                run_dir,
+                current_summary,
+            )
             daily_attribution = build_daily_side_pnl_attribution(
                 account_after_capture=self._read_json_file(run_dir / "broker_account_after.json"),
+                account_start_capture=cycle_start_capture,
                 risk_snapshot=risk,
                 account_activity_summary=self._read_json_file(
                     run_dir / "audit" / "51_account_activity_attribution_summary.json"
                 ),
                 opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+                account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
+                account_end_run_dir=run_dir.name,
+                account_end_captured_at_utc=str(
+                    current_summary.get("account_equity_post_trade_captured_at_utc", "")
+                ),
             )
 
         return {
@@ -1615,6 +1661,10 @@ class DataAggregator:
                 "denominator_semantics", ""
             ),
             "daily_side_pnl_semantics": daily_attribution.get("side_pnl_semantics", ""),
+            "daily_account_cycle_start_equity": daily_attribution.get("account_cycle_start_equity"),
+            "daily_account_cycle_end_equity": daily_attribution.get("account_cycle_end_equity"),
+            "daily_account_cycle_start_run_dir": daily_attribution.get("account_cycle_start_run_dir", ""),
+            "daily_account_cycle_end_run_dir": daily_attribution.get("account_cycle_end_run_dir", ""),
             "daily_account_last_equity": daily_attribution.get("account_last_equity"),
             "daily_account_pnl": daily_attribution.get("account_daily_pnl"),
             "daily_account_return": daily_attribution.get("account_daily_return"),
@@ -1631,7 +1681,8 @@ class DataAggregator:
                 "unattributed_equity_contribution"
             ),
             "daily_side_pnl_residual_abs_bps": daily_attribution.get(
-                "residual_abs_bps_of_last_equity"
+                "residual_abs_bps_of_cycle_start_equity",
+                daily_attribution.get("residual_abs_bps_of_last_equity"),
             ),
             "daily_side_pnl_reconciliation_threshold_bps": daily_attribution.get(
                 "reconciliation_threshold_bps"

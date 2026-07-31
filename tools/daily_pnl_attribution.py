@@ -31,15 +31,23 @@ def _ratio(amount: float | None, denominator: float | None) -> float | None:
     return amount / denominator
 
 
+def _account_equity(account: Mapping[str, Any]) -> float | None:
+    return _finite_float(account.get("equity") or account.get("portfolio_value"))
+
+
 def build_daily_side_pnl_attribution(
     *,
     account_after_capture: Any,
+    account_start_capture: Any,
     risk_snapshot: Any,
     account_activity_summary: Any,
     opening_snapshot_available: bool,
+    account_start_run_dir: str = "",
+    account_end_run_dir: str = "",
+    account_end_captured_at_utc: str = "",
     reconciliation_threshold_bps: float = DEFAULT_RECONCILIATION_THRESHOLD_BPS,
 ) -> dict[str, Any]:
-    """Reconcile side snapshot PnL to the prior-close account-equity window.
+    """Reconcile side snapshot PnL to the execution-cycle equity window.
 
     The long/short inputs remain snapshot proxies until a complete opening
     position and fill replay is available. The residual is intentionally kept
@@ -48,13 +56,15 @@ def build_daily_side_pnl_attribution(
     """
 
     account = _payload_mapping(account_after_capture)
+    account_start = _payload_mapping(account_start_capture)
     risk = _payload_mapping(risk_snapshot)
     activity = _payload_mapping(account_activity_summary)
     by_side = risk.get("snapshot_intraday_pnl_by_side")
     by_side = by_side if isinstance(by_side, Mapping) else {}
 
-    equity_after = _finite_float(account.get("equity") or account.get("portfolio_value"))
-    last_equity = _finite_float(account.get("last_equity"))
+    equity_after = _account_equity(account)
+    cycle_start_equity = _account_equity(account_start)
+    broker_last_equity = _finite_float(account.get("last_equity"))
     long_pnl = _finite_float(by_side.get("long"))
     short_pnl = _finite_float(by_side.get("short"))
     if "fee_interest_dividend_net_amount" in activity:
@@ -67,8 +77,8 @@ def build_daily_side_pnl_attribution(
         non_trade_pnl = 0.0
 
     account_daily_pnl = (
-        equity_after - last_equity
-        if equity_after is not None and last_equity is not None
+        equity_after - cycle_start_equity
+        if equity_after is not None and cycle_start_equity is not None
         else None
     )
     has_side_snapshot = long_pnl is not None and short_pnl is not None
@@ -78,12 +88,12 @@ def build_daily_side_pnl_attribution(
         else None
     )
     residual_abs_bps = (
-        abs(residual) / last_equity * 10_000.0
-        if residual is not None and last_equity is not None and last_equity > 0
+        abs(residual) / cycle_start_equity * 10_000.0
+        if residual is not None and cycle_start_equity is not None and cycle_start_equity > 0
         else None
     )
 
-    if account_daily_pnl is None or last_equity is None or last_equity <= 0:
+    if account_daily_pnl is None or cycle_start_equity is None or cycle_start_equity <= 0:
         status = "unavailable"
     elif not has_side_snapshot:
         status = "unavailable"
@@ -107,33 +117,41 @@ def build_daily_side_pnl_attribution(
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": status,
-        "window_semantics": "previous_close_account_equity_to_post_trade_snapshot",
-        "denominator_semantics": "previous_close_account_equity_last_equity",
+        "window_semantics": "previous_completed_execute_to_current_completed_execute",
+        "denominator_semantics": "previous_completed_execute_post_trade_equity",
         "side_pnl_semantics": "final_position_intraday_snapshot_proxy",
+        "account_cycle_start_equity": cycle_start_equity,
+        "account_cycle_end_equity": equity_after,
+        "account_cycle_start_captured_at_utc": account_start.get("captured_at_utc"),
+        "account_cycle_end_captured_at_utc": account_end_captured_at_utc,
+        "account_cycle_start_run_dir": account_start_run_dir,
+        "account_cycle_end_run_dir": account_end_run_dir,
         "account_equity_after": equity_after,
-        "account_last_equity": last_equity,
+        "account_last_equity": cycle_start_equity,
+        "broker_last_equity": broker_last_equity,
         "account_balance_asof": account.get("balance_asof"),
         "account_daily_pnl": account_daily_pnl,
-        "account_daily_return": _ratio(account_daily_pnl, last_equity),
+        "account_daily_return": _ratio(account_daily_pnl, cycle_start_equity),
         "long_pnl": long_pnl,
         "short_pnl": short_pnl,
         "known_non_trade_pnl": non_trade_pnl,
         "known_non_trade_pnl_source": non_trade_source,
         "unattributed_residual_pnl": residual,
-        "long_equity_contribution": _ratio(long_pnl, last_equity),
-        "short_equity_contribution": _ratio(short_pnl, last_equity),
-        "known_non_trade_equity_contribution": _ratio(non_trade_pnl, last_equity),
-        "unattributed_equity_contribution": _ratio(residual, last_equity),
+        "long_equity_contribution": _ratio(long_pnl, cycle_start_equity),
+        "short_equity_contribution": _ratio(short_pnl, cycle_start_equity),
+        "known_non_trade_equity_contribution": _ratio(non_trade_pnl, cycle_start_equity),
+        "unattributed_equity_contribution": _ratio(residual, cycle_start_equity),
         "component_sum_pnl": component_sum,
         "identity_error_pnl": identity_error,
+        "residual_abs_bps_of_cycle_start_equity": residual_abs_bps,
         "residual_abs_bps_of_last_equity": residual_abs_bps,
         "reconciliation_threshold_bps": reconciliation_threshold_bps,
         "opening_snapshot_available": bool(opening_snapshot_available),
         "opening_snapshot_source": "broker_day_open_snapshot.json" if opening_snapshot_available else "",
         "strict_daily_side_attribution_ready": False,
         "note": (
-            "Components conserve account daily PnL. Long and short remain final-position snapshot proxies; "
-            "the explicit residual absorbs closed-position, restart, transfer-window, and timing coverage gaps. "
-            "Cash transfers are excluded unless a future capture proves they occurred inside this exact window."
+            "Components conserve execution-cycle account PnL. Long and short remain final-position snapshot "
+            "proxies; the explicit residual absorbs closed-position, restart, transfer-window, and timing "
+            "coverage gaps. The broker last_equity field is retained as a diagnostic, not as the cycle start."
         ),
     }

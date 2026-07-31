@@ -676,13 +676,14 @@
                 statusFailed: 'Failed',
                 statusRunning: 'Running',
                 statusStarted: 'Started',
-                chartEquityTitle: 'Portfolio Equity (Last 30 Days)',
-                chartSideReturnTitle: 'Daily P&L Contribution vs Account Return',
+                chartEquityTitle: 'Portfolio Equity (Execution Completions)',
+                chartSideReturnTitle: 'Execution-Cycle Side P&L vs Account Return',
                 chartWeightErrorTitle: 'Daily Weight Error (L1)',
                 chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
                 seriesLongReturn: 'Long contribution',
                 seriesShortReturn: 'Short contribution',
-                seriesAccountReturn: 'Account daily return',
+                seriesAccountReturn: 'Account cycle return',
+                metricCycleStartEquity: 'Cycle start equity',
                 seriesNonTradeContribution: 'Fees / income contribution',
                 seriesResidualContribution: 'Unattributed residual',
                 seriesStrategyActual: 'Strategy to actual',
@@ -820,13 +821,14 @@
                 statusFailed: '失败',
                 statusRunning: '运行中',
                 statusStarted: '已启动',
-                chartEquityTitle: '账户权益曲线（最近30天）',
-                chartSideReturnTitle: '每日多空收益贡献与账户日收益',
+                chartEquityTitle: '账户权益曲线（执行完成快照）',
+                chartSideReturnTitle: '执行周期多空收益贡献与账户收益',
                 chartWeightErrorTitle: '每日权重误差（L1）',
                 chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
                 seriesLongReturn: '多头收益贡献',
                 seriesShortReturn: '空头收益贡献',
-                seriesAccountReturn: '账户日收益',
+                seriesAccountReturn: '账户周期收益',
+                metricCycleStartEquity: '周期起点权益',
                 seriesNonTradeContribution: '费用与收益项贡献',
                 seriesResidualContribution: '未归因残差',
                 seriesStrategyActual: '策略到实际',
@@ -1159,12 +1161,14 @@
                     residualContributionPct: auditMetric(row, 'daily_unattributed_equity_contribution', 100),
                     accountReturnPct: auditMetric(row, 'daily_account_return', 100),
                     accountPnl: auditMetric(row, 'daily_account_pnl'),
-                    accountLastEquity: auditMetric(row, 'daily_account_last_equity'),
+                    accountLastEquity: auditMetric(row, 'daily_account_cycle_start_equity'),
                     longPnl: auditMetric(row, 'daily_long_pnl'),
                     shortPnl: auditMetric(row, 'daily_short_pnl'),
                     nonTradePnl: auditMetric(row, 'daily_known_non_trade_pnl'),
                     residualPnl: auditMetric(row, 'daily_unattributed_residual_pnl'),
                     residualAbsBps: auditMetric(row, 'daily_side_pnl_residual_abs_bps'),
+                    windowSemantics: String(row.daily_side_pnl_window_semantics || ''),
+                    cycleStartRunDir: String(row.daily_account_cycle_start_run_dir || ''),
                     status: String(row.daily_side_pnl_attribution_status || 'unavailable'),
                     runDir: row.run_dir || ''
                 }));
@@ -1792,8 +1796,8 @@
                 const partialDays = series.filter(point => point.status === 'partial').length;
                 const reconciledDays = series.filter(point => point.status === 'reconciled').length;
                 metaEl.textContent = labels.length
-                    ? `${first} to ${last} · ${labels.length} days · reconciled ${reconciledDays} · partial ${partialDays} · ${renderer}`
-                    : `No aligned daily P&L evidence · ${renderer}`;
+                    ? `${first} to ${last} · ${labels.length} cycles · reconciled ${reconciledDays} · partial ${partialDays} · ${renderer}`
+                    : `No aligned execution-cycle P&L evidence · ${renderer}`;
             }
 
             const canvas = document.getElementById('sideReturnChart');
@@ -1810,7 +1814,7 @@
                     canvas,
                     labels,
                     fallbackData,
-                    'No aligned daily P&L evidence'
+                    'No aligned execution-cycle P&L evidence'
                 );
                 return;
             }
@@ -1893,7 +1897,8 @@
                                     const point = series[items?.[0]?.dataIndex ?? -1];
                                     if (!point) return '';
                                     return [
-                                        `${t('seriesAccountReturn')}: ${formatOptionalCurrency(point.accountPnl)} / ${formatOptionalCurrency(point.accountLastEquity)}`,
+                                        `${t('seriesAccountReturn')}: ${formatOptionalCurrency(point.accountPnl)} / ${t('metricCycleStartEquity')} ${formatOptionalCurrency(point.accountLastEquity)}`,
+                                        `window: ${escapeHTML(point.cycleStartRunDir || 'n/a')} -> ${escapeHTML(point.runDir || 'n/a')}`,
                                         `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} | ${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)}`,
                                         `${t('seriesNonTradeContribution')}: ${formatOptionalCurrency(point.nonTradePnl)}`,
                                         `${t('seriesResidualContribution')}: ${formatOptionalCurrency(point.residualPnl)} (${formatNumber(point.residualAbsBps)} bps)`,

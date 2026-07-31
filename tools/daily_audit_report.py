@@ -10629,6 +10629,53 @@ def _write_review(
     path.write_text("".join(lines), encoding="utf-8")
 
 
+def _previous_completed_execute_cycle(
+    run_dir: Path,
+    current_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Find the same-epoch prior execute completion used as cycle PnL start."""
+    current_date = str(
+        current_summary.get("decision_date")
+        or current_summary.get("session_date")
+        or run_dir.name[:8]
+    ).replace("-", "")
+    current_epoch = current_summary.get("capital_epoch")
+    candidates: list[tuple[str, Path, dict[str, Any]]] = []
+    for candidate in run_dir.parent.iterdir():
+        if not candidate.is_dir() or candidate == run_dir or not candidate.name.endswith("_execute"):
+            continue
+        candidate_summary = _read_json(candidate / "execution_summary.json", {})
+        if not isinstance(candidate_summary, dict):
+            continue
+        candidate_date = str(
+            candidate_summary.get("decision_date")
+            or candidate_summary.get("session_date")
+            or candidate.name[:8]
+        ).replace("-", "")
+        if not candidate_date or candidate_date >= current_date:
+            continue
+        if current_epoch is not None and candidate_summary.get("capital_epoch") not in (None, current_epoch):
+            continue
+        account_path = candidate / "broker_account_after.json"
+        if not account_path.exists():
+            continue
+        account = _read_json(account_path, {})
+        if not isinstance(account, dict):
+            continue
+        candidates.append((candidate_date, candidate, candidate_summary))
+    if not candidates:
+        return {}
+    _, previous_run_dir, previous_summary = max(candidates, key=lambda item: item[0])
+    account = _read_json(previous_run_dir / "broker_account_after.json", {})
+    if not isinstance(account, dict):
+        return {}
+    return {
+        "payload": account,
+        "captured_at_utc": previous_summary.get("account_equity_post_trade_captured_at_utc", ""),
+        "run_dir": previous_run_dir.name,
+    }
+
+
 def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     decision_dir = decision_dir.resolve() if decision_dir else _infer_decision_dir(run_dir)
@@ -11263,11 +11310,24 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         decision_rows,
         execution_attempt_outcomes,
     )
+    current_account_after = _read_json(run_dir / "broker_account_after.json", {})
+    cycle_start_capture = _previous_completed_execute_cycle(
+        run_dir,
+        summary if isinstance(summary, dict) else {},
+    )
     daily_side_pnl_attribution = build_daily_side_pnl_attribution(
-        account_after_capture=_read_json(run_dir / "broker_account_after.json", {}),
+        account_after_capture=current_account_after,
+        account_start_capture=cycle_start_capture,
         risk_snapshot=risk,
         account_activity_summary=account_activity_attribution_summary,
         opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+        account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
+        account_end_run_dir=run_dir.name,
+        account_end_captured_at_utc=str(
+            (summary if isinstance(summary, dict) else {}).get(
+                "account_equity_post_trade_captured_at_utc", ""
+            )
+        ),
     )
     equity_pnl_bridge = _build_equity_pnl_bridge(
         run_dir=run_dir,
@@ -12140,6 +12200,11 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "calendar_error_count": calendar_summary.get("error_count"),
         "account_activity_attribution_rows": len(account_activity_attribution_rows),
         "daily_side_pnl_attribution_status": daily_side_pnl_attribution.get("status"),
+        "daily_side_pnl_window_semantics": daily_side_pnl_attribution.get("window_semantics"),
+        "daily_account_cycle_start_equity": daily_side_pnl_attribution.get("account_cycle_start_equity"),
+        "daily_account_cycle_end_equity": daily_side_pnl_attribution.get("account_cycle_end_equity"),
+        "daily_account_cycle_start_run_dir": daily_side_pnl_attribution.get("account_cycle_start_run_dir"),
+        "daily_account_cycle_end_run_dir": daily_side_pnl_attribution.get("account_cycle_end_run_dir"),
         "daily_account_pnl": daily_side_pnl_attribution.get("account_daily_pnl"),
         "daily_account_return": daily_side_pnl_attribution.get("account_daily_return"),
         "daily_long_equity_contribution": daily_side_pnl_attribution.get("long_equity_contribution"),
