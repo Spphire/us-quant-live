@@ -2,6 +2,14 @@
 
 美股多因子横截面多空策略实盘系统。项目覆盖动态股票池、Alpha/Decision Engine、基于券商实际持仓的换手约束、Reg T 两阶段调仓执行、Alpaca/IBKR 执行接口与后台守护调度。
 
+## 从零部署
+
+默认生产组合需要两套只保存在本机的凭据：Alpaca 负责账户与订单，长桥 OpenAPI 负责实时执行行情。完整的环境创建、双账户配置、只读预检、Paper 验收、托盘启动和开机自启流程见 [DAEMON_STARTUP_GUIDE.md](DAEMON_STARTUP_GUIDE.md)。
+
+```powershell
+.\venv\Scripts\python.exe .\tools\check_deployment_readiness.py
+```
+
 ## 重要提示
 
 ### 数据源要求
@@ -39,10 +47,8 @@ Alpaca 免费版限制 **200 requests/minute**：
 
 使用系统托盘启动器，最简单的启动方式：
 
-```bash
-cd W:\实验室项目\us-quant-live
-source venv/Scripts/activate
-python tools/tray_launcher.py
+```powershell
+.\Start.bat
 ```
 
 或构建 .exe 后双击：
@@ -116,4 +122,4 @@ configs/alpaca_acounts/alpaca_accounts.local.json
 configs/longbridge.local.json
 ```
 
-运行前需要确保该文件存在，并包含对应的 `ALPACA_US_FULL` 账户配置。
+运行前需要确保两份文件都存在：Alpaca 配置包含 `ALPACA_US_FULL`，长桥配置包含 App Key、App Secret、Access Token，并具备美股 LV1/NBBO 权限。

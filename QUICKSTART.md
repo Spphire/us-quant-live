@@ -2,6 +2,12 @@
 
 ## Important Notes
 
+For a clean machine, dual-provider credentials, tray startup, and autostart setup, follow [DAEMON_STARTUP_GUIDE.md](DAEMON_STARTUP_GUIDE.md). Run the read-only provider check before the first decision:
+
+```powershell
+.\venv\Scripts\python.exe .\tools\check_deployment_readiness.py
+```
+
 **Data Feed**: System defaults to SIP (full market coverage). **DO NOT** use `--feed iex` - IEX covers only ~2-3% of market and will cause missing data for most stocks.
 
 **Rate Limiting**: First run may hit Alpaca's 200 req/min limit (HTTP 403/429). Wait 2 minutes and retry. Daemon mode (every 12h) never hits limit. See [ALPACA_RATE_LIMIT_GUIDE.md](ALPACA_RATE_LIMIT_GUIDE.md) for details.
@@ -101,6 +107,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_sch
 **First time setup checklist:**
 - [ ] Create `configs/alpaca_acounts/alpaca_accounts.local.json` from template
 - [ ] Fill in Alpaca API key/secret (use paper account for testing!)
+- [ ] Create `configs/longbridge.local.json` from `configs/longbridge.example.json`
+- [ ] Confirm Longbridge reports US LV1/NBBO entitlement
+- [ ] Run `tools/check_deployment_readiness.py` and require `status=pass`
 - [ ] Run a single decision test and inspect targets plus turnover diagnostics
 - [ ] Start daemon in foreground mode to observe one full cycle
 - [ ] Switch to background mode for production
