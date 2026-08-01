@@ -233,6 +233,70 @@ def test_order_attempts_concurrency_and_summary() -> None:
         assert summary["trading_complete_seconds"] == 6.0, summary
 
 
+def test_unified_release_macro_stage_is_one_timeline_bar() -> None:
+    with TemporaryDirectory() as tmp:
+        artifacts_root, aggregator = _build_fixture(Path(tmp))
+        run = artifacts_root / "20260729_execute"
+        records = _execution_records()
+        records.extend(
+            [
+                {
+                    "symbol": "REL-LONG",
+                    "side": "sell",
+                    "qty": 3.0,
+                    "stage": "release_sell_long",
+                    "macro_stage": "reduce_exposure",
+                    "release_action_class": "release_sell_long",
+                    "status_latest": "filled",
+                    "batch_started_at_utc": "2026-07-29T14:00:01.100+00:00",
+                    "queue_wait_ms": 0.0,
+                    "order_wall_time_seconds": 0.6,
+                    "batch_effective_workers": 2,
+                    "attempts": [],
+                },
+                {
+                    "symbol": "REL-SHORT",
+                    "side": "buy",
+                    "qty": 2.0,
+                    "stage": "release_buy_to_cover",
+                    "macro_stage": "reduce_exposure",
+                    "release_action_class": "release_buy_to_cover",
+                    "status_latest": "filled",
+                    "batch_started_at_utc": "2026-07-29T14:00:01.100+00:00",
+                    "queue_wait_ms": 50.0,
+                    "order_wall_time_seconds": 0.6,
+                    "batch_effective_workers": 2,
+                    "attempts": [],
+                },
+            ]
+        )
+        _write_json(run / "execution_records.json", records)
+
+        payload = aggregator.get_execution_timeline("20260729_execute")
+        stage_track = next(
+            track for track in payload["tracks"] if track["id"] == "execution-stages"
+        )
+        reduce_items = [
+            item
+            for item in stage_track["items"]
+            if item.get("detail", {}).get("stage") == "reduce_exposure"
+        ]
+        assert len(reduce_items) == 1, stage_track
+        assert reduce_items[0]["label"] == "Reduce Exposure", reduce_items[0]
+        assert reduce_items[0]["detail"]["order_count"] == 2, reduce_items[0]
+        release_orders = [
+            item
+            for track in payload["tracks"]
+            if track["kind"] == "order"
+            for item in track["items"]
+            if item.get("detail", {}).get("macro_stage") == "reduce_exposure"
+        ]
+        assert {item["detail"]["release_action_class"] for item in release_orders} == {
+            "release_sell_long",
+            "release_buy_to_cover",
+        }, release_orders
+
+
 def test_api_window_classification_and_redaction() -> None:
     with TemporaryDirectory() as tmp:
         _, aggregator = _build_fixture(Path(tmp))
@@ -285,6 +349,7 @@ def main() -> int:
     tests = [
         ("Latest execution-only run", test_latest_run_and_execution_only_scope),
         ("Order attempts and concurrency", test_order_attempts_concurrency_and_summary),
+        ("Unified release macro stage", test_unified_release_macro_stage_is_one_timeline_bar),
         ("API window and redaction", test_api_window_classification_and_redaction),
         ("Bounded run selection", test_selected_run_and_invalid_name_are_bounded),
     ]

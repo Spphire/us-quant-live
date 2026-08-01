@@ -3814,6 +3814,16 @@ def _split_release_substages(
     return sell_long, buy_to_cover
 
 
+def _release_action_class(item: OrderInstruction) -> str:
+    if item.side == "sell" and float(item.current_notional) > EPS:
+        return "release_sell_long"
+    if item.side == "buy" and float(item.current_notional) < -EPS:
+        return "release_buy_to_cover"
+    raise ValueError(
+        f"Instruction {item.symbol} is not a position-reducing release order"
+    )
+
+
 def _order_buying_power_notional(
     item: OrderInstruction,
     *,
@@ -5549,6 +5559,7 @@ def _submit_staged_regt_orders(
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
         "mode": "staged_regt",
+        "release_execution_mode": "unified_reduce_exposure",
         "initial_order_count": int(len(initial_instructions)),
         "initial_release_count": int(len(release_instructions)),
         "initial_deferred_entry_count": int(len(deferred_entry_instructions)),
@@ -5559,6 +5570,7 @@ def _submit_staged_regt_orders(
         "execution_workers": int(max(1, execution_workers)),
         "marketable_limit_max_attempts": int(max(1, marketable_limit_max_attempts)),
         "release_records": 0,
+        "release_rounds": [],
         "release_substages": [],
         "release_fully_filled": True,
         "entry_aborted": False,
@@ -5623,316 +5635,426 @@ def _submit_staged_regt_orders(
     diagnostics["initial_deferred_entry_instructions"] = _instruction_payloads(
         deferred_entry_instructions
     )
-    for stage_name, stage_token, stage_instructions in (
-        ("release_sell_long", "rsl", release_sell_long),
-        ("release_buy_to_cover", "rbc", release_buy_to_cover),
-    ):
-        if not stage_instructions:
-            continue
-        stage_symbols = sorted({item.symbol for item in stage_instructions})
-        stage_records_total: list[dict[str, Any]] = []
-        stage_fully_filled = False
-        stage_remaining_symbols: list[str] = list(stage_symbols)
-        current_stage_instructions = list(stage_instructions)
-        stage_attempt_cap = max(1, int(marketable_limit_max_attempts))
-        stage_attempt_counts: Counter[str] = Counter()
-        stage_budget_exhausted_symbols: list[str] = []
+    release_symbols = sorted({str(item.symbol).upper() for item in release_instructions})
+    release_action_class_by_symbol = {
+        str(item.symbol).upper(): _release_action_class(item)
+        for item in release_instructions
+    }
+    release_records_total: list[dict[str, Any]] = []
+    release_fully_filled = not release_instructions
+    release_remaining_instructions = list(release_instructions)
+    current_release_instructions = list(release_instructions)
+    release_attempt_cap = max(1, int(marketable_limit_max_attempts))
+    release_attempt_counts: Counter[str] = Counter()
+    release_budget_exhausted_symbols: list[str] = []
 
-        for round_no in range(1, max(1, int(release_max_rounds)) + 1):
-            if not current_stage_instructions:
-                break
-            round_attempt_budget_before = {
-                str(item.symbol).upper(): max(
-                    0,
-                    stage_attempt_cap - int(stage_attempt_counts[str(item.symbol).upper()]),
-                )
-                for item in current_stage_instructions
+    for round_no in range(1, max(1, int(release_max_rounds)) + 1):
+        if not current_release_instructions:
+            break
+        round_attempt_budget_before = {
+            str(item.symbol).upper(): max(
+                0,
+                release_attempt_cap
+                - int(release_attempt_counts[str(item.symbol).upper()]),
+            )
+            for item in current_release_instructions
+        }
+        round_input_instructions = [
+            item
+            for item in current_release_instructions
+            if round_attempt_budget_before.get(str(item.symbol).upper(), 0) > 0
+        ]
+        if not round_input_instructions:
+            release_budget_exhausted_symbols = sorted(
+                {str(item.symbol).upper() for item in current_release_instructions}
+            )
+            break
+
+        round_action_class_by_symbol = {
+            str(item.symbol).upper(): _release_action_class(item)
+            for item in round_input_instructions
+        }
+        round_offset_bps = float(marketable_limit_base_offset_bps) + max(
+            0.0, float(release_round_extra_bps)
+        ) * float(round_no - 1)
+        release_batch_started = time.monotonic()
+        release_records = _submit_and_track_orders(
+            client=client,
+            instructions=round_input_instructions,
+            session_token=f"{session_token}_rel_r{round_no:02d}",
+            timeout_seconds=float(release_timeout_seconds),
+            poll_seconds=poll_seconds,
+            execution_order_style=execution_order_style,
+            marketable_limit_base_offset_bps=round_offset_bps,
+            marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
+            marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
+            marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
+            marketable_limit_max_attempts=int(marketable_limit_max_attempts),
+            max_workers=int(execution_workers),
+            execution_price_feed=str(execution_price_feed),
+            execution_quote_client=execution_quote_client,
+            max_attempts_by_symbol=round_attempt_budget_before,
+        )
+        release_batch_summary = _order_batch_summary(
+            release_records,
+            requested_workers=int(execution_workers),
+            elapsed_seconds=float(time.monotonic() - release_batch_started),
+        )
+        for record in release_records:
+            record_symbol = str(record.get("symbol") or "").upper()
+            attempts_used = int(record.get("attempt_count") or 0)
+            if attempts_used <= 0 and str(record.get("status_latest") or ""):
+                attempts_used = 1
+            attempts_before = int(release_attempt_counts[record_symbol])
+            release_attempt_counts[record_symbol] = min(
+                release_attempt_cap,
+                attempts_before + attempts_used,
+            )
+            record["stage"] = round_action_class_by_symbol[record_symbol]
+            record["macro_stage"] = "reduce_exposure"
+            record["release_action_class"] = round_action_class_by_symbol[record_symbol]
+            record["release_round"] = int(round_no)
+            record["stage_symbol_attempt_cap"] = int(release_attempt_cap)
+            record["stage_symbol_attempt_count_before"] = int(attempts_before)
+            record["stage_symbol_attempt_count_after"] = int(
+                release_attempt_counts[record_symbol]
+            )
+            record["stage_symbol_attempts_remaining"] = int(
+                max(0, release_attempt_cap - release_attempt_counts[record_symbol])
+            )
+        records.extend(release_records)
+        release_records_total.extend(release_records)
+        diagnostics["release_records"] = int(diagnostics["release_records"]) + int(
+            len(release_records)
+        )
+
+        refreshed_release_positions = client.list_positions()
+        _, refreshed_release_signed_notional = _positions_to_frame_and_notional(
+            refreshed_release_positions
+        )
+        refreshed_release_signed_qty = _signed_qty_from_positions(
+            refreshed_release_positions
+        )
+        refreshed_release_account = client.get_account()
+        refreshed_release_buying_power, refreshed_release_buying_power_source = (
+            _buying_power(refreshed_release_account)
+        )
+        refreshed_release_equity, refreshed_release_equity_source = (
+            _resolve_account_equity(
+                account=refreshed_release_account,
+                signed_notional=refreshed_release_signed_notional,
+            )
+        )
+        release_price_symbols = sorted(
+            set(release_symbols) | set(refreshed_release_signed_notional)
+        )
+        try:
+            release_reference_prices = _resolve_reference_prices(
+                client=execution_quote_client or client,
+                symbols=release_price_symbols,
+                fallback_prices=release_reference_prices,
+                feed=execution_price_feed,
+                prefer_live=True,
+                allow_fallback=execution_quote_client is None,
+                require_fresh=execution_quote_client is not None,
+            )
+        except LongbridgeQuoteError as exc:
+            return abort_after_quote_failure(
+                stage="reduce_exposure_rebuild",
+                error=exc,
+                affected_symbols=release_price_symbols,
+            )
+        release_min_trade_notional = _effective_min_trade_notional(
+            account_equity=float(refreshed_release_equity),
+            absolute_floor=float(min_trade_notional_floor),
+            weight_bps=float(min_trade_weight_bps),
+        )
+        rebuilt_instructions, rebuilt_skipped = _build_order_instructions(
+            target_signed_weights=release_target_signed_weights,
+            current_signed_notional=refreshed_release_signed_notional,
+            current_signed_qty=refreshed_release_signed_qty,
+            account_equity=float(account_equity),
+            reference_prices=release_reference_prices,
+            assets_by_symbol=assets_by_symbol,
+            min_trade_notional=float(release_min_trade_notional),
+            sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
+            qty_decimals=int(qty_decimals),
+            whole_shares_only=bool(whole_shares_only),
+            opening_shorts_whole_shares_only=bool(
+                opening_shorts_whole_shares_only
+            ),
+            short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
+            shorting_enabled=bool(shorting_enabled),
+        )
+        rebuilt_release, _ = _split_release_entry_instructions(
+            rebuilt_instructions,
+            current_signed_qty=refreshed_release_signed_qty,
+        )
+        rebuilt_release = [
+            item
+            for item in rebuilt_release
+            if str(item.symbol).upper() in set(release_symbols)
+        ]
+        round_filled_symbols = {
+            str(record.get("symbol") or "").upper()
+            for record in release_records
+            if _order_record_fully_filled(record)
+        }
+        filled_instruction_suppressed_rebuild_symbols = sorted(
+            {
+                str(item.symbol).upper()
+                for item in rebuilt_release
+                if str(item.symbol).upper() in round_filled_symbols
             }
-            round_input_instructions = [
-                item
-                for item in current_stage_instructions
-                if round_attempt_budget_before.get(str(item.symbol).upper(), 0) > 0
-            ]
-            if not round_input_instructions:
-                stage_budget_exhausted_symbols = sorted(
-                    {str(item.symbol).upper() for item in current_stage_instructions}
-                )
-                break
-            round_offset_bps = float(marketable_limit_base_offset_bps) + max(0.0, float(release_round_extra_bps)) * float(round_no - 1)
-            release_batch_started = time.monotonic()
-            release_records = _submit_and_track_orders(
-                client=client,
-                instructions=round_input_instructions,
-                session_token=f"{session_token}_{stage_token}_r{round_no:02d}",
-                timeout_seconds=float(release_timeout_seconds),
-                poll_seconds=poll_seconds,
-                execution_order_style=execution_order_style,
-                marketable_limit_base_offset_bps=round_offset_bps,
-                marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
-                marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
-                marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
-                marketable_limit_max_attempts=int(marketable_limit_max_attempts),
-                max_workers=int(execution_workers),
-                execution_price_feed=str(execution_price_feed),
-                execution_quote_client=execution_quote_client,
-                max_attempts_by_symbol=round_attempt_budget_before,
-            )
-            release_batch_summary = _order_batch_summary(
-                release_records,
-                requested_workers=int(execution_workers),
-                elapsed_seconds=float(time.monotonic() - release_batch_started),
-            )
-            for record in release_records:
-                record_symbol = str(record.get("symbol") or "").upper()
-                attempts_used = int(record.get("attempt_count") or 0)
-                if attempts_used <= 0 and str(record.get("status_latest") or ""):
-                    attempts_used = 1
-                attempts_before = int(stage_attempt_counts[record_symbol])
-                stage_attempt_counts[record_symbol] = min(
-                    stage_attempt_cap,
-                    attempts_before + attempts_used,
-                )
-                record["stage"] = stage_name
-                record["release_round"] = int(round_no)
-                record["stage_symbol_attempt_cap"] = int(stage_attempt_cap)
-                record["stage_symbol_attempt_count_before"] = int(attempts_before)
-                record["stage_symbol_attempt_count_after"] = int(
-                    stage_attempt_counts[record_symbol]
-                )
-                record["stage_symbol_attempts_remaining"] = int(
-                    max(0, stage_attempt_cap - stage_attempt_counts[record_symbol])
-                )
-            records.extend(release_records)
-            stage_records_total.extend(release_records)
-            diagnostics["release_records"] = int(diagnostics["release_records"]) + int(len(release_records))
-
-            refreshed_substage_positions = client.list_positions()
-            _, refreshed_substage_signed_notional = _positions_to_frame_and_notional(refreshed_substage_positions)
-            refreshed_substage_signed_qty = _signed_qty_from_positions(refreshed_substage_positions)
-            refreshed_substage_account = client.get_account()
-            refreshed_substage_buying_power, refreshed_substage_buying_power_source = _buying_power(
-                refreshed_substage_account
-            )
-            refreshed_substage_equity, refreshed_substage_equity_source = _resolve_account_equity(
-                account=refreshed_substage_account,
-                signed_notional=refreshed_substage_signed_notional,
-            )
-            release_price_symbols = sorted(
-                set(stage_symbols) | set(refreshed_substage_signed_notional)
-            )
-            try:
-                release_reference_prices = _resolve_reference_prices(
-                    client=execution_quote_client or client,
-                    symbols=release_price_symbols,
-                    fallback_prices=release_reference_prices,
-                    feed=execution_price_feed,
-                    prefer_live=True,
-                    allow_fallback=execution_quote_client is None,
-                    require_fresh=execution_quote_client is not None,
-                )
-            except LongbridgeQuoteError as exc:
-                return abort_after_quote_failure(
-                    stage=f"{stage_name}_rebuild",
-                    error=exc,
-                    affected_symbols=release_price_symbols,
-                )
-            release_min_trade_notional = _effective_min_trade_notional(
-                account_equity=float(refreshed_substage_equity),
-                absolute_floor=float(min_trade_notional_floor),
-                weight_bps=float(min_trade_weight_bps),
-            )
-            rebuilt_instructions, rebuilt_skipped = _build_order_instructions(
-                target_signed_weights=release_target_signed_weights,
-                current_signed_notional=refreshed_substage_signed_notional,
-                current_signed_qty=refreshed_substage_signed_qty,
-                account_equity=float(account_equity),
-                reference_prices=release_reference_prices,
-                assets_by_symbol=assets_by_symbol,
-                min_trade_notional=float(release_min_trade_notional),
-                sizing_adverse_offset_bps=float(sizing_adverse_offset_bps),
-                qty_decimals=int(qty_decimals),
-                whole_shares_only=bool(whole_shares_only),
-                opening_shorts_whole_shares_only=bool(opening_shorts_whole_shares_only),
-                short_sales_whole_shares_only=bool(short_sales_whole_shares_only),
-                shorting_enabled=bool(shorting_enabled),
-            )
-            rebuilt_release, _ = _split_release_entry_instructions(
-                rebuilt_instructions,
-                current_signed_qty=refreshed_substage_signed_qty,
-            )
-            rebuilt_sell_long, rebuilt_buy_to_cover = _split_release_substages(rebuilt_release)
-            rebuilt_stage_instructions = (
-                rebuilt_sell_long if stage_name == "release_sell_long" else rebuilt_buy_to_cover
-            )
-            rebuilt_stage_instructions = [
-                item for item in rebuilt_stage_instructions if item.symbol in set(stage_symbols)
-            ]
-            round_filled_symbols = {
-                str(record.get("symbol") or "").upper()
+        )
+        release_remaining_instructions = [
+            item
+            for item in rebuilt_release
+            if str(item.symbol).upper() not in round_filled_symbols
+        ]
+        release_remaining_symbols = [
+            str(item.symbol).upper() for item in release_remaining_instructions
+        ]
+        release_budget_exhausted_symbols = sorted(
+            {
+                str(item.symbol).upper()
+                for item in release_remaining_instructions
+                if int(release_attempt_counts[str(item.symbol).upper()])
+                >= release_attempt_cap
+            }
+        )
+        current_release_instructions = [
+            item
+            for item in release_remaining_instructions
+            if int(release_attempt_counts[str(item.symbol).upper()])
+            < release_attempt_cap
+        ]
+        round_fully_filled = not release_remaining_instructions
+        round_action_class_counts = Counter(
+            str(record.get("release_action_class") or "")
+            for record in release_records
+        )
+        remaining_action_class_counts = Counter(
+            _release_action_class(item) for item in release_remaining_instructions
+        )
+        release_round_payload = {
+            "stage": "reduce_exposure",
+            "macro_stage": "reduce_exposure",
+            "round": int(round_no),
+            "order_count": int(len(release_records)),
+            "record_count": int(len(release_records)),
+            "action_class_counts": dict(sorted(round_action_class_counts.items())),
+            "fully_filled": bool(round_fully_filled),
+            "remaining_order_count": int(len(release_remaining_instructions)),
+            "remaining_action_class_counts": dict(
+                sorted(remaining_action_class_counts.items())
+            ),
+            "attempt_budget_eligible_order_count": int(
+                len(current_release_instructions)
+            ),
+            "remaining_symbols": list(release_remaining_symbols),
+            "rebuilt_skipped_orders": rebuilt_skipped,
+            "limit_base_offset_bps": float(round_offset_bps),
+            "marketable_limit_max_offset_bps": float(
+                marketable_limit_max_offset_bps
+            ),
+            "stage_symbol_attempt_cap": int(release_attempt_cap),
+            "stage_symbol_attempt_counts": dict(
+                sorted(release_attempt_counts.items())
+            ),
+            "stage_attempt_budget_exhausted_symbols": list(
+                release_budget_exhausted_symbols
+            ),
+            "buying_power_after_stage": float(refreshed_release_buying_power),
+            "buying_power_source": str(refreshed_release_buying_power_source),
+            "execution_batch_summary": release_batch_summary,
+        }
+        diagnostics["release_rounds"].append(release_round_payload)
+        for action_class in ("release_sell_long", "release_buy_to_cover"):
+            class_records = [
+                record
                 for record in release_records
-                if _order_record_fully_filled(record)
+                if record.get("release_action_class") == action_class
+            ]
+            class_remaining = [
+                item
+                for item in release_remaining_instructions
+                if _release_action_class(item) == action_class
+            ]
+            if not class_records and not class_remaining:
+                continue
+            class_symbols = {
+                str(item.symbol).upper()
+                for item in release_instructions
+                if release_action_class_by_symbol[str(item.symbol).upper()]
+                == action_class
             }
-            filled_instruction_suppressed_rebuild_symbols = sorted(
-                {
-                    str(item.symbol).upper()
-                    for item in rebuilt_stage_instructions
-                    if str(item.symbol).upper() in round_filled_symbols
-                }
-            )
-            rebuilt_stage_instructions = [
-                item
-                for item in rebuilt_stage_instructions
-                if str(item.symbol).upper() not in round_filled_symbols
-            ]
-            stage_remaining_symbols = [item.symbol for item in rebuilt_stage_instructions]
-            stage_budget_exhausted_symbols = sorted(
-                {
-                    str(item.symbol).upper()
-                    for item in rebuilt_stage_instructions
-                    if int(stage_attempt_counts[str(item.symbol).upper()]) >= stage_attempt_cap
-                }
-            )
-            current_stage_instructions = [
-                item
-                for item in rebuilt_stage_instructions
-                if int(stage_attempt_counts[str(item.symbol).upper()]) < stage_attempt_cap
-            ]
-            round_fully_filled = not rebuilt_stage_instructions
-            snapshots.append(
-                {
-                    "schema_version": "1.0",
-                    "snapshot_type": "release_round",
-                    "captured_at_utc": _utc_now(),
-                    "stage": stage_name,
-                    "round": int(round_no),
-                    "stage_symbols": list(stage_symbols),
-                    "session_token": f"{session_token}_{stage_token}_r{round_no:02d}",
-                    "limit_base_offset_bps": float(round_offset_bps),
-                    "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
-                    "marketable_limit_requote_steps_bps": [
-                        float(value) for value in marketable_limit_requote_steps_bps
-                    ],
-                    "marketable_limit_requote_wait_seconds": float(marketable_limit_requote_wait_seconds),
-                    "marketable_limit_max_attempts": int(marketable_limit_max_attempts),
-                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
-                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
-                    "stage_symbol_attempt_budget_before": dict(
-                        sorted(round_attempt_budget_before.items())
-                    ),
-                    "stage_attempt_budget_exhausted_symbols": list(
-                        stage_budget_exhausted_symbols
-                    ),
-                    "execution_workers": int(execution_workers),
-                    "execution_batch_summary": release_batch_summary,
-                    "input_instructions": _instruction_payloads(round_input_instructions),
-                    "submitted_records": release_records,
-                    "refreshed_positions_raw": _raw_dict_list(refreshed_substage_positions),
-                    "refreshed_signed_notional": dict(sorted(refreshed_substage_signed_notional.items())),
-                    "refreshed_signed_qty": dict(sorted(refreshed_substage_signed_qty.items())),
-                    "refreshed_account_raw": dict(refreshed_substage_account)
-                    if isinstance(refreshed_substage_account, dict)
-                    else refreshed_substage_account,
-                    "buying_power_after_stage": float(refreshed_substage_buying_power),
-                    "buying_power_source": str(refreshed_substage_buying_power_source),
-                    "account_equity_after_stage": float(refreshed_substage_equity),
-                    "account_equity_source": str(refreshed_substage_equity_source),
-                    "effective_min_trade_notional": float(release_min_trade_notional),
-                    "min_trade_weight_bps": float(min_trade_weight_bps),
-                    "reference_prices": dict(sorted(release_reference_prices.items())),
-                    "rebuilt_all_instructions": _instruction_payloads(rebuilt_instructions),
-                    "rebuilt_release_instructions": _instruction_payloads(rebuilt_release),
-                    "rebuilt_stage_instructions": _instruction_payloads(
-                        rebuilt_stage_instructions
-                    ),
-                    "round_fully_filled_symbols": sorted(round_filled_symbols),
-                    "filled_instruction_suppressed_rebuild_symbols": (
-                        filled_instruction_suppressed_rebuild_symbols
-                    ),
-                    "attempt_budget_eligible_stage_instructions": _instruction_payloads(
-                        current_stage_instructions
-                    ),
-                    "rebuilt_skipped_orders": rebuilt_skipped,
-                    "round_fully_filled_symbols": sorted(round_filled_symbols),
-                    "filled_instruction_suppressed_rebuild_symbols": (
-                        filled_instruction_suppressed_rebuild_symbols
-                    ),
-                    "remaining_order_count": int(len(rebuilt_stage_instructions)),
-                    "attempt_budget_eligible_order_count": int(
-                        len(current_stage_instructions)
-                    ),
-                    "remaining_symbols": list(stage_remaining_symbols),
-                    "fully_filled": bool(round_fully_filled),
-                }
-            )
             diagnostics["release_substages"].append(
                 {
-                    "stage": stage_name,
+                    "stage": action_class,
+                    "macro_stage": "reduce_exposure",
+                    "concurrent": True,
                     "round": int(round_no),
-                    "order_count": int(len(release_records)),
-                    "record_count": int(len(release_records)),
-                    "fully_filled": bool(round_fully_filled),
-                    "remaining_order_count": int(len(rebuilt_stage_instructions)),
-                    "attempt_budget_eligible_order_count": int(
-                        len(current_stage_instructions)
-                    ),
-                    "remaining_symbols": list(stage_remaining_symbols),
-                    "rebuilt_skipped_orders": rebuilt_skipped,
-                    "limit_base_offset_bps": float(round_offset_bps),
-                    "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
-                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
-                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
-                    "stage_attempt_budget_exhausted_symbols": list(
-                        stage_budget_exhausted_symbols
-                    ),
-                    "buying_power_after_stage": float(refreshed_substage_buying_power),
-                    "buying_power_source": str(refreshed_substage_buying_power_source),
-                    "execution_batch_summary": release_batch_summary,
+                    "order_count": int(len(class_records)),
+                    "record_count": int(len(class_records)),
+                    "fully_filled": not class_remaining,
+                    "remaining_order_count": int(len(class_remaining)),
+                    "remaining_symbols": [
+                        str(item.symbol).upper() for item in class_remaining
+                    ],
+                    "stage_symbol_attempt_counts": {
+                        symbol: int(release_attempt_counts[symbol])
+                        for symbol in sorted(class_symbols)
+                    },
+                    "shared_execution_batch": True,
                 }
             )
-            if round_fully_filled:
-                stage_fully_filled = True
-                break
-            if not current_stage_instructions:
-                break
-            if round_no < max(1, int(release_max_rounds)) and float(release_round_sleep_seconds) > 0:
-                time.sleep(float(release_round_sleep_seconds))
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "release_round",
+                "captured_at_utc": _utc_now(),
+                "stage": "reduce_exposure",
+                "macro_stage": "reduce_exposure",
+                "round": int(round_no),
+                "stage_symbols": list(release_symbols),
+                "action_class_counts": dict(sorted(round_action_class_counts.items())),
+                "session_token": f"{session_token}_rel_r{round_no:02d}",
+                "limit_base_offset_bps": float(round_offset_bps),
+                "marketable_limit_max_offset_bps": float(
+                    marketable_limit_max_offset_bps
+                ),
+                "marketable_limit_requote_steps_bps": [
+                    float(value) for value in marketable_limit_requote_steps_bps
+                ],
+                "marketable_limit_requote_wait_seconds": float(
+                    marketable_limit_requote_wait_seconds
+                ),
+                "marketable_limit_max_attempts": int(marketable_limit_max_attempts),
+                "stage_symbol_attempt_cap": int(release_attempt_cap),
+                "stage_symbol_attempt_counts": dict(
+                    sorted(release_attempt_counts.items())
+                ),
+                "stage_symbol_attempt_budget_before": dict(
+                    sorted(round_attempt_budget_before.items())
+                ),
+                "stage_attempt_budget_exhausted_symbols": list(
+                    release_budget_exhausted_symbols
+                ),
+                "execution_workers": int(execution_workers),
+                "execution_batch_summary": release_batch_summary,
+                "input_instructions": _instruction_payloads(
+                    round_input_instructions
+                ),
+                "submitted_records": release_records,
+                "refreshed_positions_raw": _raw_dict_list(
+                    refreshed_release_positions
+                ),
+                "refreshed_signed_notional": dict(
+                    sorted(refreshed_release_signed_notional.items())
+                ),
+                "refreshed_signed_qty": dict(
+                    sorted(refreshed_release_signed_qty.items())
+                ),
+                "refreshed_account_raw": dict(refreshed_release_account)
+                if isinstance(refreshed_release_account, dict)
+                else refreshed_release_account,
+                "buying_power_after_stage": float(refreshed_release_buying_power),
+                "buying_power_source": str(refreshed_release_buying_power_source),
+                "account_equity_after_stage": float(refreshed_release_equity),
+                "account_equity_source": str(refreshed_release_equity_source),
+                "effective_min_trade_notional": float(release_min_trade_notional),
+                "min_trade_weight_bps": float(min_trade_weight_bps),
+                "reference_prices": dict(sorted(release_reference_prices.items())),
+                "rebuilt_all_instructions": _instruction_payloads(
+                    rebuilt_instructions
+                ),
+                "rebuilt_release_instructions": _instruction_payloads(
+                    rebuilt_release
+                ),
+                "rebuilt_reduce_exposure_instructions": _instruction_payloads(
+                    release_remaining_instructions
+                ),
+                "rebuilt_stage_instructions": _instruction_payloads(
+                    release_remaining_instructions
+                ),
+                "round_fully_filled_symbols": sorted(round_filled_symbols),
+                "filled_instruction_suppressed_rebuild_symbols": (
+                    filled_instruction_suppressed_rebuild_symbols
+                ),
+                "attempt_budget_eligible_stage_instructions": _instruction_payloads(
+                    current_release_instructions
+                ),
+                "rebuilt_skipped_orders": rebuilt_skipped,
+                "remaining_order_count": int(len(release_remaining_instructions)),
+                "attempt_budget_eligible_order_count": int(
+                    len(current_release_instructions)
+                ),
+                "remaining_symbols": list(release_remaining_symbols),
+                "fully_filled": bool(round_fully_filled),
+            }
+        )
+        if round_fully_filled:
+            release_fully_filled = True
+            break
+        if not current_release_instructions:
+            break
+        if (
+            round_no < max(1, int(release_max_rounds))
+            and float(release_round_sleep_seconds) > 0
+        ):
+            time.sleep(float(release_round_sleep_seconds))
 
-        if not stage_fully_filled:
-            diagnostics["release_fully_filled"] = False
-            diagnostics["entry_aborted"] = True
-            diagnostics["entry_abort_reason"] = (
-                f"{stage_name}_attempt_budget_exhausted"
-                if stage_budget_exhausted_symbols
-                else f"{stage_name}_not_fully_filled_after_{int(max(1, release_max_rounds))}_rounds"
-            )
-            diagnostics["release_unfilled_stage"] = stage_name
-            diagnostics["release_unfilled_symbols"] = list(stage_remaining_symbols)
-            diagnostics["release_attempt_cap_per_symbol"] = int(stage_attempt_cap)
-            diagnostics["release_attempt_counts_by_symbol"] = dict(
-                sorted(stage_attempt_counts.items())
-            )
-            diagnostics["release_attempt_budget_exhausted_symbols"] = list(
-                stage_budget_exhausted_symbols
-            )
-            diagnostics["release_stage_records"] = int(len(stage_records_total))
-            snapshots.append(
-                {
-                    "schema_version": "1.0",
-                    "snapshot_type": "entry_abort",
-                    "captured_at_utc": _utc_now(),
-                    "stage": stage_name,
-                    "entry_abort_reason": diagnostics["entry_abort_reason"],
-                    "remaining_symbols": list(stage_remaining_symbols),
-                    "stage_symbol_attempt_cap": int(stage_attempt_cap),
-                    "stage_symbol_attempt_counts": dict(sorted(stage_attempt_counts.items())),
-                    "stage_attempt_budget_exhausted_symbols": list(
-                        stage_budget_exhausted_symbols
-                    ),
-                    "release_stage_record_count": int(len(stage_records_total)),
-                    "release_fully_filled": False,
-                }
-            )
-            return records, diagnostics
+    if not release_fully_filled:
+        release_remaining_symbols = [
+            str(item.symbol).upper() for item in release_remaining_instructions
+        ]
+        release_unfilled_action_classes = sorted(
+            {_release_action_class(item) for item in release_remaining_instructions}
+        )
+        diagnostics["release_fully_filled"] = False
+        diagnostics["entry_aborted"] = True
+        diagnostics["entry_abort_reason"] = (
+            "reduce_exposure_attempt_budget_exhausted"
+            if release_budget_exhausted_symbols
+            else "reduce_exposure_not_fully_filled_after_"
+            f"{int(max(1, release_max_rounds))}_rounds"
+        )
+        diagnostics["release_unfilled_stage"] = "reduce_exposure"
+        diagnostics["release_unfilled_action_classes"] = (
+            release_unfilled_action_classes
+        )
+        diagnostics["release_unfilled_symbols"] = list(release_remaining_symbols)
+        diagnostics["release_attempt_cap_per_symbol"] = int(release_attempt_cap)
+        diagnostics["release_attempt_counts_by_symbol"] = dict(
+            sorted(release_attempt_counts.items())
+        )
+        diagnostics["release_attempt_budget_exhausted_symbols"] = list(
+            release_budget_exhausted_symbols
+        )
+        diagnostics["release_stage_records"] = int(len(release_records_total))
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "entry_abort",
+                "captured_at_utc": _utc_now(),
+                "stage": "reduce_exposure",
+                "macro_stage": "reduce_exposure",
+                "entry_abort_reason": diagnostics["entry_abort_reason"],
+                "remaining_symbols": list(release_remaining_symbols),
+                "release_unfilled_action_classes": release_unfilled_action_classes,
+                "stage_symbol_attempt_cap": int(release_attempt_cap),
+                "stage_symbol_attempt_counts": dict(
+                    sorted(release_attempt_counts.items())
+                ),
+                "stage_attempt_budget_exhausted_symbols": list(
+                    release_budget_exhausted_symbols
+                ),
+                "release_stage_record_count": int(len(release_records_total)),
+                "release_fully_filled": False,
+            }
+        )
+        return records, diagnostics
 
     if release_instructions:
         refreshed_positions, release_position_reconciliation = (

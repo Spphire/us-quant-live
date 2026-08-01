@@ -1334,6 +1334,10 @@ class DataAggregator:
                         "side": side,
                         "qty": self._safe_timeline_float(record.get("qty")),
                         "stage": str(record.get("stage") or ""),
+                        "macro_stage": str(record.get("macro_stage") or ""),
+                        "release_action_class": str(
+                            record.get("release_action_class") or ""
+                        ),
                         "status": status,
                         "queue_wait_ms": round(queue_wait_ms, 3),
                         "attempt_count": len(attempts),
@@ -1352,7 +1356,12 @@ class DataAggregator:
         if order_items:
             by_stage: dict[str, list[dict[str, Any]]] = {}
             for item in order_items:
-                stage = str(item.get("detail", {}).get("stage") or "orders")
+                detail = item.get("detail", {})
+                stage = str(
+                    detail.get("macro_stage")
+                    or detail.get("stage")
+                    or "orders"
+                )
                 by_stage.setdefault(stage, []).append(item)
             stage_rows = sorted(
                 by_stage.items(),

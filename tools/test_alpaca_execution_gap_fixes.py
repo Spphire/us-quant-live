@@ -220,6 +220,11 @@ class _StatefulStagedFillClient:
         before = float(self.signed_qty)
         is_release_sell = "_rsl_" in client_order_id
         is_release_cover = "_rbc_" in client_order_id
+        is_unified_release = "_rel_" in client_order_id
+        if is_unified_release and before > 0.0:
+            is_release_sell = True
+        if is_unified_release and before < 0.0:
+            is_release_cover = True
         if is_release_sell:
             assert before > 0.0, (before, kwargs)
             assert side == "sell", kwargs
@@ -284,6 +289,99 @@ class _StatefulStagedFillClient:
             "equity": "10000",
             "buying_power": "19000",
             "regt_buying_power": "19000",
+        }
+
+    def get_latest_trades(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {"p": 100.0, "feed": str(feed)}
+            for symbol in symbols
+        }
+
+    def get_latest_quotes(self, *, symbols, feed):
+        return {
+            str(symbol).upper(): {
+                "bp": 100.0,
+                "ap": 100.0,
+                "feed": str(feed),
+            }
+            for symbol in symbols
+        }
+
+
+class _MultiSymbolUnifiedReleaseClient:
+    def __init__(self, submit_delay_seconds: float = 0.08) -> None:
+        self.signed_qty = {"LONG": 10.0, "SHORT": -10.0}
+        self.submit_delay_seconds = float(submit_delay_seconds)
+        self.lock = threading.Lock()
+        self.active_submits = 0
+        self.max_active_submits = 0
+        self.orders: dict[str, dict[str, object]] = {}
+
+    def submit_order(self, **kwargs):
+        client_order_id = str(kwargs.get("client_order_id") or "")
+        symbol = str(kwargs.get("symbol") or "")
+        side = str(kwargs.get("side") or "")
+        qty = float(kwargs.get("qty") or 0.0)
+        assert "_rel_" in client_order_id, client_order_id
+        with self.lock:
+            before = float(self.signed_qty[symbol])
+            if symbol == "LONG":
+                assert side == "sell" and before > 0.0, kwargs
+            else:
+                assert side == "buy" and before < 0.0, kwargs
+            self.active_submits += 1
+            self.max_active_submits = max(
+                self.max_active_submits, self.active_submits
+            )
+        try:
+            time.sleep(self.submit_delay_seconds)
+            with self.lock:
+                self.signed_qty[symbol] += qty if side == "buy" else -qty
+                if abs(self.signed_qty[symbol]) <= 1e-9:
+                    self.signed_qty[symbol] = 0.0
+                order = {
+                    "id": client_order_id,
+                    "client_order_id": client_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "type": str(kwargs.get("type") or "market"),
+                    "time_in_force": str(kwargs.get("time_in_force") or "day"),
+                    "qty": str(qty),
+                    "status": "filled",
+                    "filled_qty": str(qty),
+                    "filled_avg_price": "100",
+                    "updated_at": "2026-07-31T14:00:00Z",
+                }
+                self.orders[client_order_id] = dict(order)
+            return dict(order)
+        finally:
+            with self.lock:
+                self.active_submits -= 1
+
+    def get_order(self, order_id):
+        with self.lock:
+            return dict(self.orders[order_id])
+
+    def list_positions(self):
+        with self.lock:
+            signed_qty = dict(self.signed_qty)
+        return [
+            {
+                "symbol": symbol,
+                "side": "long" if qty > 0 else "short",
+                "qty": str(abs(qty)),
+                "market_value": str(abs(qty) * 100.0),
+                "current_price": "100",
+            }
+            for symbol, qty in signed_qty.items()
+            if abs(qty) > 1e-9
+        ]
+
+    def get_account(self):
+        return {
+            "equity": "10000",
+            "buying_power": "20000",
+            "regt_buying_power": "20000",
         }
 
     def get_latest_trades(self, *, symbols, feed):
@@ -1157,13 +1255,105 @@ def test_staged_release_attempt_budget_is_global_across_rounds():
     assert records[0]["stage_symbol_attempt_count_after"] == 4, records[0]
     assert records[0]["stage_symbol_attempts_remaining"] == 0, records[0]
     assert diagnostics["entry_aborted"] is True, diagnostics
-    assert diagnostics["entry_abort_reason"] == "release_sell_long_attempt_budget_exhausted", diagnostics
+    assert diagnostics["entry_abort_reason"] == "reduce_exposure_attempt_budget_exhausted", diagnostics
+    assert diagnostics["release_unfilled_action_classes"] == ["release_sell_long"], diagnostics
     assert diagnostics["release_attempt_counts_by_symbol"] == {"X": 4}, diagnostics
     assert diagnostics["release_attempt_budget_exhausted_symbols"] == ["X"], diagnostics
     release_snapshots = [item for item in snapshots if item.get("snapshot_type") == "release_round"]
     assert len(release_snapshots) == 1, release_snapshots
     assert release_snapshots[0]["stage_symbol_attempt_counts"] == {"X": 4}
     print("  [OK] three release rounds share one four-attempt per-symbol budget")
+
+
+def test_staged_release_sides_share_one_parallel_batch():
+    client = _MultiSymbolUnifiedReleaseClient()
+    weights = {"LONG": 0.0, "SHORT": 0.0}
+    current_qty = {"LONG": 10.0, "SHORT": -10.0}
+    current_notional = {"LONG": 1000.0, "SHORT": -1000.0}
+    assets = {
+        symbol: {
+            "symbol": symbol,
+            "tradable": True,
+            "fractionable": True,
+            "shortable": True,
+        }
+        for symbol in weights
+    }
+    instructions, skipped = _build_order_instructions(
+        target_signed_weights=weights,
+        current_signed_notional=current_notional,
+        current_signed_qty=current_qty,
+        account_equity=10000.0,
+        reference_prices={"LONG": 100.0, "SHORT": 100.0},
+        assets_by_symbol=assets,
+        min_trade_notional=1.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+    )
+    assert not skipped, skipped
+    snapshots: list[dict[str, object]] = []
+    records, diagnostics = _submit_staged_regt_orders(
+        client=client,
+        initial_instructions=instructions,
+        target_signed_weights=weights,
+        raw_target_signed_weights=weights,
+        assets_by_symbol=assets,
+        fallback_prices={"LONG": 100.0, "SHORT": 100.0},
+        session_token="unified-release",
+        execution_price_feed="iex",
+        account_equity=10000.0,
+        min_trade_notional_floor=1.0,
+        min_trade_weight_bps=0.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        buying_power_buffer=0.95,
+        gross_capacity_target_ratio=0.95,
+        short_buying_power_adverse_offset_bps=300.0,
+        release_timeout_seconds=2.0,
+        entry_timeout_seconds=2.0,
+        poll_seconds=0.01,
+        execution_order_style="market",
+        marketable_limit_base_offset_bps=0.0,
+        marketable_limit_max_offset_bps=50.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.01,
+        marketable_limit_max_attempts=2,
+        execution_workers=2,
+        release_max_rounds=2,
+        release_round_extra_bps=5.0,
+        release_round_sleep_seconds=0.0,
+        stage_snapshots=snapshots,
+        initial_current_signed_qty=current_qty,
+    )
+    assert client.max_active_submits == 2, client.max_active_submits
+    assert len(records) == 2, records
+    assert {record["stage"] for record in records} == {
+        "release_sell_long",
+        "release_buy_to_cover",
+    }, records
+    assert {record["macro_stage"] for record in records} == {
+        "reduce_exposure"
+    }, records
+    assert len({record["batch_started_at_utc"] for record in records}) == 1, records
+    assert diagnostics["release_execution_mode"] == "unified_reduce_exposure"
+    assert diagnostics["release_fully_filled"] is True, diagnostics
+    assert diagnostics["release_rounds"][0]["action_class_counts"] == {
+        "release_buy_to_cover": 1,
+        "release_sell_long": 1,
+    }, diagnostics
+    assert all(
+        item.get("concurrent") is True
+        for item in diagnostics["release_substages"]
+    ), diagnostics
+    print("  [OK] long reductions and short covers share one parallel worker pool")
 
 
 def _run_stateful_staged_case(
@@ -1342,7 +1532,7 @@ def test_staged_quote_failure_after_release_is_controlled_abort():
     assert len(records) == 1 and records[0]["status_latest"] == "filled", records
     assert diagnostics["entry_aborted"] is True, diagnostics
     assert diagnostics["entry_abort_reason"] == (
-        "release_sell_long_rebuild_quote_validation_failed_after_broker_mutation"
+        "reduce_exposure_rebuild_quote_validation_failed_after_broker_mutation"
     )
     assert diagnostics["quote_validation_failure_symbols"] == ["X"], diagnostics
     aborts = [row for row in snapshots if row.get("snapshot_type") == "entry_abort"]
@@ -1998,6 +2188,7 @@ def main() -> int:
         ("Fractional long-close precision fallback", test_fractional_long_close_retries_one_minimum_unit_lower),
         ("Per-symbol attempt budget", test_per_symbol_attempt_budget_bounds_requotes),
         ("Cross-round staged attempt budget", test_staged_release_attempt_budget_is_global_across_rounds),
+        ("Unified parallel release batch", test_staged_release_sides_share_one_parallel_batch),
         ("Staged long-to-short zero boundary", test_staged_long_to_short_stops_at_zero_before_entry),
         ("Staged short-to-long zero boundary", test_staged_short_to_long_stops_at_zero_before_entry),
         ("Staged same-side reduction", test_staged_same_side_reduction_has_no_entry_leg),

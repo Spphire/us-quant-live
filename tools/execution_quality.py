@@ -9,8 +9,8 @@ computes detailed per-order and aggregate quality metrics for later analysis:
     positive slippage always means "we paid worse than reference")
   - Tracking error: unfilled notional vs planned notional
   - Cancellation attribution (how many attempts before cancel, per stage)
-  - Per-stage breakdown (staged Reg T: release_sell_long / release_buy_to_cover /
-    entry)
+  - Per-stage/action breakdown (staged Reg T: concurrent reduce_exposure actions
+    release_sell_long / release_buy_to_cover, followed by entry)
 
 This is a READ-ONLY analyzer. It does not place, modify, or cancel any orders.
 It writes an execution_quality.json next to the records so the dashboard and
