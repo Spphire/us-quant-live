@@ -10671,6 +10671,9 @@ def _previous_completed_execute_cycle(
         return {}
     return {
         "payload": account,
+        "positions_after": _read_csv_rows(
+            previous_run_dir / "broker_positions_after.csv"
+        ),
         "captured_at_utc": previous_summary.get("account_equity_post_trade_captured_at_utc", ""),
         "run_dir": previous_run_dir.name,
     }
@@ -11317,12 +11320,25 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     )
     daily_side_pnl_attribution = build_daily_side_pnl_attribution(
         account_after_capture=current_account_after,
+        account_before_capture=_read_json(run_dir / "broker_account_before.json", {}),
         account_start_capture=cycle_start_capture,
+        previous_positions_after=cycle_start_capture.get("positions_after"),
+        current_positions_before=_read_csv_rows(
+            run_dir / "broker_positions_before.csv"
+        ),
         risk_snapshot=risk,
         account_activity_summary=account_activity_attribution_summary,
         opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
         account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
         account_end_run_dir=run_dir.name,
+        account_start_captured_at_utc=str(
+            cycle_start_capture.get("captured_at_utc") or ""
+        ),
+        account_before_captured_at_utc=str(
+            (summary if isinstance(summary, dict) else {}).get(
+                "account_equity_preflight_captured_at_utc", ""
+            )
+        ),
         account_end_captured_at_utc=str(
             (summary if isinstance(summary, dict) else {}).get(
                 "account_equity_post_trade_captured_at_utc", ""
@@ -12202,6 +12218,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "daily_side_pnl_attribution_status": daily_side_pnl_attribution.get("status"),
         "daily_side_pnl_window_semantics": daily_side_pnl_attribution.get("window_semantics"),
         "daily_account_cycle_start_equity": daily_side_pnl_attribution.get("account_cycle_start_equity"),
+        "daily_account_pre_trade_equity": daily_side_pnl_attribution.get("account_pre_trade_equity"),
         "daily_account_cycle_end_equity": daily_side_pnl_attribution.get("account_cycle_end_equity"),
         "daily_account_cycle_start_run_dir": daily_side_pnl_attribution.get("account_cycle_start_run_dir"),
         "daily_account_cycle_end_run_dir": daily_side_pnl_attribution.get("account_cycle_end_run_dir"),
@@ -12209,6 +12226,32 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "daily_account_return": daily_side_pnl_attribution.get("account_daily_return"),
         "daily_long_equity_contribution": daily_side_pnl_attribution.get("long_equity_contribution"),
         "daily_short_equity_contribution": daily_side_pnl_attribution.get("short_equity_contribution"),
+        "daily_holding_window_pnl": daily_side_pnl_attribution.get("holding_window_pnl"),
+        "daily_execution_window_pnl": daily_side_pnl_attribution.get("execution_window_pnl"),
+        "daily_execution_window_local_return": daily_side_pnl_attribution.get(
+            "execution_window_local_return"
+        ),
+        "daily_execution_window_equity_contribution": daily_side_pnl_attribution.get(
+            "execution_window_equity_contribution"
+        ),
+        "daily_holding_residual_pnl": daily_side_pnl_attribution.get(
+            "holding_residual_pnl"
+        ),
+        "daily_holding_residual_equity_contribution": daily_side_pnl_attribution.get(
+            "holding_residual_equity_contribution"
+        ),
+        "daily_component_sum_pnl": daily_side_pnl_attribution.get(
+            "component_sum_pnl"
+        ),
+        "daily_component_identity_error_pnl": daily_side_pnl_attribution.get(
+            "identity_error_pnl"
+        ),
+        "daily_position_continuity_status": daily_side_pnl_attribution.get(
+            "position_continuity_status"
+        ),
+        "daily_matched_position_count": daily_side_pnl_attribution.get(
+            "matched_position_count"
+        ),
         "daily_unattributed_residual_pnl": daily_side_pnl_attribution.get("unattributed_residual_pnl"),
         "daily_unattributed_equity_contribution": daily_side_pnl_attribution.get(
             "unattributed_equity_contribution"

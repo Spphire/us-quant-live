@@ -677,15 +677,16 @@
                 statusRunning: 'Running',
                 statusStarted: 'Started',
                 chartEquityTitle: 'Portfolio Equity (Execution Completions)',
-                chartSideReturnTitle: 'Execution-Cycle Side P&L vs Account Return',
+                chartSideReturnTitle: 'Execution-Cycle Return Decomposition',
                 chartWeightErrorTitle: 'Daily Weight Error (L1)',
                 chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
-                seriesLongReturn: 'Long contribution',
-                seriesShortReturn: 'Short contribution',
+                seriesLongReturn: 'Long holding contribution',
+                seriesShortReturn: 'Short holding contribution',
+                seriesExecutionWindowContribution: 'Execution-window contribution',
                 seriesAccountReturn: 'Account cycle return',
                 metricCycleStartEquity: 'Cycle start equity',
                 seriesNonTradeContribution: 'Fees / income contribution',
-                seriesResidualContribution: 'Unattributed residual',
+                seriesResidualContribution: 'Holding residual',
                 seriesStrategyActual: 'Strategy to actual',
                 seriesStrategyExecutable: 'Strategy to executable',
                 seriesExecutableActual: 'Executable to actual',
@@ -822,15 +823,16 @@
                 statusRunning: '运行中',
                 statusStarted: '已启动',
                 chartEquityTitle: '账户权益曲线（执行完成快照）',
-                chartSideReturnTitle: '执行周期多空收益贡献与账户收益',
+                chartSideReturnTitle: '执行周期收益拆分',
                 chartWeightErrorTitle: '每日权重误差（L1）',
                 chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
-                seriesLongReturn: '多头收益贡献',
-                seriesShortReturn: '空头收益贡献',
+                seriesLongReturn: '多头持有贡献',
+                seriesShortReturn: '空头持有贡献',
+                seriesExecutionWindowContribution: '执行窗口贡献',
                 seriesAccountReturn: '账户周期收益',
                 metricCycleStartEquity: '周期起点权益',
                 seriesNonTradeContribution: '费用与收益项贡献',
-                seriesResidualContribution: '未归因残差',
+                seriesResidualContribution: '持有段残差',
                 seriesStrategyActual: '策略到实际',
                 seriesStrategyExecutable: '策略到可执行',
                 seriesExecutableActual: '可执行到实际',
@@ -1157,18 +1159,24 @@
                     label: historyDateKey(row),
                     longContributionPct: auditMetric(row, 'daily_long_equity_contribution', 100),
                     shortContributionPct: auditMetric(row, 'daily_short_equity_contribution', 100),
-                    nonTradeContributionPct: auditMetric(row, 'daily_known_non_trade_equity_contribution', 100),
-                    residualContributionPct: auditMetric(row, 'daily_unattributed_equity_contribution', 100),
+                    executionContributionPct: auditMetric(row, 'daily_execution_window_equity_contribution', 100),
+                    residualContributionPct: auditMetric(row, 'daily_holding_residual_equity_contribution', 100),
                     accountReturnPct: auditMetric(row, 'daily_account_return', 100),
                     accountPnl: auditMetric(row, 'daily_account_pnl'),
                     accountLastEquity: auditMetric(row, 'daily_account_cycle_start_equity'),
+                    accountPreTradeEquity: auditMetric(row, 'daily_account_pre_trade_equity'),
                     longPnl: auditMetric(row, 'daily_long_pnl'),
                     shortPnl: auditMetric(row, 'daily_short_pnl'),
-                    nonTradePnl: auditMetric(row, 'daily_known_non_trade_pnl'),
-                    residualPnl: auditMetric(row, 'daily_unattributed_residual_pnl'),
+                    holdingPnl: auditMetric(row, 'daily_holding_window_pnl'),
+                    executionPnl: auditMetric(row, 'daily_execution_window_pnl'),
+                    executionLocalReturnPct: auditMetric(row, 'daily_execution_window_local_return', 100),
+                    residualPnl: auditMetric(row, 'daily_holding_residual_pnl'),
+                    identityErrorPnl: auditMetric(row, 'daily_component_identity_error_pnl'),
                     residualAbsBps: auditMetric(row, 'daily_side_pnl_residual_abs_bps'),
                     windowSemantics: String(row.daily_side_pnl_window_semantics || ''),
                     cycleStartRunDir: String(row.daily_account_cycle_start_run_dir || ''),
+                    positionContinuityStatus: String(row.daily_position_continuity_status || 'unavailable'),
+                    matchedPositionCount: auditMetric(row, 'daily_matched_position_count'),
                     status: String(row.daily_side_pnl_attribution_status || 'unavailable'),
                     runDir: row.run_dir || ''
                 }));
@@ -1756,20 +1764,20 @@
             const labels = series.map(point => point.label);
             const longValues = series.map(point => point.longContributionPct);
             const shortValues = series.map(point => point.shortContributionPct);
-            const nonTradeValues = series.map(point => point.nonTradeContributionPct);
+            const executionValues = series.map(point => point.executionContributionPct);
             const residualValues = series.map(point => point.residualContributionPct);
             const accountValues = series.map(point => point.accountReturnPct);
             const colors = {
                 long: '#60a5fa',
                 short: '#f59e0b',
-                nonTrade: '#94a3b8',
+                execution: '#a78bfa',
                 residual: '#f87171',
                 account: '#34d399'
             };
             const key = [
                 { color: colors.long, label: t('seriesLongReturn') },
                 { color: colors.short, label: t('seriesShortReturn') },
-                { color: colors.nonTrade, label: t('seriesNonTradeContribution') },
+                { color: colors.execution, label: t('seriesExecutionWindowContribution') },
                 { color: colors.residual, label: t('seriesResidualContribution') },
                 { color: colors.account, label: t('seriesAccountReturn') }
             ];
@@ -1805,7 +1813,7 @@
             const fallbackData = [
                 { color: colors.long, data: longValues },
                 { color: colors.short, data: shortValues },
-                { color: colors.nonTrade, data: nonTradeValues },
+                { color: colors.execution, data: executionValues },
                 { color: colors.residual, data: residualValues },
                 { color: colors.account, data: accountValues }
             ];
@@ -1846,10 +1854,10 @@
                         },
                         {
                             type: 'bar',
-                            label: t('seriesNonTradeContribution'),
-                            data: nonTradeValues,
-                            borderColor: colors.nonTrade,
-                            backgroundColor: 'rgba(148, 163, 184, 0.5)',
+                            label: t('seriesExecutionWindowContribution'),
+                            data: executionValues,
+                            borderColor: colors.execution,
+                            backgroundColor: 'rgba(167, 139, 250, 0.5)',
                             borderWidth: 1,
                             stack: 'pnl-components'
                         },
@@ -1900,8 +1908,10 @@
                                         `${t('seriesAccountReturn')}: ${formatOptionalCurrency(point.accountPnl)} / ${t('metricCycleStartEquity')} ${formatOptionalCurrency(point.accountLastEquity)}`,
                                         `window: ${escapeHTML(point.cycleStartRunDir || 'n/a')} -> ${escapeHTML(point.runDir || 'n/a')}`,
                                         `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} | ${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)}`,
-                                        `${t('seriesNonTradeContribution')}: ${formatOptionalCurrency(point.nonTradePnl)}`,
+                                        `${t('seriesExecutionWindowContribution')}: ${formatOptionalCurrency(point.executionPnl)} (${formatPercent(point.executionLocalReturnPct)})`,
                                         `${t('seriesResidualContribution')}: ${formatOptionalCurrency(point.residualPnl)} (${formatNumber(point.residualAbsBps)} bps)`,
+                                        `identity error: ${formatOptionalCurrency(point.identityErrorPnl)}`,
+                                        `positions: ${escapeHTML(point.positionContinuityStatus)} / matched ${formatNumber(point.matchedPositionCount)}`,
                                         `status: ${escapeHTML(point.status)}`
                                     ];
                                 }

@@ -13,6 +13,7 @@ Typically launched automatically by daily_alpaca_scheduler.py.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import mimetypes
 import os
@@ -30,9 +31,15 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 try:
-    from tools.daily_pnl_attribution import build_daily_side_pnl_attribution
+    from tools.daily_pnl_attribution import (
+        ALIGNED_SIDE_PNL_SEMANTICS,
+        build_daily_side_pnl_attribution,
+    )
 except ModuleNotFoundError:
-    from daily_pnl_attribution import build_daily_side_pnl_attribution
+    from daily_pnl_attribution import (
+        ALIGNED_SIDE_PNL_SEMANTICS,
+        build_daily_side_pnl_attribution,
+    )
 
 
 class DataAggregator:
@@ -1053,6 +1060,16 @@ class DataAggregator:
             return {}
 
     @staticmethod
+    def _read_csv_rows(path: Path) -> list[dict[str, Any]] | None:
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                return [dict(row) for row in csv.DictReader(handle)]
+        except Exception:
+            return None
+
+    @staticmethod
     def _read_json_value(path: Path, default: Any) -> Any:
         if not path.exists():
             return default
@@ -1599,6 +1616,9 @@ class DataAggregator:
             return {}
         return {
             "payload": account,
+            "positions_after": self._read_csv_rows(
+                previous_run_dir / "broker_positions_after.csv"
+            ),
             "captured_at_utc": previous_summary.get("account_equity_post_trade_captured_at_utc", ""),
             "run_dir": previous_run_dir.name,
         }
@@ -1627,7 +1647,11 @@ class DataAggregator:
         daily_attribution = self._read_json_file(
             run_dir / "audit" / "84_daily_side_pnl_attribution_summary.json"
         )
-        if not daily_attribution:
+        if (
+            not daily_attribution
+            or daily_attribution.get("side_pnl_semantics")
+            != ALIGNED_SIDE_PNL_SEMANTICS
+        ):
             current_summary = self._read_json_file(run_dir / "execution_summary.json")
             cycle_start_capture = self._previous_completed_execute_cycle(
                 run_dir,
@@ -1635,7 +1659,14 @@ class DataAggregator:
             )
             daily_attribution = build_daily_side_pnl_attribution(
                 account_after_capture=self._read_json_file(run_dir / "broker_account_after.json"),
+                account_before_capture=self._read_json_file(
+                    run_dir / "broker_account_before.json"
+                ),
                 account_start_capture=cycle_start_capture,
+                previous_positions_after=cycle_start_capture.get("positions_after"),
+                current_positions_before=self._read_csv_rows(
+                    run_dir / "broker_positions_before.csv"
+                ),
                 risk_snapshot=risk,
                 account_activity_summary=self._read_json_file(
                     run_dir / "audit" / "51_account_activity_attribution_summary.json"
@@ -1643,6 +1674,12 @@ class DataAggregator:
                 opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
                 account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
                 account_end_run_dir=run_dir.name,
+                account_start_captured_at_utc=str(
+                    cycle_start_capture.get("captured_at_utc") or ""
+                ),
+                account_before_captured_at_utc=str(
+                    current_summary.get("account_equity_preflight_captured_at_utc", "")
+                ),
                 account_end_captured_at_utc=str(
                     current_summary.get("account_equity_post_trade_captured_at_utc", "")
                 ),
@@ -1671,6 +1708,7 @@ class DataAggregator:
             ),
             "daily_side_pnl_semantics": daily_attribution.get("side_pnl_semantics", ""),
             "daily_account_cycle_start_equity": daily_attribution.get("account_cycle_start_equity"),
+            "daily_account_pre_trade_equity": daily_attribution.get("account_pre_trade_equity"),
             "daily_account_cycle_end_equity": daily_attribution.get("account_cycle_end_equity"),
             "daily_account_cycle_start_run_dir": daily_attribution.get("account_cycle_start_run_dir", ""),
             "daily_account_cycle_end_run_dir": daily_attribution.get("account_cycle_end_run_dir", ""),
@@ -1679,10 +1717,28 @@ class DataAggregator:
             "daily_account_return": daily_attribution.get("account_daily_return"),
             "daily_long_pnl": daily_attribution.get("long_pnl"),
             "daily_short_pnl": daily_attribution.get("short_pnl"),
+            "daily_holding_window_pnl": daily_attribution.get("holding_window_pnl"),
+            "daily_execution_window_pnl": daily_attribution.get("execution_window_pnl"),
+            "daily_execution_window_local_return": daily_attribution.get(
+                "execution_window_local_return"
+            ),
+            "daily_holding_residual_pnl": daily_attribution.get(
+                "holding_residual_pnl"
+            ),
+            "daily_component_sum_pnl": daily_attribution.get("component_sum_pnl"),
+            "daily_component_identity_error_pnl": daily_attribution.get(
+                "identity_error_pnl"
+            ),
             "daily_known_non_trade_pnl": daily_attribution.get("known_non_trade_pnl"),
             "daily_unattributed_residual_pnl": daily_attribution.get("unattributed_residual_pnl"),
             "daily_long_equity_contribution": daily_attribution.get("long_equity_contribution"),
             "daily_short_equity_contribution": daily_attribution.get("short_equity_contribution"),
+            "daily_execution_window_equity_contribution": daily_attribution.get(
+                "execution_window_equity_contribution"
+            ),
+            "daily_holding_residual_equity_contribution": daily_attribution.get(
+                "holding_residual_equity_contribution"
+            ),
             "daily_known_non_trade_equity_contribution": daily_attribution.get(
                 "known_non_trade_equity_contribution"
             ),
@@ -1695,6 +1751,18 @@ class DataAggregator:
             ),
             "daily_side_pnl_reconciliation_threshold_bps": daily_attribution.get(
                 "reconciliation_threshold_bps"
+            ),
+            "daily_position_continuity_status": daily_attribution.get(
+                "position_continuity_status", "unavailable"
+            ),
+            "daily_matched_position_count": daily_attribution.get(
+                "matched_position_count"
+            ),
+            "daily_previous_position_count": daily_attribution.get(
+                "previous_position_count"
+            ),
+            "daily_current_pre_trade_position_count": daily_attribution.get(
+                "current_pre_trade_position_count"
             ),
             "daily_side_opening_snapshot_available": daily_attribution.get(
                 "opening_snapshot_available", False
