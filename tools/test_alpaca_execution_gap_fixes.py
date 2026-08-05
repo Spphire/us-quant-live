@@ -1493,6 +1493,75 @@ def test_staged_same_side_reduction_has_no_entry_leg():
     print("  [OK] same-side reduction reaches its target without an entry order")
 
 
+def test_entry_rebuild_executes_new_release_residual_before_entry():
+    client = _StatefulStagedFillClient(-16.0)
+    snapshots: list[dict[str, object]] = []
+    records, diagnostics = _submit_staged_regt_orders(
+        client=client,
+        initial_instructions=[],
+        target_signed_weights={"X": -0.16},
+        raw_target_signed_weights={"X": -0.15},
+        assets_by_symbol={
+            "X": {
+                "symbol": "X",
+                "tradable": True,
+                "fractionable": True,
+                "shortable": True,
+            }
+        },
+        fallback_prices={"X": 100.0},
+        session_token="entry-residual-release",
+        execution_price_feed="iex",
+        account_equity=10000.0,
+        min_trade_notional_floor=1.0,
+        min_trade_weight_bps=0.0,
+        sizing_adverse_offset_bps=0.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        opening_shorts_whole_shares_only=True,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        buying_power_buffer=0.95,
+        gross_capacity_target_ratio=0.95,
+        short_buying_power_adverse_offset_bps=0.0,
+        release_timeout_seconds=2.0,
+        entry_timeout_seconds=2.0,
+        poll_seconds=0.01,
+        execution_order_style="market",
+        marketable_limit_base_offset_bps=0.0,
+        marketable_limit_max_offset_bps=50.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.01,
+        marketable_limit_max_attempts=2,
+        execution_workers=2,
+        release_max_rounds=2,
+        release_round_extra_bps=5.0,
+        release_round_sleep_seconds=0.0,
+        stage_snapshots=snapshots,
+        initial_current_signed_qty={"X": -16.0},
+    )
+
+    assert client.signed_qty == -15.0, client.submissions
+    assert len(client.submissions) == 1, client.submissions
+    assert client.submissions[0]["is_release"] is True, client.submissions
+    assert client.submissions[0]["side"] == "buy", client.submissions
+    assert client.submissions[0]["qty"] == 1.0, client.submissions
+    assert len(records) == 1 and records[0]["status_latest"] == "filled", records
+    assert records[0]["stage"] == "release_buy_to_cover", records
+    assert records[0]["release_origin"] == "entry_rebuild", records
+    assert diagnostics["entry_aborted"] is False, diagnostics
+    assert diagnostics["entry_rebuild_release_residual_count"] == 1, diagnostics
+    assert diagnostics["entry_rebuild_release_residual_fully_filled"] is True
+    residual_snapshots = [
+        row
+        for row in snapshots
+        if row.get("snapshot_type") == "entry_rebuild_release_residual"
+    ]
+    assert len(residual_snapshots) == 1, residual_snapshots
+    assert residual_snapshots[0]["fully_filled"] is True, residual_snapshots
+    print("  [OK] entry rebuild executes and reconciles newly exposed release residuals")
+
+
 def test_staged_filled_release_is_not_rebuilt_from_lagged_position():
     client, records, diagnostics, snapshots = _run_stateful_staged_case(
         initial_signed_qty=10.0,
@@ -2192,6 +2261,7 @@ def main() -> int:
         ("Staged long-to-short zero boundary", test_staged_long_to_short_stops_at_zero_before_entry),
         ("Staged short-to-long zero boundary", test_staged_short_to_long_stops_at_zero_before_entry),
         ("Staged same-side reduction", test_staged_same_side_reduction_has_no_entry_leg),
+        ("Entry rebuild residual release", test_entry_rebuild_executes_new_release_residual_before_entry),
         ("Staged filled release position lag", test_staged_filled_release_is_not_rebuilt_from_lagged_position),
         ("Controlled post-release quote abort", test_staged_quote_failure_after_release_is_controlled_abort),
         ("Staged entry residual repair", test_staged_entry_residual_repair_fills_weight_priority_gap),

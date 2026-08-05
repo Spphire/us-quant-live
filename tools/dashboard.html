@@ -669,6 +669,7 @@
                 metricShort: 'Short',
                 tradingDays: 'Trading Days',
                 timelineTitle: 'Task Timeline',
+                timelinePrepare: 'Prepare Alpha',
                 timelineDecision: 'Decision',
                 timelineExecute: 'Execute',
                 statusPending: 'Pending',
@@ -772,6 +773,7 @@
                 cfgFeed: 'Feed',
                 cfgExecutionMode: 'Execution Mode',
                 cfgTargetNYTime: 'Target NY Time',
+                cfgPrepareTime: 'Prepare Time (CN)',
                 cfgDecisionTime: 'Decision Time (CN)',
                 cfgExecuteTime: 'Execute Time (CN)',
                 cfgPythonVersion: 'Python Version',
@@ -815,6 +817,7 @@
                 metricShort: '空头',
                 tradingDays: '交易天数',
                 timelineTitle: '任务时间线',
+                timelinePrepare: '准备 Alpha',
                 timelineDecision: '决策',
                 timelineExecute: '执行',
                 statusPending: '待运行',
@@ -918,6 +921,7 @@
                 cfgFeed: '数据源',
                 cfgExecutionMode: '执行模式',
                 cfgTargetNYTime: '目标纽约时间',
+                cfgPrepareTime: '数据准备时间（北京）',
                 cfgDecisionTime: '决策时间（北京）',
                 cfgExecuteTime: '执行时间（北京）',
                 cfgPythonVersion: 'Python 版本',
@@ -1727,9 +1731,11 @@
         }
 
         function renderOverviewTimeline(data) {
+            const lastPrep = data.last_prepare || {};
             const lastDec = data.last_decision || {};
             const lastExe = data.last_execute || {};
 
+            const prepStatus = lastPrep.status || 'pending';
             const decStatus = lastDec.status || 'pending';
             const exeStatus = lastExe.status || 'pending';
 
@@ -1737,9 +1743,17 @@
                 <div class="panel">
                     <div class="panel-title">${t('timelineTitle')}</div>
                     <div class="timeline-row">
+                        <div class="timeline-dot ${prepStatus === 'completed' ? 'completed' : ['running', 'started'].includes(prepStatus) ? 'running' : ''}"></div>
+                        <div class="timeline-label">
+                            <div>12:30 CN ${t('timelinePrepare')}</div>
+                            <div class="timeline-sub">${t('status' + prepStatus.charAt(0).toUpperCase() + prepStatus.slice(1))}</div>
+                        </div>
+                        <span class="badge ${prepStatus === 'started' ? 'running' : prepStatus}">${t('status' + prepStatus.charAt(0).toUpperCase() + prepStatus.slice(1))}</span>
+                    </div>
+                    <div class="timeline-row">
                         <div class="timeline-dot ${decStatus === 'completed' ? 'completed' : ['running', 'started'].includes(decStatus) ? 'running' : ''}"></div>
                         <div class="timeline-label">
-                            <div>12:30 CN ${t('timelineDecision')}</div>
+                            <div>21:00 CN ${t('timelineDecision')}</div>
                             <div class="timeline-sub">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</div>
                         </div>
                         <span class="badge ${decStatus === 'started' ? 'running' : decStatus}">${t('status' + decStatus.charAt(0).toUpperCase() + decStatus.slice(1))}</span>
@@ -3014,6 +3028,7 @@
             const processPids = processHealth.pid_files || {};
             const processIssues = Array.isArray(processHealth.issues) ? processHealth.issues : [];
             const due = config.scheduler_due_latest || {};
+            const duePrepare = due.prepare || {};
             const dueDecision = due.decision || {};
             const dueExecute = due.execute || {};
             const runtime = config.scheduler_runtime_latest || {};
@@ -3026,6 +3041,7 @@
                         <div class="config-item"><span class="config-key">${t('cfgFeed')}</span><span class="config-value">${trading.feed || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">${t('cfgExecutionMode')}</span><span class="config-value">${trading.execution_mode || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">${t('cfgTargetNYTime')}</span><span class="config-value">${trading.target_ny_time || 'N/A'}</span></div>
+                        <div class="config-item"><span class="config-key">${t('cfgPrepareTime')}</span><span class="config-value">${trading.prepare_time_cn || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">${t('cfgDecisionTime')}</span><span class="config-value">${trading.decision_time_cn || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">${t('cfgExecuteTime')}</span><span class="config-value">${trading.execute_time_cn || 'N/A'}</span></div>
                     </div>
@@ -3062,8 +3078,10 @@
                         <div class="config-item"><span class="config-key">Generated CN</span><span class="config-value" style="font-size:0.75rem;">${due.generated_at_cn || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">Session</span><span class="config-value">${due.session_date || 'N/A'}</span></div>
                         <div class="config-item"><span class="config-key">Tradable</span><span class="config-value">${due.tradable ? t('yes') : t('no')}</span></div>
+                        <div class="config-item"><span class="config-key">Prepare</span><span class="config-value">${duePrepare.due ? 'due' : 'waiting'} / ${duePrepare.can_attempt ? 'eligible' : escapeHTML(duePrepare.can_attempt_reason || 'not eligible')}</span></div>
                         <div class="config-item"><span class="config-key">Decision</span><span class="config-value">${dueDecision.due ? 'due' : 'waiting'} / ${dueDecision.can_attempt ? 'eligible' : escapeHTML(dueDecision.can_attempt_reason || 'not eligible')}</span></div>
                         <div class="config-item"><span class="config-key">Execute</span><span class="config-value">${dueExecute.due ? 'due' : 'waiting'} / ${dueExecute.can_attempt ? 'eligible' : escapeHTML(dueExecute.can_attempt_reason || 'not eligible')}</span></div>
+                        <div class="config-item"><span class="config-key">Prepare Action</span><span class="config-value">${escapeHTML(duePrepare.action || '')}</span></div>
                         <div class="config-item"><span class="config-key">Decision Action</span><span class="config-value">${escapeHTML(dueDecision.action || '')}</span></div>
                         <div class="config-item"><span class="config-key">Execute Action</span><span class="config-value">${escapeHTML(dueExecute.action || '')}</span></div>
                         <div class="config-item" style="grid-column:1/-1;"><span class="config-key">Execute Target</span><span class="config-value" style="font-size:0.75rem;">${escapeHTML((due.paths || {}).decision_targets_path_resolved || '')}</span></div>

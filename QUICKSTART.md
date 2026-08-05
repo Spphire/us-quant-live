@@ -56,7 +56,10 @@ separate deploy-gap allowance so the initial portfolio can be established.
 ```powershell
 # Make sure you've filled in configs/alpaca_acounts/alpaca_accounts.local.json first!
 
-# Test decision only
+# Prepare the immutable Alpha cache (full download, no orders)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce prepare -Date 2026-06-27 -Force
+
+# Rebuild targets from cached Alpha and fresh broker positions (no orders)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce decision -Date 2026-06-27 -Force
 
 # If decision looks good, test execute (will submit real orders if config is live!)

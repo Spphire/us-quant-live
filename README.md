@@ -72,7 +72,7 @@ python tools/build_exe.py
 
 后台守护由两层组成：
 
-- `daily_alpaca_scheduler.py`：按北京时间 `12:30` 运行当日 `decision`，按北京时间 `22:00` 执行当日目标仓位。
+- `daily_alpaca_scheduler.py`：北京时间 `12:30` 下载全量输入并冻结 Alpha 缓存，`21:00` 用最新 Alpaca 持仓和长桥报价重算目标，`22:00` 校验持仓连续性后执行。
 - `watch_daily_alpaca_scheduler.ps1`：监控 scheduler 心跳、任务日志和 executor 子进程；scheduler 掉线时自动拉起。
 
 执行器将 raw alpha 多空权重统一缩放到总 RegT 容量的 `95%`，并以最终 gross 仓位不超过该目标作为硬约束；动态剩余 `buying_power` 仅用于新增订单的券商可行性保护。
@@ -101,9 +101,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\watch_daily_alpaca_s
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -Stop
 ```
 
-手动补跑当日 decision：
+手动补跑当日完整三阶段流程（最后一步会提交订单）：
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce all -Date YYYY-MM-DD -Force
+```
+
+也可以按依赖顺序分别补跑 `prepare` 和 `decision`；这两步不会提交订单：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce prepare -Date YYYY-MM-DD -Force
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_daily_alpaca_scheduler.ps1 -RunOnce decision -Date YYYY-MM-DD -Force
 ```
 

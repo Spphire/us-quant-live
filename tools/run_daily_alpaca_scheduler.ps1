@@ -3,7 +3,8 @@ param(
     [string]$ProjectRoot = "",
     [string]$AccountsJsonPath = "",
     [string]$AccountName = "ALPACA_US_FULL",
-    [string]$DecisionTimeCn = "12:30",
+    [string]$PrepareTimeCn = "12:30",
+    [string]$DecisionTimeCn = "21:00",
     [string]$ExecuteTimeCn = "22:00",
     [string]$TargetNyTime = "10:00",
     [ValidateSet("alpaca_calendar", "weekday", "always")]
@@ -13,7 +14,7 @@ param(
     [switch]$Status,
     [switch]$Stop,
     [switch]$Force,
-    [ValidateSet("", "decision", "execute", "both", "due")]
+    [ValidateSet("", "prepare", "decision", "execute", "both", "all", "due")]
     [string]$RunOnce = "",
     [string]$Date = "",
     [string[]]$ExtraArgs = @()
@@ -112,6 +113,7 @@ $schedulerArgs = @(
     "--project-root", $ProjectRoot,
     "--accounts-json-path", $AccountsJsonPath,
     "--account-name", $AccountName,
+    "--prepare-time-cn", $PrepareTimeCn,
     "--decision-time-cn", $DecisionTimeCn,
     "--execute-time-cn", $ExecuteTimeCn,
     "--target-ny-time", $TargetNyTime,
@@ -148,7 +150,7 @@ $commandText | Set-Content -LiteralPath $commandPath -Encoding UTF8
 if ($Foreground -or $RunOnce) {
     Write-Host "[AlpacaScheduler] starting daily scheduler in foreground" -ForegroundColor Cyan
     Write-Host "[AlpacaScheduler] project root: $ProjectRoot" -ForegroundColor Cyan
-    Write-Host "[AlpacaScheduler] decision CN: $DecisionTimeCn, execute CN: $ExecuteTimeCn" -ForegroundColor Cyan
+    Write-Host "[AlpacaScheduler] prepare CN: $PrepareTimeCn, decision CN: $DecisionTimeCn, execute CN: $ExecuteTimeCn" -ForegroundColor Cyan
     Push-Location $ProjectRoot
     try {
         & $Python @schedulerArgs
@@ -172,7 +174,7 @@ if ($null -ne $existing) {
 
 Write-Host "[AlpacaScheduler] starting daily scheduler in background" -ForegroundColor Cyan
 Write-Host "[AlpacaScheduler] project root: $ProjectRoot" -ForegroundColor Cyan
-Write-Host "[AlpacaScheduler] decision CN: $DecisionTimeCn, execute CN: $ExecuteTimeCn" -ForegroundColor Cyan
+Write-Host "[AlpacaScheduler] prepare CN: $PrepareTimeCn, decision CN: $DecisionTimeCn, execute CN: $ExecuteTimeCn" -ForegroundColor Cyan
 Write-Host "[AlpacaScheduler] stdout: $stdoutPath" -ForegroundColor Cyan
 Write-Host "[AlpacaScheduler] stderr: $stderrPath" -ForegroundColor Cyan
 

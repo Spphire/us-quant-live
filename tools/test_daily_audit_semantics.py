@@ -17,6 +17,7 @@ from daily_audit_report import (
     _build_account_activity_attribution,
     _build_account_state_bridge,
     _build_attribution_dossier,
+    _build_decision_execute_drift,
     _build_decision_intent_trace,
     _build_equity_pnl_bridge,
     _build_evidence_completeness,
@@ -569,6 +570,24 @@ def test_ideal_actual_weight_errors_use_signed_weights_and_post_trade_equity() -
     assert summary["weight_error_actual_denominator"] == "post_trade_account_equity"
     assert summary["weight_error_actual_denominator_amount"] == 200.0
     assert summary["strategy_to_actual_weight_error_l1"] == 0.2
+
+
+def test_decision_execute_drift_prefers_final_staged_projection() -> None:
+    rows, _ = _build_decision_execute_drift(
+        decision_plan={
+            "account_equity": 1000.0,
+            "executable_expected_signed_weights": {"AAA": 0.2},
+        },
+        execute_plan={
+            "account_equity": 1000.0,
+            "executable_expected_signed_weights": {"AAA": 0.3},
+        },
+        execute_projected_target_override={"AAA": 0.4},
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["execute_projected_target_signed_weight"] == 0.4
+    assert rows[0]["projected_target_weight_delta"] == 0.2
 
 
 def _strict_context_with_all_artifacts(tmp_path: Path) -> dict[str, object]:

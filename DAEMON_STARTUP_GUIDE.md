@@ -108,9 +108,18 @@ git check-ignore .\configs\longbridge.local.json
 
 预检不会提交、修改或取消订单。
 
-## 5. 首次 Decision 与 Paper Execute
+## 5. 首次 Prepare、Decision 与 Paper Execute
 
-选择最近一个美股交易日，只跑 Decision。它会下载完整历史输入，可能需要数分钟，但不会下单：
+选择最近一个美股交易日，先跑 Prepare。它会下载完整历史输入并冻结当日 Alpha 缓存，可能需要十余分钟，但不会下单：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\tools\run_daily_alpaca_scheduler.ps1 `
+  -Python .\venv\Scripts\python.exe `
+  -RunOnce prepare -Date YYYY-MM-DD -Force
+```
+
+再用缓存 Alpha、最新 Alpaca 持仓和长桥报价重跑 Decision，同样不会下单：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass `
@@ -121,6 +130,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 
 重点检查：
 
+- `artifacts\daily_alpaca_scheduler\YYYYMMDD_prepare\alpha_core_panel_YYYYMMDD.csv`
 - `artifacts\daily_alpaca_scheduler\YYYYMMDD_decision\decision_targets.csv`
 - `symbol_universe_intersection.json/.csv` 的最终交集和剔除原因
 - Dashboard 的 Decision Intent、Price Evidence、Min Bars 和 Quotes
@@ -144,7 +154,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 .\Start.bat
 ```
 
-它会先停止本项目已有的托盘、scheduler 和 dashboard，再启动新的托盘进程；如果 Decision/Execute 正在运行，会拒绝重启以避免中断交易。正常进程关系是：
+它会先停止本项目已有的托盘、scheduler 和 dashboard，再启动新的托盘进程；如果 Prepare/Decision/Execute 正在运行，会拒绝重启以避免中断任务。正常进程关系是：
 
 ```text
 tray_launcher.py
@@ -155,7 +165,8 @@ tray_launcher.py
 
 默认时刻：
 
-- 北京时间 `12:30`：Decision
+- 北京时间 `12:30`：Prepare 全量数据并冻结 Alpha
+- 北京时间 `21:00`：读取缓存 Alpha，按最新真实持仓重算 Decision
 - 北京时间 `22:00`：启动 Execute，并对齐纽约时间 `10:00`
 - Dashboard：`http://127.0.0.1:18076/`
 

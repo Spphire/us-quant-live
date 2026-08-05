@@ -668,6 +668,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--alpha-panel-input-path",
+        default=None,
+        help=(
+            "Optional path to a same-session AlphaCore panel CSV. When provided, "
+            "reuse the cached alpha/universe data but rerun DecisionEngine from fresh "
+            "broker positions before rebuilding executable targets."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuity-reference-path",
+        default=None,
+        help=(
+            "Optional prior broker_positions_after_raw.json used to detect unexplained "
+            "position quantity changes before decision or execution."
+        ),
+    )
+    parser.add_argument(
+        "--position-continuity-mode",
+        choices=("off", "audit", "strict"),
+        default="off",
+        help=(
+            "off disables cross-snapshot checks; audit records differences; strict "
+            "fails closed on a missing reference, unstable current quantities, or any "
+            "per-symbol quantity drift."
+        ),
+    )
+    parser.add_argument(
         "--execution-mode",
         choices=("single_pass", "staged_regt"),
         default="single_pass",
@@ -864,18 +891,78 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lambda: client.list_orders_all_pages(status="all", limit=500, direction="desc", nested=False),
             ),
         )
-        account_before = client.get_account()
-        account_before_captured_at_utc = _utc_now()
-        _write_json_file(output_root / "broker_account_before.json", account_before)
+        account_before_initial = client.get_account()
         _write_json_file(
             output_root / "broker_account_configurations_before.json",
             _safe_broker_call("get_account_configurations_before", client.get_account_configurations),
         )
+
+        positions_before_initial = client.list_positions()
+        position_account_stability_before = _collect_position_account_stability(
+            client=client,
+            initial_positions=positions_before_initial,
+            initial_account=account_before_initial,
+            sample_count=3,
+            sleep_seconds=1.0,
+        )
+        _write_json_file(output_root / "broker_position_account_stability_before.json", position_account_stability_before)
+        positions_before = list(
+            _latest_stability_payload(
+                position_account_stability_before,
+                payload_key="positions_payload",
+                fallback=positions_before_initial,
+            )
+        )
+        account_before = dict(
+            _latest_stability_payload(
+                position_account_stability_before,
+                payload_key="account_payload",
+                fallback=account_before_initial,
+            )
+        )
+        positions_before_captured_at_utc = _latest_stability_collected_at(
+            position_account_stability_before,
+            payload_key="positions_payload",
+        ) or _utc_now()
+        account_before_captured_at_utc = _latest_stability_collected_at(
+            position_account_stability_before,
+            payload_key="account_payload",
+        ) or positions_before_captured_at_utc
+        _write_json_file(output_root / "broker_positions_before_raw.json", positions_before)
+        _write_json_file(output_root / "broker_account_before.json", account_before)
         shorting_enabled = bool(account_before.get("shorting_enabled", True))
 
-        positions_before = client.list_positions()
-        positions_before_captured_at_utc = _utc_now()
-        _write_json_file(output_root / "broker_positions_before_raw.json", positions_before)
+        position_continuity_guard = _build_position_continuity_guard(
+            reference_path=(
+                Path(str(args.position_continuity_reference_path)).resolve()
+                if args.position_continuity_reference_path
+                else None
+            ),
+            current_positions=positions_before,
+            current_stability=position_account_stability_before,
+            mode=str(args.position_continuity_mode),
+            qty_decimals=int(args.qty_decimals),
+        )
+        position_continuity_guard_path = output_root / "position_continuity_guard.json"
+        _write_json_file(position_continuity_guard_path, position_continuity_guard)
+        _mark_event(
+            run_events,
+            "position_continuity_checked",
+            {
+                "status": position_continuity_guard.get("status"),
+                "mode": position_continuity_guard.get("mode"),
+                "drift_symbol_count": position_continuity_guard.get("drift_symbol_count"),
+                "current_quantity_stable": position_continuity_guard.get("current_quantity_stable"),
+                "reference_path": position_continuity_guard.get("reference_path"),
+            },
+        )
+        if position_continuity_guard.get("status") == "blocked":
+            raise RuntimeError(
+                "Position continuity guard blocked the run: "
+                f"reasons={position_continuity_guard.get('blocking_reasons')} "
+                f"symbols={position_continuity_guard.get('drift_symbols')}"
+            )
+
         if should_submit:
             day_open_snapshot_path = output_root / "broker_day_open_snapshot.json"
             day_open_snapshot_created = _write_json_file_if_absent(
@@ -899,14 +986,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "position_count": len(positions_before),
                 },
             )
-        position_account_stability_before = _collect_position_account_stability(
-            client=client,
-            initial_positions=positions_before,
-            initial_account=account_before,
-            sample_count=3,
-            sleep_seconds=1.0,
-        )
-        _write_json_file(output_root / "broker_position_account_stability_before.json", position_account_stability_before)
         broker_frame_before, broker_signed_notional_before = _positions_to_frame_and_notional(positions_before)
         broker_signed_qty_before = _signed_qty_from_positions(positions_before)
         _mark_event(
@@ -982,9 +1061,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbol_universe_json_path = output_root / "symbol_universe_intersection.json"
         symbol_universe_csv_path = output_root / "symbol_universe_intersection.csv"
         source_universe_input_path: Path | None = None
+        alpha_cache_provenance_path: Path | None = None
 
-        if args.order_plan_input_path and args.decision_targets_input_path:
-            raise ValueError("Provide only one of --order-plan-input-path or --decision-targets-input-path.")
+        strategy_inputs = [
+            value
+            for value in (
+                args.order_plan_input_path,
+                args.decision_targets_input_path,
+                args.alpha_panel_input_path,
+            )
+            if value
+        ]
+        if len(strategy_inputs) > 1:
+            raise ValueError(
+                "Provide only one of --order-plan-input-path, "
+                "--decision-targets-input-path, or --alpha-panel-input-path."
+            )
 
         if args.order_plan_input_path:
             phase_timings.skip("dynamic_symbol_pool", {"reason": "order_plan_input"})
@@ -1044,6 +1136,138 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "decision_status": decision_status,
                     "target_symbol_count": len(target_signed_weights),
+                },
+            )
+        elif args.alpha_panel_input_path:
+            phase_timings.skip("dynamic_symbol_pool", {"reason": "alpha_panel_input"})
+            phase_timings.skip("sec_industry_map", {"reason": "alpha_panel_input"})
+            phase_timings.skip("alpha_core_build", {"reason": "alpha_panel_input"})
+            phase_timings.start("portfolio_decision", {"source": "alpha_panel_input"})
+            source_path = Path(str(args.alpha_panel_input_path)).resolve()
+            source_universe_input_path = source_path
+            alpha_panel = _load_cached_alpha_panel(source_path, decision_date)
+            normalized_symbols = alpha_panel["symbol"]
+            symbols = sorted(normalized_symbols.tolist())
+            sec_cache_source = "from_alpha_panel"
+
+            decision_broker_weights = dict(broker_weights_before)
+            decision_position_mark_snapshot: dict[str, Any] = {
+                "schema_version": "1.0",
+                "generated_at_utc": _utc_now(),
+                "provider": "alpaca_position_market_value",
+                "equity": float(equity_before),
+                "signed_qty_by_symbol": dict(sorted(broker_signed_qty_before.items())),
+                "reference_prices": {},
+                "signed_notional_by_symbol": dict(sorted(broker_signed_notional_before.items())),
+                "signed_weights_by_symbol": dict(sorted(decision_broker_weights.items())),
+            }
+            held_symbols = sorted(broker_signed_qty_before)
+            if str(args.execution_quote_provider).lower() == "longbridge" and held_symbols:
+                decision_mark_client = _new_longbridge_quote_client(args)
+                try:
+                    decision_mark_health = decision_mark_client.start(held_symbols)
+                    decision_mark_prices = _resolve_reference_prices(
+                        client=decision_mark_client,
+                        symbols=held_symbols,
+                        fallback_prices={},
+                        feed=str(decision_mark_client.feed_name),
+                        prefer_live=True,
+                        allow_fallback=False,
+                        require_fresh=True,
+                    )
+                    missing_decision_marks = sorted(set(held_symbols) - set(decision_mark_prices))
+                    if missing_decision_marks:
+                        raise LongbridgeQuoteError(
+                            "Longbridge is missing fresh marks for current broker positions: "
+                            + ", ".join(missing_decision_marks)
+                        )
+                    decision_signed_notional = {
+                        symbol: float(qty) * float(decision_mark_prices[symbol])
+                        for symbol, qty in broker_signed_qty_before.items()
+                    }
+                    decision_broker_weights = _weights_from_signed_notional(
+                        decision_signed_notional,
+                        equity=equity_before,
+                    )
+                    decision_position_mark_snapshot.update(
+                        {
+                            "generated_at_utc": _utc_now(),
+                            "provider": "longbridge",
+                            "feed": str(decision_mark_client.feed_name),
+                            "provider_health": decision_mark_health,
+                            "reference_prices": dict(sorted(decision_mark_prices.items())),
+                            "signed_notional_by_symbol": dict(sorted(decision_signed_notional.items())),
+                            "signed_weights_by_symbol": dict(sorted(decision_broker_weights.items())),
+                        }
+                    )
+                finally:
+                    decision_mark_client.close()
+            _write_json_file(
+                output_root / "decision_position_mark_snapshot.json",
+                decision_position_mark_snapshot,
+            )
+
+            decision_config = DecisionConfig(
+                factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
+                candidate_pool_per_side=int(args.candidate_pool_per_side),
+                max_single_name_side_weight=float(args.max_single_name_side_weight),
+                min_nonzero_names=int(args.min_nonzero_names),
+                score_weight=float(args.score_weight),
+                sector_penalty=float(args.sector_penalty),
+                turnover_penalty=float(args.turnover_penalty),
+                turnover_budget=float(args.turnover_budget),
+                beta_band_grid=tuple(_parse_float_list(str(args.beta_band_grid))),
+            )
+            engine = DecisionEngine(decision_config)
+            decision_result = engine.decide(
+                alpha_frame=alpha_panel,
+                previous_weights=_split_signed_weights(decision_broker_weights),
+                session_idx=int(resolved_session_idx),
+                session_date=decision_date.isoformat(),
+            )
+            decision_status = str(decision_result.status)
+            decision_skip_reason = (
+                None if decision_result.skip_reason in (None, "", "null") else str(decision_result.skip_reason)
+            )
+            decision_diagnostics = dict(decision_result.diagnostics)
+            decision_diagnostics["alpha_cache_source"] = source_path.as_posix()
+            decision_diagnostics["alpha_cache_sha256"] = _sha256_file(source_path)
+            decision_diagnostics["previous_weight_mark_provider"] = decision_position_mark_snapshot.get(
+                "provider"
+            )
+
+            alpha_path = output_root / f"alpha_core_panel_{decision_date.strftime('%Y%m%d')}.csv"
+            alpha_panel.to_csv(alpha_path, index=False)
+            alpha_cache_provenance_path = output_root / "alpha_cache_provenance.json"
+            _write_json_file(
+                alpha_cache_provenance_path,
+                {
+                    "schema_version": "1.0",
+                    "generated_at_utc": _utc_now(),
+                    "source_path": source_path.as_posix(),
+                    "source_sha256": _sha256_file(source_path),
+                    "copied_path": alpha_path.as_posix(),
+                    "copied_sha256": _sha256_file(alpha_path),
+                    "session_date": decision_date.isoformat(),
+                    "row_count": len(alpha_panel),
+                    "column_count": len(alpha_panel.columns),
+                    "symbol_count": len(symbols),
+                    "position_continuity_reference_path": position_continuity_guard.get("reference_path"),
+                    "position_continuity_status": position_continuity_guard.get("status"),
+                },
+            )
+            decision_targets_path = output_root / "decision_targets.csv"
+            target_signed_weights = _signed_weights_from_decision_targets(decision_result.targets)
+            _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
+            phase_timings.finish(
+                "portfolio_decision",
+                {
+                    "decision_status": decision_status,
+                    "decision_skip_reason": decision_skip_reason,
+                    "target_symbol_count": len(target_signed_weights),
+                    "alpha_row_count": len(alpha_panel),
+                    "alpha_source_path": source_path.as_posix(),
+                    "alpha_source_sha256": _sha256_file(source_path),
                 },
             )
         else:
@@ -1348,7 +1572,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         audit_price_symbols = sorted(set(reference_price_symbols) | set(benchmark_symbols))
         configured_quote_provider = str(args.execution_quote_provider).lower()
-        execution_input_run = bool(str(args.decision_targets_input_path or "").strip())
+        execution_input_run = bool(
+            str(args.decision_targets_input_path or "").strip()
+            or str(args.order_plan_input_path or "").strip()
+            or str(args.alpha_panel_input_path or "").strip()
+        )
         active_quote_provider = (
             configured_quote_provider if should_submit or execution_input_run else "alpaca"
         )
@@ -2458,6 +2686,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "decision_date": decision_date.isoformat(),
             "session_idx": int(resolved_session_idx),
             "order_plan_input_path": plan_input_path,
+            "alpha_panel_input_path": (
+                Path(str(args.alpha_panel_input_path)).resolve().as_posix()
+                if args.alpha_panel_input_path
+                else None
+            ),
+            "position_continuity_guard": position_continuity_guard,
             "account_equity_preflight": float(equity_before),
             "account_equity_preflight_source": str(equity_before_source),
             "account_equity_preflight_captured_at_utc": account_before_captured_at_utc,
@@ -2580,6 +2814,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "python_environment_json": (output_root / "python_environment.json").as_posix(),
                 "input_file_manifest_json": (output_root / "input_file_manifest.json").as_posix(),
                 "alpha_panel_csv": alpha_path.as_posix() if alpha_path else None,
+                "alpha_cache_provenance_json": (
+                    alpha_cache_provenance_path.as_posix() if alpha_cache_provenance_path else None
+                ),
+                "position_continuity_guard_json": position_continuity_guard_path.as_posix(),
+                "decision_position_mark_snapshot_json": (
+                    (output_root / "decision_position_mark_snapshot.json").as_posix()
+                    if (output_root / "decision_position_mark_snapshot.json").exists()
+                    else None
+                ),
                 "decision_targets_csv": decision_targets_path.as_posix() if decision_targets_path else None,
                 "order_plan_json": plan_path.as_posix(),
                 "broker_account_before_json": (output_root / "broker_account_before.json").as_posix(),
@@ -5576,6 +5819,9 @@ def _submit_staged_regt_orders(
         "entry_aborted": False,
         "entry_abort_reason": None,
         "entry_records": 0,
+        "entry_rebuild_release_residual_count": 0,
+        "entry_rebuild_release_residual_records": 0,
+        "entry_rebuild_release_residual_fully_filled": True,
         "entry_repair_rounds_configured": int(max(0, entry_repair_rounds)),
         "entry_repair_rounds_completed": 0,
         "entry_repair_records": 0,
@@ -6165,9 +6411,176 @@ def _submit_staged_regt_orders(
         current_signed_qty=refreshed_signed_qty,
     )
     entry_instructions_before_cap = list(entry_instructions)
+    entry_release_residual_records: list[dict[str, Any]] = []
+    entry_release_residual_batch_summary: dict[str, Any] = {}
+    entry_release_residual_reconciliation: dict[str, Any] = {}
+    entry_buying_power_for_submission = float(buying_power)
+    entry_buying_power_source_for_submission = str(buying_power_source)
+
+    if rebuilt_release_residual:
+        residual_snapshot: dict[str, Any] = {
+            "schema_version": "1.0",
+            "snapshot_type": "entry_rebuild_release_residual",
+            "captured_at_utc": _utc_now(),
+            "stage": "reduce_exposure",
+            "macro_stage": "reduce_exposure",
+            "origin": "entry_rebuild",
+            "session_token": f"{session_token}_ent_rel",
+            "execution_workers": int(execution_workers),
+            "input_instructions": _instruction_payloads(rebuilt_release_residual),
+            "submitted_records": [],
+        }
+        snapshots.append(residual_snapshot)
+        residual_batch_started = time.monotonic()
+        entry_release_residual_records = _submit_and_track_orders(
+            client=client,
+            instructions=rebuilt_release_residual,
+            session_token=f"{session_token}_ent_rel",
+            timeout_seconds=float(release_timeout_seconds),
+            poll_seconds=poll_seconds,
+            execution_order_style=execution_order_style,
+            marketable_limit_base_offset_bps=marketable_limit_base_offset_bps,
+            marketable_limit_max_offset_bps=marketable_limit_max_offset_bps,
+            marketable_limit_requote_steps_bps=marketable_limit_requote_steps_bps,
+            marketable_limit_requote_wait_seconds=marketable_limit_requote_wait_seconds,
+            marketable_limit_max_attempts=int(marketable_limit_max_attempts),
+            max_workers=int(execution_workers),
+            execution_price_feed=str(execution_price_feed),
+            execution_quote_client=execution_quote_client,
+        )
+        entry_release_residual_batch_summary = _order_batch_summary(
+            entry_release_residual_records,
+            requested_workers=int(execution_workers),
+            elapsed_seconds=float(time.monotonic() - residual_batch_started),
+        )
+        residual_action_by_symbol = {
+            str(item.symbol).upper(): _release_action_class(item)
+            for item in rebuilt_release_residual
+        }
+        for record in entry_release_residual_records:
+            symbol = str(record.get("symbol") or "").upper()
+            record["stage"] = residual_action_by_symbol.get(
+                symbol, "reduce_exposure"
+            )
+            record["macro_stage"] = "reduce_exposure"
+            record["release_origin"] = "entry_rebuild"
+        records.extend(entry_release_residual_records)
+        residual_snapshot["submitted_records"] = entry_release_residual_records
+        residual_snapshot["submitted_record_count"] = int(
+            len(entry_release_residual_records)
+        )
+        residual_snapshot["execution_batch_summary"] = (
+            entry_release_residual_batch_summary
+        )
+
+        residual_instruction_symbols = {
+            str(item.symbol).upper() for item in rebuilt_release_residual
+        }
+        residual_filled_symbols = {
+            str(record.get("symbol") or "").upper()
+            for record in entry_release_residual_records
+            if str(record.get("symbol") or "").strip()
+            and _order_record_fully_filled(record)
+        }
+        residual_unfilled_symbols = sorted(
+            residual_instruction_symbols - residual_filled_symbols
+        )
+        diagnostics["entry_rebuild_release_residual_count"] = int(
+            len(rebuilt_release_residual)
+        )
+        diagnostics["entry_rebuild_release_residual_records"] = int(
+            len(entry_release_residual_records)
+        )
+        diagnostics["entry_rebuild_release_residual_batch_summary"] = (
+            entry_release_residual_batch_summary
+        )
+        diagnostics["entry_rebuild_release_residual_fully_filled"] = bool(
+            not residual_unfilled_symbols
+        )
+        if residual_unfilled_symbols:
+            diagnostics["entry_aborted"] = True
+            diagnostics["entry_abort_reason"] = (
+                "entry_rebuild_release_residual_not_fully_filled"
+            )
+            diagnostics["release_unfilled_symbols"] = residual_unfilled_symbols
+            residual_snapshot["fully_filled"] = False
+            residual_snapshot["remaining_symbols"] = residual_unfilled_symbols
+            snapshots.append(
+                {
+                    "schema_version": "1.0",
+                    "snapshot_type": "entry_abort",
+                    "captured_at_utc": _utc_now(),
+                    "stage": "entry_rebuild_release_residual",
+                    "entry_abort_reason": diagnostics["entry_abort_reason"],
+                    "remaining_symbols": residual_unfilled_symbols,
+                }
+            )
+            return records, diagnostics
+
+        residual_positions, entry_release_residual_reconciliation = (
+            _wait_for_release_position_reconciliation(
+                client=client,
+                release_instructions=rebuilt_release_residual,
+                qty_decimals=int(qty_decimals),
+                timeout_seconds=min(
+                    30.0, max(5.0, float(release_timeout_seconds) / 4.0)
+                ),
+                poll_seconds=float(poll_seconds),
+            )
+        )
+        diagnostics["entry_rebuild_release_residual_reconciliation"] = (
+            entry_release_residual_reconciliation
+        )
+        residual_snapshot["position_reconciliation"] = (
+            entry_release_residual_reconciliation
+        )
+        residual_snapshot["positions_raw"] = _raw_dict_list(residual_positions)
+        residual_pending_symbols = list(
+            entry_release_residual_reconciliation.get("pending_symbols") or []
+        )
+        if residual_pending_symbols:
+            diagnostics["entry_rebuild_release_residual_fully_filled"] = False
+            diagnostics["entry_aborted"] = True
+            diagnostics["entry_abort_reason"] = (
+                "entry_rebuild_release_residual_reconciliation_timeout"
+            )
+            diagnostics["release_unfilled_symbols"] = residual_pending_symbols
+            residual_snapshot["fully_filled"] = False
+            residual_snapshot["remaining_symbols"] = residual_pending_symbols
+            snapshots.append(
+                {
+                    "schema_version": "1.0",
+                    "snapshot_type": "entry_abort",
+                    "captured_at_utc": _utc_now(),
+                    "stage": "entry_rebuild_release_residual",
+                    "entry_abort_reason": diagnostics["entry_abort_reason"],
+                    "remaining_symbols": residual_pending_symbols,
+                }
+            )
+            return records, diagnostics
+
+        _, residual_signed_notional = _positions_to_frame_and_notional(
+            residual_positions
+        )
+        residual_account = client.get_account()
+        (
+            entry_buying_power_for_submission,
+            entry_buying_power_source_for_submission,
+        ) = _buying_power(residual_account)
+        residual_snapshot["fully_filled"] = True
+        residual_snapshot["buying_power_after_residual"] = float(
+            entry_buying_power_for_submission
+        )
+        residual_snapshot["buying_power_source_after_residual"] = str(
+            entry_buying_power_source_for_submission
+        )
+        residual_snapshot["signed_notional_after_residual"] = dict(
+            sorted(residual_signed_notional.items())
+        )
+
     entry_instructions, cap_diag = _scale_entry_instructions_to_buying_power(
         entry_instructions,
-        buying_power=float(buying_power),
+        buying_power=float(entry_buying_power_for_submission),
         buffer=float(buying_power_buffer),
         min_trade_notional=float(entry_min_trade_notional),
         qty_decimals=int(qty_decimals),
@@ -6191,6 +6604,12 @@ def _submit_staged_regt_orders(
             "min_trade_weight_bps": float(min_trade_weight_bps),
             "entry_rebuild_order_count": int(len(entry_instructions)),
             "entry_rebuild_skipped_orders": entry_skipped,
+            "entry_buying_power_for_submission": float(
+                entry_buying_power_for_submission
+            ),
+            "entry_buying_power_source_for_submission": str(
+                entry_buying_power_source_for_submission
+            ),
             "entry_buying_power_cap": cap_diag,
             "entry_projection": entry_projection,
         }
@@ -6228,6 +6647,13 @@ def _submit_staged_regt_orders(
         "entry_executable_target_projection": entry_projection,
         "rebuilt_all_instructions": _instruction_payloads(rebuilt_all_entry_instructions),
         "rebuilt_release_residual_instructions": _instruction_payloads(rebuilt_release_residual),
+        "release_residual_submitted_records": entry_release_residual_records,
+        "release_residual_execution_batch_summary": entry_release_residual_batch_summary,
+        "release_residual_position_reconciliation": entry_release_residual_reconciliation,
+        "entry_buying_power_for_submission": float(entry_buying_power_for_submission),
+        "entry_buying_power_source_for_submission": str(
+            entry_buying_power_source_for_submission
+        ),
         "entry_instructions_before_buying_power_cap": _instruction_payloads(entry_instructions_before_cap),
         "entry_skipped_orders": entry_skipped,
         "entry_buying_power_cap": cap_diag,
@@ -6929,6 +7355,11 @@ def _collect_position_account_stability(
         for sample in samples
         if sample.get("positions_ok")
     ]
+    position_quantity_hashes = [
+        _stable_json_digest((sample.get("positions_meta") or {}).get("signed_qty_by_symbol") or {})
+        for sample in samples
+        if sample.get("positions_ok")
+    ]
     account_hashes = [
         str((sample.get("account_meta") or {}).get("payload_sha256") or "")
         for sample in samples
@@ -6944,9 +7375,14 @@ def _collect_position_account_stability(
         "generated_at_utc": _utc_now(),
         "sample_count": int(len(samples)),
         "position_hash_count": int(len(set(position_hashes))),
+        "position_quantity_hash_count": int(len(set(position_quantity_hashes))),
         "account_hash_count": int(len(set(account_hashes))),
         "position_symbol_counts": position_counts,
         "position_symbol_count_stable": len(set(position_counts)) <= 1 if position_counts else False,
+        "position_quantity_stable": (
+            len(position_quantity_hashes) == len(samples)
+            and len(set(position_quantity_hashes)) <= 1
+        ),
         "position_payload_stable": len(set(position_hashes)) <= 1 if position_hashes else False,
         "account_payload_stable": len(set(account_hashes)) <= 1 if account_hashes else False,
         "samples": samples,
@@ -6966,6 +7402,202 @@ def _latest_stability_payload(stability: Mapping[str, Any], *, payload_key: str,
         if sample.get(ok_key) and payload not in (None, ""):
             return payload
     return fallback
+
+
+def _latest_stability_collected_at(stability: Mapping[str, Any], *, payload_key: str) -> str | None:
+    samples = stability.get("samples") if isinstance(stability, Mapping) else None
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        return None
+    for sample in reversed(samples):
+        if not isinstance(sample, Mapping):
+            continue
+        ok_key = "positions_ok" if payload_key == "positions_payload" else "account_ok"
+        if sample.get(ok_key) and sample.get(payload_key) not in (None, ""):
+            captured = str(sample.get("collected_at_utc") or "").strip()
+            return captured or None
+    return None
+
+
+def _load_position_rows(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Position snapshot must be a JSON array: {path}")
+    return [dict(item) for item in payload if isinstance(item, Mapping)]
+
+
+def _load_cached_alpha_panel(path: Path, decision_date: date) -> pd.DataFrame:
+    source_path = Path(path).resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Cached alpha panel not found: {source_path}")
+    alpha_panel = pd.read_csv(source_path)
+    if alpha_panel.empty:
+        raise ValueError(f"Cached alpha panel is empty: {source_path}")
+    if "symbol" not in alpha_panel.columns or "session_date" not in alpha_panel.columns:
+        raise ValueError(
+            "Cached alpha panel must contain symbol and session_date columns: "
+            f"{source_path}"
+        )
+    panel_session_dates = sorted(
+        {
+            str(value).strip()[:10]
+            for value in alpha_panel["session_date"].dropna().tolist()
+            if str(value).strip()
+        }
+    )
+    if panel_session_dates != [decision_date.isoformat()]:
+        raise ValueError(
+            "Cached alpha panel session_date does not match requested decision date: "
+            f"requested={decision_date.isoformat()} panel={panel_session_dates}"
+        )
+    symbol_values = alpha_panel["symbol"]
+    normalized_symbols = symbol_values.astype(str).str.strip().str.upper()
+    if (
+        symbol_values.isna().any()
+        or normalized_symbols.eq("").any()
+        or normalized_symbols.duplicated().any()
+    ):
+        raise ValueError("Cached alpha panel contains blank or duplicate symbols.")
+    normalized = alpha_panel.copy()
+    normalized["symbol"] = normalized_symbols
+    return normalized
+
+
+def _build_position_continuity_guard(
+    *,
+    reference_path: Path | None,
+    current_positions: Sequence[Mapping[str, Any]],
+    current_stability: Mapping[str, Any],
+    mode: str,
+    qty_decimals: int,
+) -> dict[str, Any]:
+    normalized_mode = str(mode or "off").strip().lower()
+    if normalized_mode not in {"off", "audit", "strict"}:
+        raise ValueError(f"Unsupported position continuity mode: {mode}")
+
+    tolerance = max(1e-8, 0.5 * (10.0 ** (-max(0, int(qty_decimals)))))
+    current_qty = _signed_qty_from_positions(current_positions)
+    sample_qty_maps: list[dict[str, float]] = []
+    samples = current_stability.get("samples") if isinstance(current_stability, Mapping) else None
+    if isinstance(samples, Sequence) and not isinstance(samples, (str, bytes)):
+        for sample in samples:
+            if not isinstance(sample, Mapping) or not sample.get("positions_ok"):
+                continue
+            payload = sample.get("positions_payload")
+            if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+                sample_qty_maps.append(
+                    {
+                        symbol: round(float(qty), max(0, int(qty_decimals)))
+                        for symbol, qty in _signed_qty_from_positions(payload).items()
+                    }
+                )
+    quantity_hashes = [_stable_json_digest(dict(sorted(item.items()))) for item in sample_qty_maps]
+    expected_sample_count = int(current_stability.get("sample_count") or 0)
+    current_quantity_stable = bool(
+        sample_qty_maps
+        and len(sample_qty_maps) == expected_sample_count
+        and len(set(quantity_hashes)) == 1
+    )
+
+    blocking_reasons: list[str] = []
+    reference_rows: list[dict[str, Any]] = []
+    reference_error: str | None = None
+    if reference_path is not None:
+        try:
+            reference_rows = _load_position_rows(reference_path)
+        except Exception as exc:
+            reference_error = f"{type(exc).__name__}: {exc}"
+    elif normalized_mode == "strict":
+        reference_error = "strict mode requires --position-continuity-reference-path"
+
+    reference_qty = _signed_qty_from_positions(reference_rows)
+    drift_rows: list[dict[str, Any]] = []
+    if reference_path is not None and reference_error is None:
+        for symbol in sorted(set(reference_qty) | set(current_qty)):
+            before_qty = float(reference_qty.get(symbol, 0.0))
+            now_qty = float(current_qty.get(symbol, 0.0))
+            delta_qty = now_qty - before_qty
+            if abs(delta_qty) <= tolerance:
+                continue
+            if abs(before_qty) <= tolerance:
+                change_type = "appeared"
+            elif abs(now_qty) <= tolerance:
+                change_type = "disappeared"
+            else:
+                change_type = "quantity_changed"
+            drift_rows.append(
+                {
+                    "symbol": symbol,
+                    "change_type": change_type,
+                    "reference_signed_qty": before_qty,
+                    "current_signed_qty": now_qty,
+                    "delta_signed_qty": delta_qty,
+                    "absolute_delta_qty": abs(delta_qty),
+                }
+            )
+
+    if normalized_mode == "strict":
+        if reference_error is not None:
+            blocking_reasons.append("reference_unavailable")
+        if not current_quantity_stable:
+            blocking_reasons.append("current_position_quantities_unstable")
+        if drift_rows:
+            blocking_reasons.append("cross_snapshot_position_quantity_drift")
+
+    if normalized_mode == "off":
+        status = "disabled"
+    elif blocking_reasons:
+        status = "blocked"
+    elif reference_path is None or reference_error is not None:
+        status = "not_applicable"
+    elif drift_rows:
+        status = "attention"
+    else:
+        status = "pass"
+
+    reference_captured_at_utc = None
+    if reference_path is not None:
+        stability_path = reference_path.parent / "broker_position_account_stability_after.json"
+        if stability_path.exists():
+            try:
+                reference_stability = json.loads(stability_path.read_text(encoding="utf-8"))
+                reference_captured_at_utc = _latest_stability_collected_at(
+                    reference_stability,
+                    payload_key="positions_payload",
+                )
+            except Exception:
+                reference_captured_at_utc = None
+
+    return {
+        "schema_version": "1.0",
+        "generated_at_utc": _utc_now(),
+        "mode": normalized_mode,
+        "status": status,
+        "blocking_reasons": blocking_reasons,
+        "qty_tolerance": tolerance,
+        "reference_path": reference_path.as_posix() if reference_path is not None else None,
+        "reference_exists": bool(reference_path is not None and reference_path.exists()),
+        "reference_error": reference_error,
+        "reference_sha256": (
+            _sha256_file(reference_path)
+            if reference_path is not None and reference_path.is_file()
+            else None
+        ),
+        "reference_captured_at_utc": reference_captured_at_utc,
+        "reference_position_count": len(reference_rows),
+        "current_position_count": len(current_positions),
+        "current_stability_sample_count": expected_sample_count,
+        "current_successful_quantity_sample_count": len(sample_qty_maps),
+        "current_quantity_hash_count": len(set(quantity_hashes)),
+        "current_quantity_stable": current_quantity_stable,
+        "drift_symbol_count": len(drift_rows),
+        "drift_symbols": [row["symbol"] for row in drift_rows],
+        "drift_rows": drift_rows,
+        "semantics": (
+            "Signed broker quantities are compared across task boundaries; market-value and "
+            "price changes are intentionally ignored. Strict mode fails closed before target "
+            "construction or order submission."
+        ),
+    }
 
 
 def _json_default(value: Any) -> Any:
@@ -7310,6 +7942,7 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
             "broker_positions_after_raw.json",
             "broker_position_account_stability_before.json",
             "broker_position_account_stability_after.json",
+            "position_continuity_guard.json",
             "broker_account_configurations_before.json",
             "broker_account_configurations_after.json",
             "broker_clock_before.json",
@@ -7728,6 +8361,7 @@ def _write_run_evidence_digest(output_root: Path) -> Path:
         "broker_positions_after_raw.json",
         "broker_position_account_stability_before.json",
         "broker_position_account_stability_after.json",
+        "position_continuity_guard.json",
         "broker_fill_activities.json",
         "broker_account_activities.json",
         "broker_order_snapshots.json",
@@ -7950,6 +8584,8 @@ def _input_file_manifest(args: argparse.Namespace, account_state_path: Path) -> 
     optional_keys = [
         "decision_targets_input_path",
         "order_plan_input_path",
+        "alpha_panel_input_path",
+        "position_continuity_reference_path",
         "sec_ticker_map_cache_path",
         "sec_companyfacts_cache_dir",
         "sec_submissions_cache_dir",
@@ -7959,8 +8595,10 @@ def _input_file_manifest(args: argparse.Namespace, account_state_path: Path) -> 
         raw = getattr(args, key, None)
         if raw:
             paths[key] = Path(str(raw)).resolve()
-    source_input = getattr(args, "decision_targets_input_path", None) or getattr(
-        args, "order_plan_input_path", None
+    source_input = (
+        getattr(args, "decision_targets_input_path", None)
+        or getattr(args, "order_plan_input_path", None)
+        or getattr(args, "alpha_panel_input_path", None)
     )
     if source_input:
         paths["decision_symbol_universe_intersection"] = (

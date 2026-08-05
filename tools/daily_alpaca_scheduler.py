@@ -68,9 +68,13 @@ def resolve_session_date(now_cn: datetime, operating_window_start: dt_time | Non
 @dataclass(frozen=True)
 class DayPaths:
     session_key: str
+    prepare_output_root: Path
     decision_output_root: Path
     execute_output_root: Path
+    alpha_panel_path: Path
     decision_targets_path: Path
+    prepare_stdout_log: Path
+    prepare_stderr_log: Path
     decision_stdout_log: Path
     decision_stderr_log: Path
     execute_stdout_log: Path
@@ -80,8 +84,9 @@ class DayPaths:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Keep an Alpaca daily workflow online: run DecisionEngine at 12:30 Beijing "
-            "and execute the same day's decision_targets.csv at 22:00 Beijing."
+            "Keep an Alpaca daily workflow online: prepare Alpha data at 12:30 Beijing, "
+            "rerun DecisionEngine from fresh broker positions at 21:00, and execute the "
+            "same day's final decision_targets.csv at 22:00."
         )
     )
     parser.add_argument("--project-root", default=str(PROJECT_ROOT))
@@ -132,14 +137,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Alpaca feed retained for intraday bar evidence and provider=alpaca.",
     )
 
-    # NOTE: decision fires at 12:30 BJ (not 12:00). BJ 12:00 == US Eastern 00:00 which
+    # NOTE: data preparation fires at 12:30 BJ (not 12:00). BJ 12:00 == US Eastern 00:00 which
     # is exactly midnight ET — the free-tier Alpaca SIP endpoint marks the previous
     # trading day's daily bar as "recent" for ~15-30 minutes past midnight and rejects
     # queries against it with HTTP 403 "subscription does not permit querying recent
     # SIP data". Empirically at 00:00:26 ET the request 403's; by 00:17 ET it succeeds.
-    # BJ 12:30 == 00:30 ET stays comfortably past the rollover, so decision runs
+    # BJ 12:30 == 00:30 ET stays comfortably past the rollover, so data preparation
     # succeed on the first attempt instead of relying on the 30-minute retry.
-    parser.add_argument("--decision-time-cn", default="12:30")
+    parser.add_argument("--prepare-time-cn", default="12:30")
+    parser.add_argument("--decision-time-cn", default="21:00")
     parser.add_argument("--execute-time-cn", default="22:00")
     parser.add_argument("--target-ny-time", default="10:00")
     parser.add_argument(
@@ -202,7 +208,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retry-failed-after-minutes", type=float, default=30.0)
     parser.add_argument("--execute-retry-failed-after-minutes", type=float, default=5.0)
     parser.add_argument("--date", default=None, help="YYYY-MM-DD session date for --run-once modes only.")
-    parser.add_argument("--run-once", choices=("decision", "execute", "both", "due"), default=None)
+    parser.add_argument(
+        "--run-once",
+        choices=("prepare", "decision", "execute", "both", "all", "due"),
+        default=None,
+    )
     parser.add_argument("--force", action="store_true", help="Run even if the task is already completed in state.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without writing state or running them.")
     return parser.parse_args(argv)
@@ -313,7 +323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(
             "[Scheduler] online. "
-            f"decision={args.decision_time_cn} CN, execute={args.execute_time_cn} CN, "
+            f"prepare={args.prepare_time_cn} CN, decision={args.decision_time_cn} CN, "
+            f"execute={args.execute_time_cn} CN, "
             f"state={args.state_path}",
             flush=True,
         )
@@ -354,7 +365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or (now_cn - last_heartbeat_at).total_seconds() >= max(args.heartbeat_minutes, 0.1) * 60
             )
             if heartbeat_due:
-                session_date = resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
+                session_date = resolve_session_date(now_cn, _parse_hhmm(args.prepare_time_cn))
                 now_us = now_cn.astimezone(US_TZ)
                 print(
                     f"[Scheduler] heartbeat {now_cn.isoformat(timespec='seconds')} "
@@ -438,12 +449,16 @@ def _run_once(
     calendar_cache: dict[str, bool],
     now_cn: datetime,
 ) -> bool:
-    session_date = date.fromisoformat(args.date) if args.date else resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
+    session_date = date.fromisoformat(args.date) if args.date else resolve_session_date(
+        now_cn, _parse_hhmm(args.prepare_time_cn)
+    )
     if not _session_is_tradable(args, session_date, calendar_cache):
         print(f"[Scheduler] skip {session_date}: not a US trading day.", flush=True)
         return True
 
     paths = _day_paths(args, session_date)
+    if args.run_once == "prepare":
+        return _run_task(args=args, state=state, session_date=session_date, task="prepare", paths=paths, now_cn=now_cn)
     if args.run_once == "decision":
         return _run_task(args=args, state=state, session_date=session_date, task="decision", paths=paths, now_cn=now_cn)
     if args.run_once == "execute":
@@ -452,6 +467,11 @@ def _run_once(
         decision_ok = _run_task(args=args, state=state, session_date=session_date, task="decision", paths=paths, now_cn=now_cn)
         execute_ok = _run_task(args=args, state=state, session_date=session_date, task="execute", paths=paths, now_cn=now_cn)
         return bool(decision_ok and execute_ok)
+    if args.run_once == "all":
+        prepare_ok = _run_task(args=args, state=state, session_date=session_date, task="prepare", paths=paths, now_cn=now_cn)
+        decision_ok = _run_task(args=args, state=state, session_date=session_date, task="decision", paths=paths, now_cn=now_cn)
+        execute_ok = _run_task(args=args, state=state, session_date=session_date, task="execute", paths=paths, now_cn=now_cn)
+        return bool(prepare_ok and decision_ok and execute_ok)
     return _run_due_tasks(args=args, state=state, calendar_cache=calendar_cache, now_cn=now_cn, session_date=session_date)
 
 
@@ -463,7 +483,7 @@ def _run_due_tasks(
     now_cn: datetime,
     session_date: date | None = None,
 ) -> bool:
-    session_date = session_date or resolve_session_date(now_cn, _parse_hhmm(args.decision_time_cn))
+    session_date = session_date or resolve_session_date(now_cn, _parse_hhmm(args.prepare_time_cn))
     trace: dict[str, Any] = _build_due_trace_base(args=args, state=state, now_cn=now_cn, session_date=session_date)
     try:
         tradable = _session_is_tradable(args, session_date, calendar_cache)
@@ -475,23 +495,36 @@ def _run_due_tasks(
         _write_due_trace(args, trace)
         raise
     if not tradable:
+        trace["prepare"] = {"due": False, "action": "skip", "reason": "not_trading_day"}
         trace["decision"] = {"due": False, "action": "skip", "reason": "not_trading_day"}
         trace["execute"] = {"due": False, "action": "skip", "reason": "not_trading_day"}
         _write_due_trace(args, trace)
         return True
 
+    prepare_time = _parse_hhmm(args.prepare_time_cn)
     decision_time = _parse_hhmm(args.decision_time_cn)
     execute_time = _parse_hhmm(args.execute_time_cn)
     paths = _day_paths(args, session_date)
     ran_ok = True
+    prepare_task_state = _task_state(state, session_date, "prepare")
     decision_task_state = _task_state(state, session_date, "decision")
     execute_task_state = _task_state(state, session_date, "execute")
     trace["paths"] = {
+        "prepare_output_root": paths.prepare_output_root.as_posix(),
         "decision_output_root": paths.decision_output_root.as_posix(),
         "execute_output_root": paths.execute_output_root.as_posix(),
+        "alpha_panel_path_default": paths.alpha_panel_path.as_posix(),
+        "alpha_panel_path_resolved": _alpha_panel_path_from_state(state, session_date, paths).as_posix(),
         "decision_targets_path_default": paths.decision_targets_path.as_posix(),
         "decision_targets_path_resolved": _decision_targets_path_from_state(state, session_date, paths).as_posix(),
     }
+    trace["prepare"] = _task_due_trace(
+        task="prepare",
+        task_state=prepare_task_state,
+        args=args,
+        now_cn=now_cn,
+        due_time=prepare_time,
+    )
     trace["decision"] = _task_due_trace(
         task="decision",
         task_state=decision_task_state,
@@ -507,12 +540,66 @@ def _run_due_tasks(
         due_time=execute_time,
     )
 
+    if now_cn.time() >= prepare_time:
+        trace["prepare"]["due"] = True
+        ran_ok = _run_task(
+            args=args,
+            state=state,
+            session_date=session_date,
+            task="prepare",
+            paths=paths,
+            now_cn=now_cn,
+        ) and ran_ok
+        trace["prepare"]["action"] = "attempted" if trace["prepare"].get("can_attempt") else "skipped"
+        trace["prepare"]["status_after"] = str(prepare_task_state.get("status") or "")
+        trace["prepare"]["attempts_after"] = int(prepare_task_state.get("attempts") or 0)
+    else:
+        trace["prepare"]["action"] = "wait"
+        trace["prepare"]["reason"] = "before_prepare_time"
+
     if now_cn.time() >= decision_time:
         trace["decision"]["due"] = True
-        ran_ok = _run_task(args=args, state=state, session_date=session_date, task="decision", paths=paths, now_cn=now_cn) and ran_ok
-        trace["decision"]["action"] = "attempted" if trace["decision"].get("can_attempt") else "skipped"
-        trace["decision"]["status_after"] = str(decision_task_state.get("status") or "")
-        trace["decision"]["attempts_after"] = int(decision_task_state.get("attempts") or 0)
+        alpha_path = _alpha_panel_path_from_state(state, session_date, paths)
+        decision_reference = _position_continuity_reference_path(
+            state, session_date, "decision", paths
+        )
+        alpha_dependency_error = (
+            None
+            if args.dry_run
+            else _prepared_alpha_dependency_error(
+                state=state,
+                session_date=session_date,
+                paths=paths,
+            )
+        )
+        trace["decision"]["alpha_panel_exists"] = bool(alpha_path.exists())
+        trace["decision"]["alpha_dependency_error"] = alpha_dependency_error
+        trace["decision"]["position_reference"] = decision_reference.as_posix()
+        trace["decision"]["position_reference_exists"] = bool(decision_reference.exists())
+        if args.dry_run or (alpha_dependency_error is None and decision_reference.exists()):
+            ran_ok = _run_task(
+                args=args,
+                state=state,
+                session_date=session_date,
+                task="decision",
+                paths=paths,
+                now_cn=now_cn,
+            ) and ran_ok
+            trace["decision"]["action"] = "attempted" if trace["decision"].get("can_attempt") else "skipped"
+            trace["decision"]["status_after"] = str(decision_task_state.get("status") or "")
+            trace["decision"]["attempts_after"] = int(decision_task_state.get("attempts") or 0)
+        else:
+            trace["decision"]["action"] = "wait"
+            trace["decision"]["reason"] = (
+                "invalid_prepare_alpha_panel"
+                if alpha_dependency_error
+                else "missing_prepare_position_reference"
+            )
+            print(
+                "[Scheduler] decision waiting for valid prepare artifacts: "
+                f"alpha_error={alpha_dependency_error!r} position_reference={decision_reference}",
+                flush=True,
+            )
     else:
         trace["decision"]["action"] = "wait"
         trace["decision"]["reason"] = "before_decision_time"
@@ -520,17 +607,27 @@ def _run_due_tasks(
     if now_cn.time() >= execute_time:
         trace["execute"]["due"] = True
         target_path = _decision_targets_path_from_state(state, session_date, paths)
+        execute_reference = _position_continuity_reference_path(
+            state, session_date, "execute", paths
+        )
         trace["execute"]["decision_targets_exists"] = bool(target_path.exists())
-        if args.dry_run or target_path.exists():
+        trace["execute"]["position_reference"] = execute_reference.as_posix()
+        trace["execute"]["position_reference_exists"] = bool(execute_reference.exists())
+        if args.dry_run or (target_path.exists() and execute_reference.exists()):
             ran_ok = _run_task(args=args, state=state, session_date=session_date, task="execute", paths=paths, now_cn=now_cn) and ran_ok
             trace["execute"]["action"] = "attempted" if trace["execute"].get("can_attempt") else "skipped"
             trace["execute"]["status_after"] = str(execute_task_state.get("status") or "")
             trace["execute"]["attempts_after"] = int(execute_task_state.get("attempts") or 0)
         else:
             trace["execute"]["action"] = "wait"
-            trace["execute"]["reason"] = "missing_decision_targets"
+            trace["execute"]["reason"] = (
+                "missing_decision_targets"
+                if not target_path.exists()
+                else "missing_position_continuity_reference"
+            )
             print(
-                f"[Scheduler] execute waiting for decision targets: {target_path}",
+                "[Scheduler] execute waiting for decision artifacts: "
+                f"targets={target_path} position_reference={execute_reference}",
                 flush=True,
             )
     else:
@@ -559,6 +656,7 @@ def _build_due_trace_base(
         "generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
         "generated_at_us": now_us.isoformat(timespec="seconds"),
         "session_date": session_date.isoformat(),
+        "prepare_time_cn": str(args.prepare_time_cn),
         "decision_time_cn": str(args.decision_time_cn),
         "execute_time_cn": str(args.execute_time_cn),
         "target_ny_time": str(args.target_ny_time),
@@ -856,6 +954,7 @@ def _build_scheduler_task_context(
         "task": str(task),
         "attempt": int(attempt_number),
         "timing": {
+            "prepare_time_cn": str(args.prepare_time_cn),
             "decision_time_cn": str(args.decision_time_cn),
             "execute_time_cn": str(args.execute_time_cn),
             "target_ny_time": str(args.target_ny_time),
@@ -869,10 +968,20 @@ def _build_scheduler_task_context(
             "project_root": Path(args.project_root).as_posix(),
             "state_path": Path(args.state_path).as_posix(),
             "output_root": output_root.as_posix(),
+            "prepare_output_root": paths.prepare_output_root.as_posix(),
             "decision_output_root": paths.decision_output_root.as_posix(),
             "execute_output_root": paths.execute_output_root.as_posix(),
+            "alpha_panel_path_default": paths.alpha_panel_path.as_posix(),
+            "alpha_panel_path_resolved": _alpha_panel_path_from_state(
+                state, session_date, paths
+            ).as_posix(),
             "decision_targets_path_default": paths.decision_targets_path.as_posix(),
             "decision_targets_path_resolved": _decision_targets_path_from_state(state, session_date, paths).as_posix(),
+            "position_continuity_reference": _position_continuity_reference_path(
+                state, session_date, task, paths
+            ).as_posix()
+            if task in {"decision", "execute"}
+            else None,
             "stdout_log": stdout_log.as_posix(),
             "stderr_log": stderr_log.as_posix(),
             "scheduler_task_context": context_path.as_posix(),
@@ -947,6 +1056,12 @@ def _build_scheduler_task_result(
         "artifacts": {
             "execution_summary": _path_status(output_root / "execution_summary.json"),
             "decision_phase_timings": _path_status(output_root / "decision_phase_timings.json"),
+            "alpha_panel": _path_status(output_root / f"alpha_core_panel_{paths.session_key}.csv"),
+            "alpha_cache_provenance": _path_status(output_root / "alpha_cache_provenance.json"),
+            "position_continuity_guard": _path_status(output_root / "position_continuity_guard.json"),
+            "decision_position_mark_snapshot": _path_status(
+                output_root / "decision_position_mark_snapshot.json"
+            ),
             "execution_quality": _path_status(output_root / "execution_quality.json"),
             "daily_audit_dir": _path_status(output_root / "audit"),
             "decision_targets": _path_status(output_root / "decision_targets.csv"),
@@ -1094,14 +1209,46 @@ def _run_task(
     paths: DayPaths,
     now_cn: datetime,
 ) -> bool:
+    if task not in {"prepare", "decision", "execute"}:
+        raise ValueError(f"Unsupported scheduler task: {task}")
     task_state = _task_state(state, session_date, task)
     if not _task_can_attempt(task_state, args, now_cn, task=task):
         return True
 
-    if task == "execute":
+    if task == "decision":
+        alpha_path = _alpha_panel_path_from_state(state, session_date, paths)
+        reference_path = _position_continuity_reference_path(
+            state, session_date, task, paths
+        )
+        dependency_error = _prepared_alpha_dependency_error(
+            state=state,
+            session_date=session_date,
+            paths=paths,
+        )
+        if not args.dry_run and dependency_error:
+            print(f"[Scheduler] decision skipped; {dependency_error}", flush=True)
+            return False
+        if not args.dry_run and not reference_path.exists():
+            print(
+                f"[Scheduler] decision skipped; missing prepare position reference: {reference_path}",
+                flush=True,
+            )
+            return False
+        if args.dry_run:
+            _ = alpha_path
+    elif task == "execute":
         target_path = _decision_targets_path_from_state(state, session_date, paths)
+        reference_path = _position_continuity_reference_path(
+            state, session_date, task, paths
+        )
         if not args.dry_run and not target_path.exists():
             print(f"[Scheduler] execute skipped; missing decision targets: {target_path}", flush=True)
+            return False
+        if not args.dry_run and not reference_path.exists():
+            print(
+                f"[Scheduler] execute skipped; missing position continuity reference: {reference_path}",
+                flush=True,
+            )
             return False
 
     command = _build_command(args, session_date, task, paths, state)
@@ -1117,8 +1264,7 @@ def _run_task(
 
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     stderr_log.parent.mkdir(parents=True, exist_ok=True)
-    paths.decision_output_root.mkdir(parents=True, exist_ok=True)
-    paths.execute_output_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     previous_attempts = int(task_state.get("attempts") or 0)
     previous_task_state = _jsonable(dict(task_state))
@@ -1192,7 +1338,14 @@ def _run_task(
 
     if returncode == 0:
         _capture_task_outputs(task_state, task, paths)
-        if task == "decision":
+        if task == "prepare":
+            alpha_path = Path(str(task_state.get("alpha_panel_path") or paths.alpha_panel_path))
+            if not alpha_path.exists():
+                task_state["status"] = "failed"
+                task_state["error"] = f"prepare completed but Alpha panel was not found: {alpha_path}"
+            else:
+                task_state["status"] = "completed"
+        elif task == "decision":
             target_path = Path(str(task_state.get("decision_targets_path") or paths.decision_targets_path))
             if not target_path.exists():
                 task_state["status"] = "failed"
@@ -1335,9 +1488,27 @@ def _build_command(
         ]
     )
 
+    if task == "prepare":
+        command.extend(
+            [
+                "--trigger-mode",
+                "plan_only",
+                "--no-submit",
+                "--output-root",
+                paths.prepare_output_root,
+            ]
+        )
+        return command
+
     if task == "decision":
         command.extend(
             [
+                "--alpha-panel-input-path",
+                _alpha_panel_path_from_state(state, session_date, paths),
+                "--position-continuity-reference-path",
+                _position_continuity_reference_path(state, session_date, task, paths),
+                "--position-continuity-mode",
+                "strict",
                 "--trigger-mode",
                 "plan_only",
                 "--no-submit",
@@ -1351,6 +1522,10 @@ def _build_command(
         [
             "--decision-targets-input-path",
             _decision_targets_path_from_state(state, session_date, paths),
+            "--position-continuity-reference-path",
+            _position_continuity_reference_path(state, session_date, task, paths),
+            "--position-continuity-mode",
+            "strict",
             "--trigger-mode",
             args.executor_trigger_mode,
             "--target-ny-time",
@@ -1472,7 +1647,15 @@ def _capture_task_outputs(task_state: dict[str, Any], task: str, paths: DayPaths
     except json.JSONDecodeError:
         return
     outputs = summary.get("outputs", {}) if isinstance(summary, dict) else {}
-    if isinstance(outputs, dict) and outputs.get("decision_targets_csv"):
+    if not isinstance(outputs, dict):
+        return
+    if task == "prepare":
+        raw_alpha_path = outputs.get("alpha_panel_csv")
+        alpha_path = Path(str(raw_alpha_path)).resolve() if raw_alpha_path else paths.alpha_panel_path
+        if alpha_path.exists():
+            task_state["alpha_panel_path"] = alpha_path.as_posix()
+            task_state["alpha_panel_sha256"] = _sha256_path(alpha_path)
+    if task != "prepare" and outputs.get("decision_targets_csv"):
         task_state["decision_targets_path"] = str(outputs["decision_targets_csv"])
 
 
@@ -1490,27 +1673,98 @@ def _decision_targets_path_from_state(state: dict[str, Any], session_date: date,
     return Path(str(raw)).resolve() if raw else paths.decision_targets_path
 
 
+def _alpha_panel_path_from_state(state: dict[str, Any], session_date: date, paths: DayPaths) -> Path:
+    sessions = state.get("sessions", {})
+    session = sessions.get(session_date.isoformat(), {}) if isinstance(sessions, dict) else {}
+    prepare = session.get("prepare", {}) if isinstance(session, dict) else {}
+    raw = prepare.get("alpha_panel_path") if isinstance(prepare, dict) else None
+    return Path(str(raw)).resolve() if raw else paths.alpha_panel_path
+
+
+def _prepared_alpha_dependency_error(
+    *,
+    state: dict[str, Any],
+    session_date: date,
+    paths: DayPaths,
+) -> str | None:
+    alpha_path = _alpha_panel_path_from_state(state, session_date, paths)
+    if not alpha_path.exists():
+        return f"missing prepared Alpha panel: {alpha_path}"
+    prepare_state = _task_state(state, session_date, "prepare")
+    expected_hash = str(prepare_state.get("alpha_panel_sha256") or "").strip()
+    if not expected_hash:
+        return "prepared Alpha panel has no immutable SHA-256 in scheduler state"
+    actual_hash = _sha256_path(alpha_path)
+    if actual_hash != expected_hash:
+        return (
+            "prepared Alpha panel hash changed: "
+            f"expected={expected_hash} actual={actual_hash} path={alpha_path}"
+        )
+    return None
+
+
+def _position_continuity_reference_path(
+    state: dict[str, Any],
+    session_date: date,
+    task: str,
+    paths: DayPaths,
+) -> Path:
+    if task == "decision":
+        return paths.prepare_output_root / "broker_positions_after_raw.json"
+    if task != "execute":
+        raise ValueError(f"Position continuity is not defined for task: {task}")
+
+    execute_state = _task_state(state, session_date, "execute")
+    prior_execute_after = paths.execute_output_root / "broker_positions_after_raw.json"
+    if int(execute_state.get("attempts") or 0) > 0 and prior_execute_after.exists():
+        return prior_execute_after
+    return paths.decision_output_root / "broker_positions_after_raw.json"
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _task_logs(task: str, paths: DayPaths) -> tuple[Path, Path]:
+    if task == "prepare":
+        return paths.prepare_stdout_log, paths.prepare_stderr_log
     if task == "decision":
         return paths.decision_stdout_log, paths.decision_stderr_log
-    return paths.execute_stdout_log, paths.execute_stderr_log
+    if task == "execute":
+        return paths.execute_stdout_log, paths.execute_stderr_log
+    raise ValueError(f"Unsupported scheduler task: {task}")
 
 
 def _task_output_root(task: str, paths: DayPaths) -> Path:
-    return paths.decision_output_root if task == "decision" else paths.execute_output_root
+    if task == "prepare":
+        return paths.prepare_output_root
+    if task == "decision":
+        return paths.decision_output_root
+    if task == "execute":
+        return paths.execute_output_root
+    raise ValueError(f"Unsupported scheduler task: {task}")
 
 
 def _day_paths(args: argparse.Namespace, session_date: date) -> DayPaths:
     session_key = session_date.strftime("%Y%m%d")
     output_root = Path(args.output_root)
     logs_root = output_root / "logs"
+    prepare_output_root = output_root / f"{session_key}_prepare"
     decision_output_root = output_root / f"{session_key}_decision"
     execute_output_root = output_root / f"{session_key}_execute"
     return DayPaths(
         session_key=session_key,
+        prepare_output_root=prepare_output_root,
         decision_output_root=decision_output_root,
         execute_output_root=execute_output_root,
+        alpha_panel_path=prepare_output_root / f"alpha_core_panel_{session_key}.csv",
         decision_targets_path=decision_output_root / "decision_targets.csv",
+        prepare_stdout_log=logs_root / f"{session_key}_prepare.out.log",
+        prepare_stderr_log=logs_root / f"{session_key}_prepare.err.log",
         decision_stdout_log=logs_root / f"{session_key}_decision.out.log",
         decision_stderr_log=logs_root / f"{session_key}_decision.err.log",
         execute_stdout_log=logs_root / f"{session_key}_execute.out.log",

@@ -3866,6 +3866,7 @@ def _build_decision_execute_drift(
     *,
     decision_plan: dict[str, Any],
     execute_plan: dict[str, Any],
+    execute_projected_target_override: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     decision_orders, decision_skipped = _planned_order_maps(decision_plan if isinstance(decision_plan, dict) else {})
     execute_orders, execute_skipped = _planned_order_maps(execute_plan if isinstance(execute_plan, dict) else {})
@@ -3886,13 +3887,17 @@ def _build_decision_execute_drift(
         if isinstance(execute_plan.get("raw_target_signed_weights"), dict)
         else {}
     )
-    execute_projected = (
-        execute_plan.get("executable_expected_signed_weights", {})
-        if isinstance(execute_plan.get("executable_expected_signed_weights"), dict)
-        else execute_plan.get("target_signed_weights", {})
-        if isinstance(execute_plan.get("target_signed_weights"), dict)
-        else {}
-    )
+    if (
+        isinstance(execute_projected_target_override, Mapping)
+        and execute_projected_target_override
+    ):
+        execute_projected = execute_projected_target_override
+    elif isinstance(execute_plan.get("executable_expected_signed_weights"), dict):
+        execute_projected = execute_plan.get("executable_expected_signed_weights", {})
+    elif isinstance(execute_plan.get("target_signed_weights"), dict):
+        execute_projected = execute_plan.get("target_signed_weights", {})
+    else:
+        execute_projected = {}
     symbols = sorted(
         set(decision_raw)
         | set(decision_projected)
@@ -10937,6 +10942,12 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     decision_execute_drift_rows, decision_execute_drift_summary = _build_decision_execute_drift(
         decision_plan=decision_plan if isinstance(decision_plan, dict) else {},
         execute_plan=plan if isinstance(plan, dict) else {},
+        execute_projected_target_override=(
+            summary.get("executable_expected_signed_weights")
+            if isinstance(summary, dict)
+            and isinstance(summary.get("executable_expected_signed_weights"), dict)
+            else None
+        ),
     )
     market_price_evidence_rows, market_price_evidence_summary = _build_market_price_evidence(
         run_dir=run_dir,

@@ -74,10 +74,11 @@ class DataAggregator:
             long_count = sum(1 for p in positions_data if p.get("side") == "long")
             short_count = sum(1 for p in positions_data if p.get("side") == "short")
 
-            # Extract the latest session's decision/execute status from the
+            # Extract the latest session's prepare/decision/execute status from the
             # scheduler's sessions-keyed state.json.
-            latest_date, decision_task, execute_task = self._latest_session_tasks(state)
+            latest_date, prepare_task, decision_task, execute_task = self._latest_session_tasks(state)
             if reset_pending and str(latest_date or "") < str(account_epoch.get("effective_session") or ""):
+                prepare_task = {}
                 decision_task = {}
                 execute_task = {}
 
@@ -92,6 +93,7 @@ class DataAggregator:
                 "positions_count": {"long": long_count, "short": short_count, "total": len(positions_data)},
                 "session_date": display_session_date,
                 "account_epoch": {**account_epoch, "reset_pending": reset_pending},
+                "last_prepare": prepare_task,
                 "last_decision": decision_task,
                 "last_execute": execute_task,
                 "audit": {
@@ -633,7 +635,8 @@ class DataAggregator:
                 "feed": "sip",
                 "execution_mode": "staged_regt",
                 "target_ny_time": "10:00",
-                "decision_time_cn": "12:30",
+                "prepare_time_cn": "12:30",
+                "decision_time_cn": "21:00",
                 "execute_time_cn": "22:00",
             },
             "system": {
@@ -1850,23 +1853,27 @@ class DataAggregator:
             return {}
         return sorted(valid_rows, key=lambda row: str(row.get("session_date") or ""))[-1]
 
-    def _latest_session_tasks(self, state: dict[str, Any]) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
-        """Extract the latest session's decision/execute task records from state.
+    def _latest_session_tasks(
+        self, state: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Extract the latest session's prepare/decision/execute records from state.
 
         state.json format:
-            {"version": 1, "sessions": {"2026-06-29": {"decision": {...}, "execute": {...}}}}
-        Returns (latest_session_date, decision_task, execute_task). Missing pieces
-        come back as empty dicts.
+            {"version": 1, "sessions": {"2026-06-29": {"prepare": {...},
+            "decision": {...}, "execute": {...}}}}
+        Returns (latest_session_date, prepare_task, decision_task, execute_task).
+        Missing pieces come back as empty dicts.
         """
         sessions = state.get("sessions", {})
         if not isinstance(sessions, dict) or not sessions:
-            return None, {}, {}
+            return None, {}, {}, {}
         # Session keys are ISO dates (YYYY-MM-DD); lexicographic sort == chronological
         latest_date = max(sessions.keys())
         session = sessions.get(latest_date, {}) or {}
+        prepare = session.get("prepare", {}) or {}
         decision = session.get("decision", {}) or {}
         execute = session.get("execute", {}) or {}
-        return latest_date, decision, execute
+        return latest_date, prepare, decision, execute
 
     def _read_account_state(self) -> dict[str, Any]:
         """Read the executor account lifecycle state."""

@@ -20,24 +20,33 @@ def main() -> int:
     )
     paths = DayPaths(
         session_key="20260728",
+        prepare_output_root=Path("prepare"),
         decision_output_root=Path("decision"),
         execute_output_root=Path("execute"),
+        alpha_panel_path=Path("prepare/alpha_core_panel_20260728.csv"),
         decision_targets_path=Path("decision/decision_targets.csv"),
+        prepare_stdout_log=Path("prepare.out.log"),
+        prepare_stderr_log=Path("prepare.err.log"),
         decision_stdout_log=Path("decision.out.log"),
         decision_stderr_log=Path("decision.err.log"),
         execute_stdout_log=Path("execute.out.log"),
         execute_stderr_log=Path("execute.err.log"),
     )
-    command = [
-        str(value)
-        for value in _build_command(
-            args,
-            date(2026, 7, 28),
-            "execute",
-            paths,
-            {},
-        )
-    ]
+    state: dict = {}
+    commands = {
+        task: [
+            str(value)
+            for value in _build_command(
+                args,
+                date(2026, 7, 28),
+                task,
+                paths,
+                state,
+            )
+        ]
+        for task in ("prepare", "decision", "execute")
+    }
+    command = commands["execute"]
     expected_values = {
         "--execution-quote-provider": "longbridge",
         "--longbridge-max-quote-age-seconds": "10",
@@ -50,9 +59,33 @@ def main() -> int:
         actual = command[command.index(flag) + 1]
         assert actual == expected, (flag, actual, expected)
 
+    prepare = commands["prepare"]
+    assert "--alpha-panel-input-path" not in prepare, prepare
+    assert prepare[prepare.index("--trigger-mode") + 1] == "plan_only", prepare
+    assert "--no-submit" in prepare, prepare
+    assert prepare[prepare.index("--output-root") + 1] == "prepare", prepare
+
+    decision = commands["decision"]
+    assert decision[decision.index("--alpha-panel-input-path") + 1].endswith(
+        "prepare\\alpha_core_panel_20260728.csv"
+    ), decision
+    assert decision[decision.index("--position-continuity-reference-path") + 1].endswith(
+        "prepare\\broker_positions_after_raw.json"
+    ), decision
+    assert decision[decision.index("--position-continuity-mode") + 1] == "strict", decision
+    assert "--no-submit" in decision, decision
+
+    assert command[command.index("--decision-targets-input-path") + 1].endswith(
+        "decision\\decision_targets.csv"
+    ), command
+    assert command[command.index("--position-continuity-reference-path") + 1].endswith(
+        "decision\\broker_positions_after_raw.json"
+    ), command
+    assert command[command.index("--position-continuity-mode") + 1] == "strict", command
+
     print(
-        "[PASS] scheduler command carries Longbridge freshness and "
-        "entry-repair defaults"
+        "[PASS] scheduler commands carry three-stage dependencies, continuity "
+        "guards, Longbridge freshness, and entry-repair defaults"
     )
     return 0
 

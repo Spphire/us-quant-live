@@ -206,7 +206,7 @@ function Get-ActiveTaskState {
     foreach ($sessionProp in $state.sessions.PSObject.Properties) {
         $sessionDate = [string]$sessionProp.Name
         $session = $sessionProp.Value
-        foreach ($taskName in @("decision", "execute")) {
+        foreach ($taskName in @("prepare", "decision", "execute")) {
             if ($session.PSObject.Properties.Name -notcontains $taskName) {
                 continue
             }
