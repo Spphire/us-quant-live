@@ -282,7 +282,7 @@ def test_unified_release_macro_stage_is_one_timeline_bar() -> None:
             if item.get("detail", {}).get("stage") == "reduce_exposure"
         ]
         assert len(reduce_items) == 1, stage_track
-        assert reduce_items[0]["label"] == "Reduce Exposure", reduce_items[0]
+        assert reduce_items[0]["label"] == "Main release (parallel)", reduce_items[0]
         assert reduce_items[0]["detail"]["order_count"] == 2, reduce_items[0]
         release_orders = [
             item
@@ -295,6 +295,127 @@ def test_unified_release_macro_stage_is_one_timeline_bar() -> None:
             "release_sell_long",
             "release_buy_to_cover",
         }, release_orders
+
+
+def test_recalculation_and_residual_release_are_explicit_stages() -> None:
+    with TemporaryDirectory() as tmp:
+        artifacts_root, aggregator = _build_fixture(Path(tmp))
+        run = artifacts_root / "20260729_execute"
+        _write_json(
+            run / "execution_records.json",
+            [
+                {
+                    "symbol": "MAIN-RELEASE",
+                    "side": "sell",
+                    "qty": 3.0,
+                    "stage": "release_sell_long",
+                    "macro_stage": "reduce_exposure",
+                    "release_action_class": "release_sell_long",
+                    "status_latest": "filled",
+                    "batch_started_at_utc": "2026-07-29T14:00:01.100+00:00",
+                    "queue_wait_ms": 0.0,
+                    "order_wall_time_seconds": 0.6,
+                    "attempts": [],
+                },
+                {
+                    "symbol": "RESIDUAL",
+                    "side": "sell",
+                    "qty": 0.25,
+                    "stage": "release_sell_long",
+                    "macro_stage": "reduce_exposure",
+                    "release_action_class": "release_sell_long",
+                    "release_origin": "entry_rebuild",
+                    "status_latest": "filled",
+                    "batch_started_at_utc": "2026-07-29T14:00:03+00:00",
+                    "queue_wait_ms": 0.0,
+                    "order_wall_time_seconds": 0.5,
+                    "attempts": [],
+                },
+                {
+                    "symbol": "ENTRY",
+                    "side": "buy",
+                    "qty": 2.0,
+                    "stage": "entry",
+                    "status_latest": "filled",
+                    "batch_started_at_utc": "2026-07-29T14:00:04+00:00",
+                    "queue_wait_ms": 0.0,
+                    "order_wall_time_seconds": 1.0,
+                    "attempts": [],
+                },
+            ],
+        )
+        _write_json(
+            run / "staged_rebuild_snapshots.json",
+            {
+                "schema_version": "1.0",
+                "snapshots": [
+                    {
+                        "snapshot_type": "release_position_reconciliation",
+                        "captured_at_utc": "2026-07-29T14:00:02+00:00",
+                    },
+                    {
+                        "snapshot_type": "entry_rebuild_release_residual",
+                        "captured_at_utc": "2026-07-29T14:00:03+00:00",
+                    },
+                    {
+                        "snapshot_type": "entry_rebuild",
+                        "captured_at_utc": "2026-07-29T14:00:04+00:00",
+                    },
+                ],
+            },
+        )
+
+        payload = aggregator.get_execution_timeline("20260729_execute")
+        stage_track = next(
+            track for track in payload["tracks"] if track["id"] == "execution-stages"
+        )
+        stages = {
+            item["detail"]["stage"]: item
+            for item in stage_track["items"]
+        }
+        assert stages["reduce_exposure"]["label"] == "Main release (parallel)", stages
+        assert stages["release_position_reconciliation"]["label"] == (
+            "Reconcile released positions"
+        ), stages
+        assert stages["entry_rebuild_projection"]["label"] == (
+            "Recalculate executable target"
+        ), stages
+        assert stages["entry_rebuild_release_residual"]["label"] == (
+            "Recalculated residual release"
+        ), stages
+        assert stages["entry_rebuild_residual_reconciliation"]["label"] == (
+            "Reconcile residual / finalize target"
+        ), stages
+        assert stages["entry"]["label"] == "Entry", stages
+        assert stages["entry_rebuild_projection"]["start_seconds"] == 1.0, stages
+        assert stages["entry_rebuild_projection"]["end_seconds"] == 2.0, stages
+        assert stages["entry_rebuild_release_residual"]["start_seconds"] == 2.0, stages
+        assert stages["entry_rebuild_release_residual"]["end_seconds"] == 2.5, stages
+
+        residual_order = next(
+            item
+            for track in payload["tracks"]
+            if track["kind"] == "order"
+            for item in track["items"]
+            if item["label"] == "RESIDUAL"
+        )
+        assert residual_order["detail"]["release_origin"] == "entry_rebuild"
+
+
+def test_frontend_lists_full_stage_labels_outside_scaled_bars() -> None:
+    html = (Path(__file__).resolve().parent / "dashboard.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'class="execution-stage-index"' in html
+    assert "executionStageTrack?.items" in html
+    for label in (
+        "Main release (parallel)",
+        "Reconcile released positions",
+        "Recalculate executable target",
+        "Recalculated residual release",
+        "Reconcile residual / finalize target",
+    ):
+        assert label in html, label
 
 
 def test_api_window_classification_and_redaction() -> None:
@@ -350,6 +471,14 @@ def main() -> int:
         ("Latest execution-only run", test_latest_run_and_execution_only_scope),
         ("Order attempts and concurrency", test_order_attempts_concurrency_and_summary),
         ("Unified release macro stage", test_unified_release_macro_stage_is_one_timeline_bar),
+        (
+            "Explicit recalculation and residual release stages",
+            test_recalculation_and_residual_release_are_explicit_stages,
+        ),
+        (
+            "Full stage labels outside scaled bars",
+            test_frontend_lists_full_stage_labels_outside_scaled_bars,
+        ),
         ("API window and redaction", test_api_window_classification_and_redaction),
         ("Bounded run selection", test_selected_run_and_invalid_name_are_bounded),
     ]

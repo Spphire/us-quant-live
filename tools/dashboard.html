@@ -488,6 +488,28 @@
             color: #f4f7fb; font-size: 1.02rem; font-weight: 650;
             line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
+        .execution-stage-index {
+            display: flex; flex-wrap: wrap; align-items: center;
+            gap: 0.55rem 1.05rem; padding: 0.1rem 0.15rem 0.85rem;
+            margin-bottom: 1rem; border-bottom: 1px solid #26314f;
+        }
+        .execution-stage-index-item {
+            display: grid; grid-template-columns: 9px minmax(0, auto) auto;
+            align-items: center; gap: 0.38rem; min-width: 0;
+            color: #c4cada; font-size: 0.72rem; line-height: 1.35;
+        }
+        .execution-stage-index-swatch {
+            width: 9px; height: 9px; border-radius: 2px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .execution-stage-index-swatch.preparation { background: #3269a8; }
+        .execution-stage-index-swatch.trading { background: #16805d; }
+        .execution-stage-index-swatch.reconcile { background: #596579; }
+        .execution-stage-index-swatch.optimizer { background: #a76b18; }
+        .execution-stage-index-swatch.repair { background: #b07519; }
+        .execution-stage-index-duration {
+            color: #7f899f; font-variant-numeric: tabular-nums; white-space: nowrap;
+        }
         .execution-timeline-shell {
             position: relative; border: 1px solid #26314f; border-radius: 6px;
             overflow: hidden; background: #090d1d;
@@ -603,6 +625,7 @@
             .execution-toolbar { align-items: flex-start; }
             .execution-toolbar-spacer { display: none; }
             .execution-toolbar select { min-width: 150px; max-width: 190px; }
+            .execution-stage-index { gap: 0.45rem 0.8rem; }
             .execution-timeline-scroll { max-height: 560px; }
             .execution-track-label, .execution-group-label, .execution-ruler-label { padding-left: 7px; padding-right: 7px; }
         }
@@ -2649,11 +2672,17 @@
                 'Post Run Audit And Finalize': '执行后审计与收尾',
                 'Prepare submission': '下单准备',
                 'Reconcile / reproject': '对账与重新投影',
+                'Main release (parallel)': '主释放（多空并行）',
+                'Reconcile released positions': '释放后持仓对账',
+                'Recalculate executable target': '重算可执行目标',
+                'Recalculated residual release': '重算后残差释放',
+                'Reconcile residual / finalize target': '残差对账与目标定稿',
                 'Finalize trading': '交易收尾',
                 'Release Sell Long': '卖出多头减仓',
                 'Release Buy To Cover': '买入平空减仓',
                 'Entry': '加仓入场',
                 'Entry Repair': '入场修补',
+                'entry_rebuild': '入场重算',
                 'Submit order': '提交订单',
                 'Cancel order': '取消订单',
                 'Poll order': '查询订单',
@@ -2685,6 +2714,9 @@
             return ({
                 'start': '开始', 'end': '结束', 'duration': '耗时', 'status': '状态',
                 'symbol': '标的', 'side': '方向', 'qty': '数量', 'stage': '阶段',
+                'release origin': '释放来源',
+                'release sell long count': '多头减仓单数',
+                'release buy to cover count': '空头回补单数',
                 'queue wait ms': '排队等待', 'attempt count': '尝试次数',
                 'batch wave index': '批次波次', 'batch effective workers': '批次并发数',
                 'batch worker safety cap': '并发安全上限',
@@ -2819,6 +2851,14 @@
                 [t('executionOrderConcurrency'), formatNumber(summary.max_order_concurrency || 0)],
                 [t('executionApiCalls'), formatNumber(summary.api_call_count || 0)],
             ];
+            const executionStageTrack = (data.tracks || []).find(track => track.id === 'execution-stages');
+            const executionStageIndex = (executionStageTrack?.items || []).map(item => `
+                <div class="execution-stage-index-item" title="${escapeHTML(executionTimelineName(item.label))}">
+                    <span class="execution-stage-index-swatch ${escapeHTML(item.color_key || 'preparation')}"></span>
+                    <span>${escapeHTML(executionTimelineName(item.label))}</span>
+                    <span class="execution-stage-index-duration">${escapeHTML(formatTimelineSeconds(item.duration_seconds, true))}</span>
+                </div>
+            `).join('');
             container.innerHTML = `
                 <div class="panel">
                     <div class="panel-title">${t('executionTimelineTitle')}</div>
@@ -2832,6 +2872,7 @@
                         <label><input type="checkbox" ${executionTimelineState.showMilestones ? 'checked' : ''} onchange="toggleExecutionTimelineTrack('milestones', this.checked)"> ${t('executionMilestones')}</label>
                     </div>
                     <div class="execution-summary">${summaryItems.map(([label, value]) => `<div class="execution-summary-item"><div class="execution-summary-label">${escapeHTML(label)}</div><div class="execution-summary-value">${escapeHTML(value)}</div></div>`).join('')}</div>
+                    <div class="execution-stage-index">${executionStageIndex}</div>
                     <div class="execution-timeline-shell">
                         <div class="execution-timeline-scroll scroll-style">
                             <div class="execution-timeline-grid" style="--timeline-label-width:${labelWidth}px;--timeline-width:${timelineWidth}px;--timeline-tick-width:${tickWidth}px">

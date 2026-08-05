@@ -1192,6 +1192,14 @@ class DataAggregator:
         records = records_value if isinstance(records_value, list) else []
         events = self._read_json_lines(run_dir / "run_events.jsonl", max_rows=5000)
         api_rows = self._read_json_lines(run_dir / "alpaca_api_audit.jsonl", max_rows=50000)
+        staged_value = self._read_json_file(
+            run_dir / "staged_rebuild_snapshots.json"
+        )
+        staged_snapshots = (
+            staged_value.get("snapshots", [])
+            if isinstance(staged_value.get("snapshots"), list)
+            else []
+        )
 
         run_start_epoch = self._parse_timeline_timestamp(timing.get("run_started_at_utc"))
         if run_start_epoch is None:
@@ -1240,6 +1248,21 @@ class DataAggregator:
         total_seconds = max(0.0, trading_phase_end_run - trading_phase_start_run)
         trading_phase_start = 0.0
         trading_phase_end = total_seconds
+        staged_snapshot_seconds: dict[str, list[float]] = {}
+        for snapshot in staged_snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            snapshot_type = str(snapshot.get("snapshot_type") or "")
+            snapshot_epoch = self._parse_timeline_timestamp(
+                snapshot.get("captured_at_utc")
+            )
+            if not snapshot_type or snapshot_epoch is None:
+                continue
+            relative = max(
+                0.0,
+                min(total_seconds, snapshot_epoch - timeline_start_epoch),
+            )
+            staged_snapshot_seconds.setdefault(snapshot_type, []).append(relative)
 
         for index, phase in enumerate(timing.get("phases", [])):
             if not isinstance(phase, dict):
@@ -1358,6 +1381,7 @@ class DataAggregator:
                         "release_action_class": str(
                             record.get("release_action_class") or ""
                         ),
+                        "release_origin": str(record.get("release_origin") or ""),
                         "status": status,
                         "queue_wait_ms": round(queue_wait_ms, 3),
                         "attempt_count": len(attempts),
@@ -1382,6 +1406,11 @@ class DataAggregator:
                     or detail.get("stage")
                     or "orders"
                 )
+                if (
+                    stage == "reduce_exposure"
+                    and detail.get("release_origin") == "entry_rebuild"
+                ):
+                    stage = "entry_rebuild_release_residual"
                 by_stage.setdefault(stage, []).append(item)
             stage_rows = sorted(
                 by_stage.items(),
@@ -1402,36 +1431,134 @@ class DataAggregator:
                         "detail": {"stage": "prepare_submission"},
                     }
                 )
-            previous_end = first_order_start
-            for stage_index, (stage, items) in enumerate(stage_rows):
-                start = min(float(item["start_seconds"]) for item in items)
-                end = max(float(item["end_seconds"]) for item in items)
-                if start > previous_end + 0.05:
-                    stage_items.append(
-                        {
-                            "id": f"stage-gap-{stage_index + 1}",
-                            "label": "Reconcile / reproject",
-                            "start_seconds": round(previous_end, 6),
-                            "end_seconds": round(start, 6),
-                            "duration_seconds": round(start - previous_end, 6),
-                            "status": "completed",
-                            "color_key": "reconcile",
-                            "detail": {"stage": "inter_stage_gap"},
-                        }
-                    )
+
+            def append_stage_gap(
+                *,
+                item_id: str,
+                label: str,
+                start: float,
+                end: float,
+                stage: str,
+                color_key: str = "reconcile",
+            ) -> None:
+                if end <= start + 0.05:
+                    return
                 stage_items.append(
                     {
-                        "id": f"stage-{stage_index + 1}",
-                        "label": stage.replace("_", " ").title(),
+                        "id": item_id,
+                        "label": label,
                         "start_seconds": round(start, 6),
                         "end_seconds": round(end, 6),
                         "duration_seconds": round(end - start, 6),
                         "status": "completed",
-                        "color_key": "repair" if "repair" in stage else "trading",
-                        "detail": {"stage": stage, "order_count": len(items)},
+                        "color_key": color_key,
+                        "detail": {"stage": stage},
+                    }
+                )
+
+            stage_labels = {
+                "reduce_exposure": "Main release (parallel)",
+                "entry_rebuild_release_residual": "Recalculated residual release",
+                "entry": "Entry",
+                "entry_repair": "Entry repair",
+            }
+            previous_end = first_order_start
+            previous_stage = ""
+            for stage_index, (stage, items) in enumerate(stage_rows):
+                start = min(float(item["start_seconds"]) for item in items)
+                end = max(float(item["end_seconds"]) for item in items)
+                if start > previous_end + 0.05:
+                    if previous_stage == "reduce_exposure" and stage in {
+                        "entry_rebuild_release_residual",
+                        "entry",
+                    }:
+                        reconciliation_boundaries = [
+                            value
+                            for value in staged_snapshot_seconds.get(
+                                "release_position_reconciliation", []
+                            )
+                            if previous_end < value < start
+                        ]
+                        reconciliation_end = (
+                            reconciliation_boundaries[-1]
+                            if reconciliation_boundaries
+                            else previous_end
+                        )
+                        append_stage_gap(
+                            item_id=f"stage-gap-{stage_index + 1}-release-reconcile",
+                            label="Reconcile released positions",
+                            start=previous_end,
+                            end=reconciliation_end,
+                            stage="release_position_reconciliation",
+                        )
+                        append_stage_gap(
+                            item_id=f"stage-gap-{stage_index + 1}-recalculate",
+                            label="Recalculate executable target",
+                            start=max(previous_end, reconciliation_end),
+                            end=start,
+                            stage="entry_rebuild_projection",
+                            color_key="optimizer",
+                        )
+                    elif (
+                        previous_stage == "entry_rebuild_release_residual"
+                        and stage == "entry"
+                    ):
+                        append_stage_gap(
+                            item_id=f"stage-gap-{stage_index + 1}-residual-reconcile",
+                            label="Reconcile residual / finalize target",
+                            start=previous_end,
+                            end=start,
+                            stage="entry_rebuild_residual_reconciliation",
+                        )
+                    else:
+                        append_stage_gap(
+                            item_id=f"stage-gap-{stage_index + 1}",
+                            label="Reconcile / reproject",
+                            start=previous_end,
+                            end=start,
+                            stage="inter_stage_gap",
+                        )
+                action_counts: dict[str, int] = {}
+                for item in items:
+                    action_class = str(
+                        item.get("detail", {}).get("release_action_class") or ""
+                    )
+                    if action_class:
+                        action_counts[action_class] = (
+                            action_counts.get(action_class, 0) + 1
+                        )
+                stage_detail: dict[str, Any] = {
+                    "stage": stage,
+                    "order_count": len(items),
+                }
+                if action_counts:
+                    stage_detail["release_sell_long_count"] = action_counts.get(
+                        "release_sell_long", 0
+                    )
+                    stage_detail["release_buy_to_cover_count"] = action_counts.get(
+                        "release_buy_to_cover", 0
+                    )
+                stage_items.append(
+                    {
+                        "id": f"stage-{stage_index + 1}",
+                        "label": stage_labels.get(
+                            stage, stage.replace("_", " ").title()
+                        ),
+                        "start_seconds": round(start, 6),
+                        "end_seconds": round(end, 6),
+                        "duration_seconds": round(end - start, 6),
+                        "status": "completed",
+                        "color_key": (
+                            "repair"
+                            if stage == "entry_rebuild_release_residual"
+                            or "repair" in stage
+                            else "trading"
+                        ),
+                        "detail": stage_detail,
                     }
                 )
                 previous_end = max(previous_end, end)
+                previous_stage = stage
             if trading_phase_end is not None and trading_phase_end > last_order_end + 0.05:
                 stage_items.append(
                     {
