@@ -97,6 +97,7 @@ def test_reset_boundary_before_new_run() -> None:
         assert overview["session_date"] == "2026-07-23", overview
         assert overview["account_epoch"]["capital_epoch"] == 2, overview
         assert overview["account_epoch"]["reset_pending"] is True, overview
+        assert overview["last_prepare"] == {}, overview
         assert overview["last_decision"] == {}, overview
         assert overview["last_execute"] == {}, overview
         assert aggregator.get_positions() == []
@@ -169,11 +170,35 @@ def test_emergency_flatten_supersedes_stale_execute_positions() -> None:
         assert rows and rows[0]["capital_epoch"] == 2, history
 
 
+def test_overview_exposes_three_stage_scheduler_status() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        artifacts_root, aggregator = _build_fixture(root)
+        _write_json(
+            artifacts_root / "state.json",
+            {
+                "sessions": {
+                    "2026-07-23": {
+                        "prepare": {"status": "completed", "attempts": 1},
+                        "decision": {"status": "started", "attempts": 1},
+                        "execute": {"status": "failed", "attempts": 2},
+                    }
+                }
+            },
+        )
+        overview = aggregator.get_overview()
+        assert overview["session_date"] == "2026-07-23", overview
+        assert overview["last_prepare"]["status"] == "completed", overview
+        assert overview["last_decision"]["status"] == "started", overview
+        assert overview["last_execute"]["status"] == "failed", overview
+
+
 def main() -> int:
     tests = [
         ("Reset boundary before first run", test_reset_boundary_before_new_run),
         ("First new-account run", test_first_new_account_run_supersedes_reset_baseline),
         ("Emergency flatten supersedes stale execute", test_emergency_flatten_supersedes_stale_execute_positions),
+        ("Three-stage scheduler status", test_overview_exposes_three_stage_scheduler_status),
     ]
     for name, test in tests:
         print(f"[TEST] {name}")

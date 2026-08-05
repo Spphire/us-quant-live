@@ -2,8 +2,8 @@
 Unit tests for trading-day / session-date resolution in daily_alpaca_scheduler.
 
 These lock in the timezone contract:
-1. Decision (12:00 BJ) and Execute (22:00 BJ) MUST resolve to the SAME session_date
-   (so execute can find the decision-targets file decision wrote).
+1. Prepare (12:30 BJ), Decision (21:00 BJ), and Execute (22:00 BJ) MUST resolve
+   to the SAME session_date so each stage can find the prior stage's artifacts.
 2. session_date must refer to the correct US-Eastern trading session in both
    summer (DST) and winter (standard time).
 3. Early-morning manual runs (Beijing 00:00-11:59) must roll back to the US date,
@@ -23,13 +23,17 @@ def _bj(s: str) -> datetime:
 
 
 def test_decision_execute_consistency():
-    """Decision and execute must give identical session_date (default 12:00/22:00)."""
-    cutoff = dt_time(12, 0)
+    """Prepare, decision, and execute must use one scheduler session date."""
+    cutoff = dt_time(12, 30)
     for day, season in [("2026-06-27", "summer/DST"), ("2026-12-15", "winter/standard")]:
-        dec = resolve_session_date(_bj(f"{day} 12:00"), cutoff)
+        prep = resolve_session_date(_bj(f"{day} 12:30"), cutoff)
+        dec = resolve_session_date(_bj(f"{day} 21:00"), cutoff)
         exe = resolve_session_date(_bj(f"{day} 22:00"), cutoff)
-        assert dec == exe, f"{season}: decision={dec} != execute={exe} (file name mismatch!)"
-        print(f"  [OK] {season}: decision==execute=={dec}")
+        assert prep == dec == exe, (
+            f"{season}: prepare={prep}, decision={dec}, execute={exe} "
+            "(artifact session mismatch!)"
+        )
+        print(f"  [OK] {season}: prepare==decision==execute=={dec}")
 
 
 def test_configurable_decision_time_consistency():
@@ -90,6 +94,16 @@ def test_noon_boundary():
     print(f"  [OK] 12:00 -> {at_noon}, 11:59 -> {before_noon}")
 
 
+def test_scheduler_prepare_boundary():
+    """The configured 12:30 prepare boundary starts the new operating cycle."""
+    cutoff = dt_time(12, 30)
+    at_prepare = resolve_session_date(_bj("2026-12-15 12:30"), cutoff).isoformat()
+    before_prepare = resolve_session_date(_bj("2026-12-15 12:29"), cutoff).isoformat()
+    assert at_prepare == "2026-12-15", at_prepare
+    assert before_prepare == "2026-12-14", before_prepare
+    print(f"  [OK] 12:30 -> {at_prepare}, 12:29 -> {before_prepare}")
+
+
 def main():
     print("=" * 60)
     print("Session Date Resolution Tests (timezone contract)")
@@ -101,6 +115,7 @@ def main():
         ("Operating window uses Beijing date", test_operating_window_uses_beijing_date),
         ("Early-morning rolls back to US date", test_early_morning_rolls_back_to_us_date),
         ("Noon boundary", test_noon_boundary),
+        ("Scheduler prepare boundary", test_scheduler_prepare_boundary),
     ]
 
     failed = 0

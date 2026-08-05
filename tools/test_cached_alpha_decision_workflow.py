@@ -7,6 +7,7 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -19,6 +20,7 @@ from alpaca_executor import (  # noqa: E402
     _load_cached_alpha_panel,
 )
 from decision_engine import DecisionConfig, DecisionEngine  # noqa: E402
+import tools.daily_alpaca_scheduler as scheduler  # noqa: E402
 from tools.daily_alpaca_scheduler import (  # noqa: E402
     CN_TZ,
     _day_paths,
@@ -293,6 +295,129 @@ def test_scheduler_waits_for_stage_dependencies() -> None:
         assert not paths.execute_output_root.exists()
 
 
+def _command_value(command: list[str], flag: str) -> str:
+    return command[command.index(flag) + 1]
+
+
+def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        args = parse_args([])
+        args.project_root = root
+        args.output_root = root / "scheduler"
+        args.state_path = root / "scheduler" / "state.json"
+        args.python_executable = Path("python.exe")
+        args.executor_path = Path("executor.py")
+        args.accounts_json_path = Path("accounts.json")
+        args.dry_run = False
+        args.force = False
+        paths = _day_paths(args, SESSION_DATE)
+        state: dict = {"version": 1, "sessions": {}}
+        now_cn = datetime(2026, 8, 5, 22, 0, tzinfo=CN_TZ)
+        calls: list[dict[str, str]] = []
+
+        original_run = scheduler.subprocess.run
+        original_quality = scheduler._generate_execution_quality
+        original_audit = scheduler._generate_daily_audit
+        original_finalize = scheduler._finalize_scheduler_run_evidence
+
+        def fake_run(command, **_kwargs):
+            argv = [str(value) for value in command]
+            output_root = Path(_command_value(argv, "--output-root")).resolve()
+            output_root.mkdir(parents=True, exist_ok=True)
+            if "--alpha-panel-input-path" in argv:
+                task = "decision"
+            elif "--decision-targets-input-path" in argv:
+                task = "execute"
+            else:
+                task = "prepare"
+
+            call = {"task": task, "output_root": output_root.as_posix()}
+            if "--position-continuity-reference-path" in argv:
+                call["position_reference"] = Path(
+                    _command_value(argv, "--position-continuity-reference-path")
+                ).resolve().as_posix()
+                assert _command_value(argv, "--position-continuity-mode") == "strict"
+            calls.append(call)
+
+            outputs: dict[str, str] = {}
+            if task == "prepare":
+                alpha_path = output_root / f"alpha_core_panel_{paths.session_key}.csv"
+                pd.DataFrame(_alpha_rows()).to_csv(alpha_path, index=False)
+                outputs["alpha_panel_csv"] = alpha_path.as_posix()
+            elif task == "decision":
+                alpha_path = Path(_command_value(argv, "--alpha-panel-input-path")).resolve()
+                assert alpha_path == paths.alpha_panel_path.resolve()
+                assert alpha_path.exists()
+                target_path = output_root / "decision_targets.csv"
+                target_path.write_text("symbol,target_signed_weight\nAAA,0.1\n", encoding="utf-8")
+                outputs["decision_targets_csv"] = target_path.as_posix()
+            else:
+                target_path = Path(_command_value(argv, "--decision-targets-input-path")).resolve()
+                assert target_path == paths.decision_targets_path.resolve()
+                assert target_path.exists()
+
+            (output_root / "broker_positions_after_raw.json").write_text(
+                json.dumps([_position("AAA", 1)]),
+                encoding="utf-8",
+            )
+            (output_root / "execution_summary.json").write_text(
+                json.dumps({"ok": True, "outputs": outputs}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0)
+
+        scheduler.subprocess.run = fake_run
+        scheduler._generate_execution_quality = lambda _path: None
+        scheduler._generate_daily_audit = lambda _execute, _decision=None: None
+        scheduler._finalize_scheduler_run_evidence = lambda _path: None
+        try:
+            for task in ("prepare", "decision", "execute"):
+                assert scheduler._run_task(
+                    args=args,
+                    state=state,
+                    session_date=SESSION_DATE,
+                    task=task,
+                    paths=paths,
+                    now_cn=now_cn,
+                ) is True
+
+            session_state = state["sessions"][SESSION_DATE.isoformat()]
+            assert [call["task"] for call in calls] == ["prepare", "decision", "execute"]
+            assert all(
+                session_state[task]["status"] == "completed"
+                for task in ("prepare", "decision", "execute")
+            )
+            assert session_state["prepare"]["alpha_panel_path"] == paths.alpha_panel_path.resolve().as_posix()
+            assert session_state["prepare"]["alpha_panel_sha256"] == _sha256_path(paths.alpha_panel_path)
+            assert session_state["decision"]["decision_targets_path"] == paths.decision_targets_path.as_posix()
+            assert calls[1]["position_reference"] == (
+                paths.prepare_output_root / "broker_positions_after_raw.json"
+            ).resolve().as_posix()
+            assert calls[2]["position_reference"] == (
+                paths.decision_output_root / "broker_positions_after_raw.json"
+            ).resolve().as_posix()
+
+            session_state["execute"]["status"] = "failed"
+            args.force = True
+            assert scheduler._run_task(
+                args=args,
+                state=state,
+                session_date=SESSION_DATE,
+                task="execute",
+                paths=paths,
+                now_cn=now_cn,
+            ) is True
+            assert calls[-1]["position_reference"] == (
+                paths.execute_output_root / "broker_positions_after_raw.json"
+            ).resolve().as_posix()
+        finally:
+            scheduler.subprocess.run = original_run
+            scheduler._generate_execution_quality = original_quality
+            scheduler._generate_daily_audit = original_audit
+            scheduler._finalize_scheduler_run_evidence = original_finalize
+
+
 def main() -> int:
     tests = [
         test_position_continuity_semantics,
@@ -300,6 +425,7 @@ def main() -> int:
         test_cached_alpha_validation_and_decision_equivalence,
         test_scheduler_rejects_modified_alpha_cache,
         test_scheduler_waits_for_stage_dependencies,
+        test_scheduler_three_stage_lifecycle_and_retry_reference,
     ]
     for test in tests:
         test()
