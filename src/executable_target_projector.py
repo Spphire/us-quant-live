@@ -55,7 +55,11 @@ def _projected_whole_qty(raw_qty: float, *, integer_tolerance: float = 0.20) -> 
 
 def _quantize_down(value: float, decimals: int) -> float:
     scale = 10 ** max(0, int(decimals))
-    return float(math.floor(max(0.0, float(value)) * scale + 1e-9) / scale)
+    scaled = max(0.0, float(value)) * scale
+    nearest = round(scaled)
+    if abs(scaled - nearest) <= 1e-2:
+        scaled = float(nearest)
+    return float(math.floor(scaled + 1e-9) / scale)
 
 
 def _build_target_specs(
@@ -191,7 +195,6 @@ def _solve_projection(
     variable_count = z_idx + 1
     primary_objective = np.zeros(variable_count, dtype=float)
     primary_objective[d0 : d0 + count] = 1.0
-    primary_objective[z_idx] = 0.25
 
     lower = np.zeros(variable_count, dtype=float)
     upper = np.full(variable_count, np.inf, dtype=float)
@@ -275,18 +278,24 @@ def _solve_projection(
     result = primary_result
     primary_value = _safe_float(primary_result.fun, default=float("nan"))
     secondary_used = False
+    secondary_value: float | None = None
+    secondary_gross_weight: float | None = None
+    tertiary_used = False
+    tertiary_value: float | None = None
     if primary_result.success and primary_result.x is not None and math.isfinite(primary_value):
         # Lock the best weight error, then maximize executable target gross.
         # This makes buying-power utilization a true secondary objective.
         secondary_objective = np.zeros(variable_count, dtype=float)
+        gross_weight_row = np.zeros(variable_count, dtype=float)
         for idx, spec in enumerate(specs):
             equity = max(
                 float(spec.desired_notional) / max(abs(float(spec.raw_weight)), 1e-12),
                 1e-9,
             )
-            secondary_objective[q0 + idx] = -float(spec.reference_price) / equity
+            gross_weight_row[q0 + idx] = float(spec.reference_price) / equity
+            secondary_objective[q0 + idx] = -gross_weight_row[q0 + idx]
             secondary_objective[e0 + idx] = 1e-10
-        tolerance = max(1e-9, abs(primary_value) * 1e-7)
+        tolerance = max(1e-12, abs(primary_value) * 1e-10)
         primary_lock = LinearConstraint(
             primary_objective.reshape(1, -1),
             np.asarray([-np.inf]),
@@ -302,6 +311,34 @@ def _solve_projection(
         if secondary_result.success and secondary_result.x is not None:
             result = secondary_result
             secondary_used = True
+            secondary_value = _safe_float(secondary_result.fun, default=float("nan"))
+            secondary_gross_weight = float(np.dot(gross_weight_row, secondary_result.x))
+
+            # Resolve exact L1/gross ties by reducing the worst single-name gap.
+            # Tight locks and quantity-grid snapping keep this tie-break from
+            # perturbing executable fractional quantities.
+            gross_tolerance = max(1e-12, abs(secondary_gross_weight) * 1e-10)
+            gross_lock = LinearConstraint(
+                gross_weight_row.reshape(1, -1),
+                np.asarray([secondary_gross_weight - gross_tolerance]),
+                np.asarray([np.inf]),
+            )
+            tertiary_objective = np.zeros(variable_count, dtype=float)
+            tertiary_objective[z_idx] = 1.0
+            tertiary_result = milp(
+                c=tertiary_objective,
+                integrality=integrality,
+                bounds=Bounds(lower, upper),
+                constraints=(base_constraint, primary_lock, gross_lock),
+                options={"time_limit": 10.0, "mip_rel_gap": 1e-9},
+            )
+            if tertiary_result.success and tertiary_result.x is not None:
+                result = tertiary_result
+                tertiary_used = True
+                tertiary_value = _safe_float(
+                    tertiary_result.fun,
+                    default=float("nan"),
+                )
     solver_diag = {
         "success": bool(result.success),
         "status": int(result.status),
@@ -310,12 +347,14 @@ def _solve_projection(
         "objective_priority": [
             "minimize_absolute_weight_error",
             "maximize_executable_target_gross_without_worsening_weight_error",
+            "minimize_max_single_name_weight_error_only_within_exact_higher_priority_ties",
         ],
         "primary_weight_error_objective": float(primary_value),
         "secondary_optimization_used": bool(secondary_used),
-        "secondary_objective_value": _safe_float(result.fun, default=float("nan"))
-        if secondary_used
-        else None,
+        "secondary_objective_value": secondary_value,
+        "secondary_gross_weight": secondary_gross_weight,
+        "tertiary_optimization_used": bool(tertiary_used),
+        "tertiary_max_single_name_weight_error": tertiary_value,
         "mip_gap": _safe_float(getattr(result, "mip_gap", None), default=float("nan")),
         "mip_node_count": int(_safe_float(getattr(result, "mip_node_count", 0))),
         "gross_notional_cap": safe_gross_cap,
@@ -394,6 +433,8 @@ def _summarize_solution(
     used = 0.0
     l1 = 0.0
     l2_sq = 0.0
+    long_l1 = 0.0
+    short_l1 = 0.0
     max_abs_weight_gap = 0.0
     max_relative = 0.0
     integer_rounding_loss = 0.0
@@ -406,6 +447,10 @@ def _summarize_solution(
         gap = actual_notional - spec.desired_notional
         weight_gap = gap / equity
         l1 += abs(weight_gap)
+        if spec.side == "short":
+            short_l1 += abs(weight_gap)
+        else:
+            long_l1 += abs(weight_gap)
         l2_sq += weight_gap * weight_gap
         max_abs_weight_gap = max(max_abs_weight_gap, abs(weight_gap))
         max_relative = max(max_relative, abs(gap) / max(spec.desired_notional, 1e-9))
@@ -424,8 +469,12 @@ def _summarize_solution(
         "buying_power_cap": float(cap),
         "buying_power_cap_utilization": float(used / cap) if cap > EPS else 0.0,
         "tracking_error_l1_weight": float(l1),
+        "tracking_error_long_l1_weight": float(long_l1),
+        "tracking_error_short_l1_weight": float(short_l1),
         "tracking_error_l2_weight": float(math.sqrt(l2_sq)),
         "tracking_error_l1_weight_pct": float(l1 * 100.0),
+        "tracking_error_long_l1_weight_pct": float(long_l1 * 100.0),
+        "tracking_error_short_l1_weight_pct": float(short_l1 * 100.0),
         "mean_abs_symbol_weight_error": float(l1 / len(specs)) if specs else 0.0,
         "mean_abs_symbol_weight_error_pct": float((l1 / len(specs)) * 100.0) if specs else 0.0,
         "max_abs_symbol_weight_error": float(max_abs_weight_gap),
@@ -451,6 +500,16 @@ def _summarize_projection_rows(
 ) -> dict[str, Any]:
     used = sum(_safe_float(row.get("estimated_entry_buying_power")) for row in rows)
     weight_gaps = [_safe_float(row.get("projection_weight_gap")) for row in rows]
+    long_l1 = sum(
+        abs(_safe_float(row.get("projection_weight_gap")))
+        for row in rows
+        if str(row.get("target_side") or "").lower() == "long"
+    )
+    short_l1 = sum(
+        abs(_safe_float(row.get("projection_weight_gap")))
+        for row in rows
+        if str(row.get("target_side") or "").lower() == "short"
+    )
     max_relative = 0.0
     integer_gap = 0.0
     projected_gross = 0.0
@@ -482,8 +541,12 @@ def _summarize_projection_rows(
         "buying_power_cap": float(cap),
         "buying_power_cap_utilization": float(used / cap) if cap > EPS else 0.0,
         "tracking_error_l1_weight": l1,
+        "tracking_error_long_l1_weight": float(long_l1),
+        "tracking_error_short_l1_weight": float(short_l1),
         "tracking_error_l2_weight": float(math.sqrt(sum(value * value for value in weight_gaps))),
         "tracking_error_l1_weight_pct": float(l1 * 100.0),
+        "tracking_error_long_l1_weight_pct": float(long_l1 * 100.0),
+        "tracking_error_short_l1_weight_pct": float(short_l1 * 100.0),
         "mean_abs_symbol_weight_error": mean_abs,
         "mean_abs_symbol_weight_error_pct": float(mean_abs * 100.0),
         "max_abs_symbol_weight_error": max_abs,
@@ -778,6 +841,17 @@ def project_executable_targets(
         buying_power_cap=cap,
         gross_notional_cap=gross_target_notional if total_capacity is not None else None,
     )
+    projection_floor_l1 = _safe_float(
+        optimizer_pre_filter_summary.get("tracking_error_l1_weight")
+    )
+    final_projection_l1 = _safe_float(actual_summary.get("tracking_error_l1_weight"))
+    solver_mip_gap = _safe_float(solver_diag.get("mip_gap"), default=float("nan"))
+    projection_floor_proven_optimal = bool(
+        solver_diag.get("success")
+        and int(_safe_float(solver_diag.get("status"), default=-1)) == 0
+        and not solver_diag.get("fallback_used")
+        and (not math.isfinite(solver_mip_gap) or solver_mip_gap <= 1e-8)
+    )
     scenario_rows: list[dict[str, Any]] = []
     scenario_values = sorted({min(max(float(value), 0.0), 1.0) for value in scenario_buffers} | {buffer})
     for scenario_buffer in scenario_values:
@@ -867,6 +941,31 @@ def project_executable_targets(
         "executable_short_gross_weight": float(executable_short_gross),
         "solver": solver_diag,
         "optimizer_pre_min_trade_summary": optimizer_pre_filter_summary,
+        "projection_error_floor_semantics": (
+            "global_milp_l1_optimum_before_min_trade_filter_under_integer_share_"
+            "buying_power_and_gross_capacity_constraints"
+        ),
+        "projection_error_floor_proven_optimal": projection_floor_proven_optimal,
+        "projection_error_floor_l1_weight": float(projection_floor_l1),
+        "projection_error_floor_l1_weight_pct": float(projection_floor_l1 * 100.0),
+        "projection_error_floor_long_l1_weight": _safe_float(
+            optimizer_pre_filter_summary.get("tracking_error_long_l1_weight")
+        ),
+        "projection_error_floor_long_l1_weight_pct": _safe_float(
+            optimizer_pre_filter_summary.get("tracking_error_long_l1_weight_pct")
+        ),
+        "projection_error_floor_short_l1_weight": _safe_float(
+            optimizer_pre_filter_summary.get("tracking_error_short_l1_weight")
+        ),
+        "projection_error_floor_short_l1_weight_pct": _safe_float(
+            optimizer_pre_filter_summary.get("tracking_error_short_l1_weight_pct")
+        ),
+        "min_trade_filter_incremental_error_l1_weight": float(
+            max(0.0, final_projection_l1 - projection_floor_l1)
+        ),
+        "min_trade_filter_incremental_error_l1_weight_pct": float(
+            max(0.0, final_projection_l1 - projection_floor_l1) * 100.0
+        ),
         **actual_summary,
         "blocked_target_count": int(len(blocked)),
         "integer_short_target_count": int(sum(spec.side == "short" and spec.integral_target for spec in specs)),

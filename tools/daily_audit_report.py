@@ -5726,6 +5726,18 @@ def _build_executable_target_projection_outputs(
 
     final_phase, final_projection = projections[-1] if projections else ("missing", {})
     initial_projection = projections[0][1] if projections else {}
+    pre_min_trade = (
+        final_projection.get("optimizer_pre_min_trade_summary", {})
+        if isinstance(final_projection.get("optimizer_pre_min_trade_summary"), dict)
+        else {}
+    )
+    projection_error_floor_l1 = _optional_float(
+        final_projection.get("projection_error_floor_l1_weight")
+    )
+    if projection_error_floor_l1 is None:
+        projection_error_floor_l1 = _optional_float(
+            pre_min_trade.get("tracking_error_l1_weight")
+        )
     summary = {
         "schema_version": "1.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -5742,6 +5754,48 @@ def _build_executable_target_projection_outputs(
         "tracking_error_l1_weight": final_projection.get("tracking_error_l1_weight"),
         "tracking_error_l2_weight": final_projection.get("tracking_error_l2_weight"),
         "tracking_error_l1_weight_pct": final_projection.get("tracking_error_l1_weight_pct"),
+        "tracking_error_long_l1_weight": final_projection.get(
+            "tracking_error_long_l1_weight"
+        ),
+        "tracking_error_short_l1_weight": final_projection.get(
+            "tracking_error_short_l1_weight"
+        ),
+        "projection_error_floor_semantics": final_projection.get(
+            "projection_error_floor_semantics",
+            "legacy_optimizer_pre_min_trade_result",
+        ),
+        "projection_error_floor_proven_optimal": bool(
+            final_projection.get("projection_error_floor_proven_optimal")
+        ),
+        "projection_error_floor_l1_weight": projection_error_floor_l1,
+        "projection_error_floor_l1_weight_pct": (
+            float(projection_error_floor_l1 * 100.0)
+            if projection_error_floor_l1 is not None
+            else None
+        ),
+        "projection_error_floor_long_l1_weight": _optional_float(
+            final_projection.get("projection_error_floor_long_l1_weight")
+        )
+        if final_projection.get("projection_error_floor_long_l1_weight") is not None
+        else _optional_float(pre_min_trade.get("tracking_error_long_l1_weight")),
+        "projection_error_floor_short_l1_weight": _optional_float(
+            final_projection.get("projection_error_floor_short_l1_weight")
+        )
+        if final_projection.get("projection_error_floor_short_l1_weight") is not None
+        else _optional_float(pre_min_trade.get("tracking_error_short_l1_weight")),
+        "min_trade_filter_incremental_error_l1_weight": _optional_float(
+            final_projection.get("min_trade_filter_incremental_error_l1_weight")
+        )
+        if final_projection.get("min_trade_filter_incremental_error_l1_weight") is not None
+        else (
+            max(
+                0.0,
+                _safe_float(final_projection.get("tracking_error_l1_weight"))
+                - float(projection_error_floor_l1),
+            )
+            if projection_error_floor_l1 is not None
+            else None
+        ),
         "mean_abs_symbol_weight_error": final_projection.get("mean_abs_symbol_weight_error"),
         "mean_abs_symbol_weight_error_pct": final_projection.get("mean_abs_symbol_weight_error_pct"),
         "max_abs_symbol_weight_error": final_projection.get("max_abs_symbol_weight_error"),
@@ -12968,6 +13022,23 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(executable_projection, dict)
                 else None,
+                "optimizer_projection_error_floor_l1_weight": _optional_float(
+                    executable_projection.get("projection_error_floor_l1_weight")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_projection_error_floor_proven_optimal": bool(
+                    executable_projection.get("projection_error_floor_proven_optimal")
+                )
+                if isinstance(executable_projection, dict)
+                else False,
+                "optimizer_min_trade_incremental_error_l1_weight": _optional_float(
+                    executable_projection.get(
+                        "min_trade_filter_incremental_error_l1_weight"
+                    )
+                )
+                if isinstance(executable_projection, dict)
+                else None,
                 "optimizer_mean_abs_symbol_weight_error": _optional_float(
                     executable_projection.get("mean_abs_symbol_weight_error")
                 )
@@ -14016,7 +14087,11 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "strategy_to_actual_weight_error_l1", "strategy_to_executable_weight_error_l1",
             "executable_to_actual_weight_error_l1", "mean_symbol_strategy_to_actual_weight_error",
             "max_symbol_strategy_to_actual_weight_error", "executable_projection_status",
-            "optimizer_tracking_error_l1_weight", "optimizer_mean_abs_symbol_weight_error",
+            "optimizer_tracking_error_l1_weight",
+            "optimizer_projection_error_floor_l1_weight",
+            "optimizer_projection_error_floor_proven_optimal",
+            "optimizer_min_trade_incremental_error_l1_weight",
+            "optimizer_mean_abs_symbol_weight_error",
             "optimizer_max_abs_symbol_weight_error", "optimizer_buying_power_cap_utilization",
             "optimizer_gross_capacity_target_ratio", "optimizer_gross_capacity_target_notional",
             "optimizer_projected_final_gross_notional",

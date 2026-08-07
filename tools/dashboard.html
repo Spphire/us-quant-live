@@ -714,6 +714,7 @@
                 seriesStrategyActual: 'Strategy to actual',
                 seriesStrategyExecutable: 'Strategy to executable',
                 seriesExecutableActual: 'Executable to actual',
+                seriesProjectionFloor: 'Constraint optimum',
                 seriesGrossUtilization: 'Gross utilization',
                 seriesConfiguredTarget: '95% target',
                 seriesTotalCapacity: '100% capacity',
@@ -862,6 +863,7 @@
                 seriesStrategyActual: '策略到实际',
                 seriesStrategyExecutable: '策略到可执行',
                 seriesExecutableActual: '可执行到实际',
+                seriesProjectionFloor: '约束下的最优下界',
                 seriesGrossUtilization: '实际总仓位利用率',
                 seriesConfiguredTarget: '95% 目标',
                 seriesTotalCapacity: '100% 总容量',
@@ -2095,7 +2097,8 @@
                 const weightColors = {
                     strategyActual: '#f87171',
                     strategyExecutable: '#fbbf24',
-                    executableActual: '#60a5fa'
+                    executableActual: '#60a5fa',
+                    projectionFloor: '#34d399'
                 };
                 const capacityColors = {
                     utilization: '#34d399',
@@ -2107,7 +2110,8 @@
                 const weightKey = [
                     { label: t('seriesStrategyActual'), color: weightColors.strategyActual },
                     { label: t('seriesStrategyExecutable'), color: weightColors.strategyExecutable },
-                    { label: t('seriesExecutableActual'), color: weightColors.executableActual }
+                    { label: t('seriesExecutableActual'), color: weightColors.executableActual },
+                    { label: t('seriesProjectionFloor'), color: weightColors.projectionFloor }
                 ];
                 const capacityKey = [
                     { label: t('seriesGrossUtilization'), color: capacityColors.utilization },
@@ -2145,7 +2149,7 @@
                 const weightMeta = document.getElementById('weightErrorChartMeta');
                 if (weightMeta) {
                     weightMeta.textContent = latestWeight
-                        ? `${weightRows[0].session_date} to ${latestWeight.session_date} · ${weightRows.length} days · latest ${t('seriesStrategyActual')} ${formatWeightError(latestWeight.strategy_to_actual_weight_error_l1)}`
+                        ? `${weightRows[0].session_date} to ${latestWeight.session_date} · ${weightRows.length} days · latest ${t('seriesStrategyActual')} ${formatWeightError(latestWeight.strategy_to_actual_weight_error_l1)} · ${t('seriesProjectionFloor')} ${formatWeightError(latestWeight.optimizer_projection_error_floor_l1_weight)}`
                         : 'No daily weight-error evidence';
                 }
                 const latestCapacity = capacityRows[capacityRows.length - 1];
@@ -2169,6 +2173,12 @@
                     {
                         color: weightColors.executableActual,
                         data: weightRows.map(row => auditMetric(row, 'executable_to_actual_weight_error_l1', 100))
+                    },
+                    {
+                        color: weightColors.projectionFloor,
+                        data: weightRows.map(row => auditMetric(row, 'optimizer_projection_error_floor_l1_weight', 100)),
+                        dash: [6, 5],
+                        points: false
                     }
                 ];
                 const weightCanvas = document.getElementById('weightErrorChart');
@@ -2215,6 +2225,17 @@
                                         pointRadius: 2,
                                         pointHoverRadius: 5,
                                         tension: 0.25,
+                                        yAxisID: 'yWeight'
+                                    },
+                                    {
+                                        label: t('seriesProjectionFloor'),
+                                        data: weightFallbackData[3].data,
+                                        borderColor: weightColors.projectionFloor,
+                                        borderWidth: 1.75,
+                                        borderDash: [6, 5],
+                                        pointRadius: 0,
+                                        pointHoverRadius: 4,
+                                        tension: 0.2,
                                         yAxisID: 'yWeight'
                                     }
                                 ]

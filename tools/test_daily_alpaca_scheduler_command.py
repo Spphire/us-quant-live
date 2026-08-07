@@ -72,20 +72,22 @@ def main() -> int:
     assert decision[decision.index("--position-continuity-reference-path") + 1].endswith(
         "prepare\\broker_positions_after_raw.json"
     ), decision
-    assert decision[decision.index("--position-continuity-mode") + 1] == "strict", decision
+    assert decision[decision.index("--position-continuity-mode") + 1] == "rebalance", decision
     assert "--no-submit" in decision, decision
 
-    assert command[command.index("--decision-targets-input-path") + 1].endswith(
-        "decision\\decision_targets.csv"
+    assert command[command.index("--alpha-panel-input-path") + 1].endswith(
+        "prepare\\alpha_core_panel_20260728.csv"
     ), command
+    assert "--decision-targets-input-path" not in command, command
     assert command[command.index("--position-continuity-reference-path") + 1].endswith(
-        "decision\\broker_positions_after_raw.json"
+        "prepare\\broker_positions_after_raw.json"
     ), command
-    assert command[command.index("--position-continuity-mode") + 1] == "strict", command
+    assert command[command.index("--position-continuity-mode") + 1] == "rebalance", command
+    assert "--no-submit" not in command, command
 
     print(
-        "[PASS] scheduler commands carry three-stage dependencies, continuity "
-        "guards, Longbridge freshness, and entry-repair defaults"
+        "[PASS] scheduler commands carry prepared-Alpha dependencies, fresh-decision "
+        "rebalance guards, Longbridge freshness, and entry-repair defaults"
     )
     return 0
 

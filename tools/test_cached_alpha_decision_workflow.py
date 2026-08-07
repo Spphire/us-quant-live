@@ -112,6 +112,18 @@ def test_position_continuity_semantics() -> None:
         assert audited["status"] == "attention", audited
         assert not audited["blocking_reasons"], audited
 
+        rebalanced = _build_position_continuity_guard(
+            reference_path=reference_path,
+            current_positions=changed,
+            current_stability=changed_stability,
+            mode="rebalance",
+            qty_decimals=6,
+        )
+        assert rebalanced["status"] == "attention", rebalanced
+        assert rebalanced["current_state_accepted"] is True, rebalanced
+        assert rebalanced["disposition"] == "accepted_current_state_with_reference_drift", rebalanced
+        assert not rebalanced["blocking_reasons"], rebalanced
+
         unstable = _stability([current, changed, current])
         unstable_guard = _build_position_continuity_guard(
             reference_path=reference_path,
@@ -123,6 +135,16 @@ def test_position_continuity_semantics() -> None:
         assert unstable_guard["status"] == "blocked", unstable_guard
         assert "current_position_quantities_unstable" in unstable_guard["blocking_reasons"]
 
+        unstable_rebalance = _build_position_continuity_guard(
+            reference_path=reference_path,
+            current_positions=current,
+            current_stability=unstable,
+            mode="rebalance",
+            qty_decimals=6,
+        )
+        assert unstable_rebalance["status"] == "blocked", unstable_rebalance
+        assert unstable_rebalance["current_state_accepted"] is False, unstable_rebalance
+
         missing = _build_position_continuity_guard(
             reference_path=Path(tmp) / "missing.json",
             current_positions=current,
@@ -132,6 +154,27 @@ def test_position_continuity_semantics() -> None:
         )
         assert missing["status"] == "blocked", missing
         assert missing["reference_sha256"] is None, missing
+
+
+def test_prax_reappeared_position_is_accepted_for_fresh_rebalance() -> None:
+    with TemporaryDirectory() as tmp:
+        reference_path = Path(tmp) / "broker_positions_after_raw.json"
+        reference_path.write_text(
+            json.dumps([_position("PRAX", 9.3256, price=3.2)]),
+            encoding="utf-8",
+        )
+        current = [_position("PRAX", 19.4981, price=3.2)]
+        guard = _build_position_continuity_guard(
+            reference_path=reference_path,
+            current_positions=current,
+            current_stability=_stability([current, current, current]),
+            mode="rebalance",
+            qty_decimals=4,
+        )
+        assert guard["status"] == "attention", guard
+        assert guard["current_state_accepted"] is True, guard
+        assert guard["drift_symbols"] == ["PRAX"], guard
+        assert abs(guard["drift_rows"][0]["delta_signed_qty"] - 10.1725) < 1e-8, guard
 
 
 def test_latest_successful_stability_payload() -> None:
@@ -295,6 +338,54 @@ def test_scheduler_waits_for_stage_dependencies() -> None:
         assert not paths.execute_output_root.exists()
 
 
+def test_failed_preview_does_not_block_authoritative_execute() -> None:
+    with TemporaryDirectory() as tmp:
+        args = parse_args([])
+        args.output_root = Path(tmp)
+        args.state_path = Path(tmp) / "state.json"
+        paths = _day_paths(args, SESSION_DATE)
+        paths.alpha_panel_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.alpha_panel_path.write_text(
+            "symbol,session_date\nAAA,2026-08-05\n",
+            encoding="utf-8",
+        )
+        state = {
+            "sessions": {
+                SESSION_DATE.isoformat(): {
+                    "prepare": {
+                        "status": "completed",
+                        "alpha_panel_path": paths.alpha_panel_path.as_posix(),
+                        "alpha_panel_sha256": _sha256_path(paths.alpha_panel_path),
+                    }
+                }
+            }
+        }
+        calls: list[str] = []
+        original_run_task = scheduler._run_task
+        original_session_is_tradable = scheduler._session_is_tradable
+
+        def fake_run_task(*, task: str, **_kwargs) -> bool:
+            calls.append(task)
+            return task != "decision"
+
+        scheduler._run_task = fake_run_task
+        scheduler._session_is_tradable = lambda *_args, **_kwargs: True
+        try:
+            ok = scheduler._run_due_tasks(
+                args=args,
+                state=state,
+                calendar_cache={},
+                now_cn=datetime(2026, 8, 5, 22, 0, tzinfo=CN_TZ),
+                session_date=SESSION_DATE,
+            )
+        finally:
+            scheduler._run_task = original_run_task
+            scheduler._session_is_tradable = original_session_is_tradable
+
+        assert ok is True
+        assert calls == ["prepare", "decision", "execute"], calls
+
+
 def _command_value(command: list[str], flag: str) -> str:
     return command[command.index(flag) + 1]
 
@@ -325,9 +416,9 @@ def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
             argv = [str(value) for value in command]
             output_root = Path(_command_value(argv, "--output-root")).resolve()
             output_root.mkdir(parents=True, exist_ok=True)
-            if "--alpha-panel-input-path" in argv:
+            if "--alpha-panel-input-path" in argv and "--no-submit" in argv:
                 task = "decision"
-            elif "--decision-targets-input-path" in argv:
+            elif "--alpha-panel-input-path" in argv:
                 task = "execute"
             else:
                 task = "prepare"
@@ -337,7 +428,7 @@ def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
                 call["position_reference"] = Path(
                     _command_value(argv, "--position-continuity-reference-path")
                 ).resolve().as_posix()
-                assert _command_value(argv, "--position-continuity-mode") == "strict"
+                assert _command_value(argv, "--position-continuity-mode") == "rebalance"
             calls.append(call)
 
             outputs: dict[str, str] = {}
@@ -353,9 +444,13 @@ def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
                 target_path.write_text("symbol,target_signed_weight\nAAA,0.1\n", encoding="utf-8")
                 outputs["decision_targets_csv"] = target_path.as_posix()
             else:
-                target_path = Path(_command_value(argv, "--decision-targets-input-path")).resolve()
-                assert target_path == paths.decision_targets_path.resolve()
-                assert target_path.exists()
+                alpha_path = Path(_command_value(argv, "--alpha-panel-input-path")).resolve()
+                assert alpha_path == paths.alpha_panel_path.resolve()
+                assert alpha_path.exists()
+                assert "--decision-targets-input-path" not in argv
+                target_path = output_root / "decision_targets.csv"
+                target_path.write_text("symbol,target_signed_weight\nAAA,0.1\n", encoding="utf-8")
+                outputs["decision_targets_csv"] = target_path.as_posix()
 
             (output_root / "broker_positions_after_raw.json").write_text(
                 json.dumps([_position("AAA", 1)]),
@@ -397,6 +492,9 @@ def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
             assert calls[2]["position_reference"] == (
                 paths.decision_output_root / "broker_positions_after_raw.json"
             ).resolve().as_posix()
+            assert session_state["execute"]["decision_targets_path"] == (
+                paths.execute_output_root / "decision_targets.csv"
+            ).as_posix()
 
             session_state["execute"]["status"] = "failed"
             args.force = True
@@ -421,10 +519,12 @@ def test_scheduler_three_stage_lifecycle_and_retry_reference() -> None:
 def main() -> int:
     tests = [
         test_position_continuity_semantics,
+        test_prax_reappeared_position_is_accepted_for_fresh_rebalance,
         test_latest_successful_stability_payload,
         test_cached_alpha_validation_and_decision_equivalence,
         test_scheduler_rejects_modified_alpha_cache,
         test_scheduler_waits_for_stage_dependencies,
+        test_failed_preview_does_not_block_authoritative_execute,
         test_scheduler_three_stage_lifecycle_and_retry_reference,
     ]
     for test in tests:

@@ -617,8 +617,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--min-trade-weight-bps",
         type=float,
-        default=1.0,
-        help="Per-symbol no-trade band in account-equity bps; weight alignment remains the primary objective.",
+        default=0.0,
+        help=(
+            "Per-symbol no-trade band in account-equity bps. The default keeps only "
+            "the absolute --min-trade-notional floor so small executable corrections "
+            "are not suppressed."
+        ),
     )
     parser.add_argument("--whole-shares-only", action="store_true")
     parser.add_argument(
@@ -686,11 +690,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--position-continuity-mode",
-        choices=("off", "audit", "strict"),
+        choices=("off", "audit", "rebalance", "strict"),
         default="off",
         help=(
-            "off disables cross-snapshot checks; audit records differences; strict "
-            "fails closed on a missing reference, unstable current quantities, or any "
+            "off disables cross-snapshot checks; audit records differences; rebalance "
+            "requires stable current broker quantities but accepts reference drift as a "
+            "fresh DecisionEngine input; strict also fails on missing references or any "
             "per-symbol quantity drift."
         ),
     )
@@ -951,6 +956,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "status": position_continuity_guard.get("status"),
                 "mode": position_continuity_guard.get("mode"),
+                "disposition": position_continuity_guard.get("disposition"),
+                "current_state_accepted": position_continuity_guard.get(
+                    "current_state_accepted"
+                ),
                 "drift_symbol_count": position_continuity_guard.get("drift_symbol_count"),
                 "current_quantity_stable": position_continuity_guard.get("current_quantity_stable"),
                 "reference_path": position_continuity_guard.get("reference_path"),
@@ -7471,7 +7480,7 @@ def _build_position_continuity_guard(
     qty_decimals: int,
 ) -> dict[str, Any]:
     normalized_mode = str(mode or "off").strip().lower()
-    if normalized_mode not in {"off", "audit", "strict"}:
+    if normalized_mode not in {"off", "audit", "rebalance", "strict"}:
         raise ValueError(f"Unsupported position continuity mode: {mode}")
 
     tolerance = max(1e-8, 0.5 * (10.0 ** (-max(0, int(qty_decimals)))))
@@ -7535,11 +7544,12 @@ def _build_position_continuity_guard(
                 }
             )
 
+    if normalized_mode in {"rebalance", "strict"} and not current_quantity_stable:
+        blocking_reasons.append("current_position_quantities_unstable")
+
     if normalized_mode == "strict":
         if reference_error is not None:
             blocking_reasons.append("reference_unavailable")
-        if not current_quantity_stable:
-            blocking_reasons.append("current_position_quantities_unstable")
         if drift_rows:
             blocking_reasons.append("cross_snapshot_position_quantity_drift")
 
@@ -7547,6 +7557,8 @@ def _build_position_continuity_guard(
         status = "disabled"
     elif blocking_reasons:
         status = "blocked"
+    elif normalized_mode == "rebalance" and (reference_error is not None or drift_rows):
+        status = "attention"
     elif reference_path is None or reference_error is not None:
         status = "not_applicable"
     elif drift_rows:
@@ -7568,7 +7580,7 @@ def _build_position_continuity_guard(
                 reference_captured_at_utc = None
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": _utc_now(),
         "mode": normalized_mode,
         "status": status,
@@ -7589,13 +7601,30 @@ def _build_position_continuity_guard(
         "current_successful_quantity_sample_count": len(sample_qty_maps),
         "current_quantity_hash_count": len(set(quantity_hashes)),
         "current_quantity_stable": current_quantity_stable,
+        "current_state_accepted": bool(
+            normalized_mode == "rebalance" and not blocking_reasons
+        ),
+        "disposition": (
+            "blocked"
+            if blocking_reasons
+            else "accepted_current_state_with_reference_drift"
+            if normalized_mode == "rebalance" and drift_rows
+            else "accepted_current_state_without_reference"
+            if normalized_mode == "rebalance" and reference_error is not None
+            else "accepted_current_state"
+            if normalized_mode == "rebalance"
+            else "verified_continuity"
+            if status == "pass"
+            else status
+        ),
         "drift_symbol_count": len(drift_rows),
         "drift_symbols": [row["symbol"] for row in drift_rows],
         "drift_rows": drift_rows,
         "semantics": (
             "Signed broker quantities are compared across task boundaries; market-value and "
-            "price changes are intentionally ignored. Strict mode fails closed before target "
-            "construction or order submission."
+            "price changes are intentionally ignored. Rebalance mode requires internally stable "
+            "current broker quantities and treats cross-snapshot drift as a fresh strategy input. "
+            "Strict mode also fails closed on missing references or cross-snapshot drift."
         ),
     }
 

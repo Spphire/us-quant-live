@@ -682,7 +682,43 @@ def test_projector_uses_buying_power_only_as_secondary_objective():
     assert lattice_qty["X"] == -6.0, lattice_qty
     assert diagnostics["solver"]["objective_priority"][0] == "minimize_absolute_weight_error"
     assert diagnostics["solver"]["secondary_optimization_used"]
+    assert diagnostics["solver"]["tertiary_optimization_used"]
+    assert abs(
+        diagnostics["solver"]["primary_weight_error_objective"]
+        - diagnostics["optimizer_pre_min_trade_summary"]["tracking_error_l1_weight"]
+    ) < 1e-7, diagnostics
     print("  [OK] equal weight-error tie uses higher exposure only in secondary solve")
+
+
+def test_projector_reports_constraint_floor_and_min_trade_increment():
+    _, _, diagnostics = project_executable_targets(
+        raw_target_signed_weights={"X": 0.01},
+        current_signed_qty={"X": 95.0},
+        current_signed_notional={"X": 95.0},
+        reference_prices={"X": 1.0},
+        assets_by_symbol={"X": {"shortable": True, "fractionable": True}},
+        account_equity=10000.0,
+        buying_power=40000.0,
+        buying_power_buffer=0.95,
+        min_trade_notional=10.0,
+        qty_decimals=4,
+        whole_shares_only=False,
+        short_sales_whole_shares_only=True,
+        shorting_enabled=True,
+        sizing_adverse_offset_bps=12.0,
+        short_buying_power_adverse_offset_bps=300.0,
+    )
+    assert diagnostics["projection_error_floor_proven_optimal"], diagnostics
+    assert diagnostics["projection_error_floor_l1_weight"] < 1e-10, diagnostics
+    assert abs(diagnostics["tracking_error_l1_weight"] - 0.0005) < 1e-10, diagnostics
+    assert abs(
+        diagnostics["min_trade_filter_incremental_error_l1_weight"] - 0.0005
+    ) < 1e-10, diagnostics
+    assert diagnostics["tracking_error_long_l1_weight"] == diagnostics[
+        "tracking_error_l1_weight"
+    ]
+    assert diagnostics["tracking_error_short_l1_weight"] == 0.0
+    print("  [OK] projector separates the constraint floor from min-trade filtering")
 
 
 def test_projector_enforces_final_gross_capacity_target():
@@ -809,6 +845,7 @@ def test_projection_audit_prefers_staged_entry_snapshot():
         **initial,
         "estimated_entry_buying_power_used": 200.0,
         "tracking_error_l1_weight": 0.01,
+        "optimizer_pre_min_trade_summary": {"tracking_error_l1_weight": 0.008},
     }
     with TemporaryDirectory() as temp_dir:
         run_dir = Path(temp_dir)
@@ -827,6 +864,9 @@ def test_projection_audit_prefers_staged_entry_snapshot():
     assert len(rows) == 2, rows
     assert summary["final_projection_phase"] == "staged_entry", summary
     assert summary["tracking_error_l1_weight"] == 0.01, summary
+    assert summary["projection_error_floor_l1_weight"] == 0.008, summary
+    assert summary["projection_error_floor_proven_optimal"] is False, summary
+    assert abs(summary["min_trade_filter_incremental_error_l1_weight"] - 0.002) < 1e-12
     assert rows[-1]["constraint_reasons"] == "short_target_integer", rows[-1]
     print("  [OK] projection audit uses refreshed staged-entry optimization")
 
@@ -2239,6 +2279,7 @@ def main() -> int:
         ("Residual-aware integer short delta", test_projector_short_residual_produces_integer_order_delta),
         ("Buying-power scenario diagnostics", test_projector_logs_buffer_scenarios),
         ("Lexicographic weight-error priority", test_projector_uses_buying_power_only_as_secondary_objective),
+        ("Projection constraint floor diagnostics", test_projector_reports_constraint_floor_and_min_trade_increment),
         ("Final gross capacity target", test_projector_enforces_final_gross_capacity_target),
         ("Block missing short side", test_submission_guard_blocks_missing_short_side),
         ("Allow complete long/short portfolio", test_submission_guard_allows_complete_long_short_projection),
