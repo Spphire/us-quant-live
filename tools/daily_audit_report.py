@@ -887,6 +887,10 @@ def _build_run_evidence_digest_audit(
         "file_hash_manifest.json",
         "artifact_completeness_snapshot.json",
     ]
+    price_basis_evidence_files = {"alpha_price_basis.json"}
+    price_basis_evidence_enabled = any((run_dir / name).exists() for name in price_basis_evidence_files)
+    if price_basis_evidence_enabled:
+        expected_files.extend(sorted(price_basis_evidence_files))
     new_replay_files = {
         "run_events.jsonl",
         "decision_phase_timings.json",
@@ -948,6 +952,8 @@ def _build_run_evidence_digest_audit(
         strict_files.update(enhanced_execution_evidence_files)
     if symbol_universe_evidence_enabled:
         strict_files.update(symbol_universe_evidence_files)
+    if price_basis_evidence_enabled:
+        strict_files.update(price_basis_evidence_files)
     if scheduler_evidence_enabled:
         strict_files.update(scheduler_evidence_files)
     file_statuses = digest.get("file_statuses") if isinstance(digest.get("file_statuses"), dict) else {}
@@ -8164,6 +8170,11 @@ def _build_evidence_completeness(
             "Corporate-action evidence needed to explain dividends, splits, symbol changes, and broker adjustments.",
         ),
         (
+            "price_basis",
+            ["alpha_panel", "alpha_price_basis"],
+            "Raw/adjusted price-basis evidence needed to prove that alpha returns and execution sizing use different, explicit price units.",
+        ),
+        (
             "source_reproducibility",
             [
                 "run_context",
@@ -9338,7 +9349,15 @@ def _build_data_quality_snapshot(
         "symbol",
         "price_asof_session_date",
         "close",
+        "raw_close",
+        "adjusted_close",
         "lagged_raw_close",
+        "lagged_adjusted_close",
+        "adjustment_factor",
+        "market_cap_price_asof_session_date",
+        "alpha_price_adjustment",
+        "alpha_return_price_source",
+        "absolute_price_source",
         "return_5d",
         "momentum_l120_s20",
         "beta",
@@ -9346,6 +9365,14 @@ def _build_data_quality_snapshot(
         "sec_status",
         "sec_payload_source",
         "shares_outstanding",
+        "shares_outstanding_reported",
+        "shares_split_adjustment_factor",
+        "shares_outstanding_price_basis",
+        "shares_price_basis_status",
+        "shares_split_adjustment_start",
+        "shares_split_adjustment_end",
+        "shares_split_adjustment_dates",
+        "shares_split_action_count",
         "share_source",
         "last_fundamental_filed_date",
         "assets",
@@ -9428,6 +9455,21 @@ def _build_data_quality_snapshot(
         "sec_payload_source_counts": _counter_from_rows(alpha_rows, "sec_payload_source"),
         "share_source_counts": _counter_from_rows(alpha_rows, "share_source"),
         "market_cap_price_source_counts": _counter_from_rows(alpha_rows, "market_cap_price_source"),
+        "price_basis": {
+            "alpha_price_adjustment_counts": _counter_from_rows(alpha_rows, "alpha_price_adjustment"),
+            "alpha_return_price_source_counts": _counter_from_rows(alpha_rows, "alpha_return_price_source"),
+            "absolute_price_source_counts": _counter_from_rows(alpha_rows, "absolute_price_source"),
+            "adjustment_factor": _numeric_summary(alpha_rows, "adjustment_factor"),
+            "share_price_basis_status_counts": _counter_from_rows(alpha_rows, "shares_price_basis_status"),
+            "shares_split_adjustment_factor": _numeric_summary(
+                alpha_rows,
+                "shares_split_adjustment_factor",
+            ),
+            "rows_missing_raw_close": sum(1 for row in alpha_rows if _is_missing(row.get("raw_close"))),
+            "rows_missing_adjusted_close": sum(
+                1 for row in alpha_rows if _is_missing(row.get("adjusted_close"))
+            ),
+        },
         "price_asof_session_date_counts": _counter_from_rows(alpha_rows, "price_asof_session_date"),
         "price_staleness_days": {
             "count": len(price_ages),
@@ -11196,6 +11238,9 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             else None,
             "broker_corporate_actions": (run_dir / "broker_corporate_actions.json").as_posix()
             if (run_dir / "broker_corporate_actions.json").exists()
+            else None,
+            "alpha_price_basis": (run_dir / "alpha_price_basis.json").as_posix()
+            if (run_dir / "alpha_price_basis.json").exists()
             else None,
             "broker_order_snapshots": (run_dir / "broker_order_snapshots.json").as_posix()
             if (run_dir / "broker_order_snapshots.json").exists()

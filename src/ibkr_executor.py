@@ -33,6 +33,7 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
+from price_basis import summarize_alpha_price_basis_panel  # noqa: E402
 from vendors import (  # noqa: E402
     AlpacaHttpClient,
     AlpacaRequestError,
@@ -124,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     parser.add_argument("--feed", default="sip", help="Feed used by AlphaCore bars fetch.")
-    parser.add_argument("--price-adjustment", default="all")
+    parser.add_argument("--price-adjustment", choices=("split", "all"), default="all")
     parser.add_argument("--bars-window-calendar-days", type=int, default=420)
     parser.add_argument("--bars-chunk-size", type=int, default=120)
     parser.add_argument("--bars-workers", type=int, default=8)
@@ -315,6 +316,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(account_state_path, account_state)
         alpha_panel = pd.DataFrame()
         alpha_path: Path | None = None
+        alpha_price_basis_path: Path | None = None
+        alpha_price_basis_evidence: dict[str, Any] | None = None
         decision_targets_path: Path | None = None
         plan_input_path: str | None = None
         decision_status = "ok"
@@ -417,6 +420,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             alpha_panel = alpha_core.build_for_date(as_of_date=decision_date.isoformat(), symbols=symbols)
             alpha_path = output_root / f"alpha_core_panel_{decision_date.strftime('%Y%m%d')}.csv"
             alpha_panel.to_csv(alpha_path, index=False)
+            alpha_price_basis_path = output_root / "alpha_price_basis.json"
+            alpha_price_basis_evidence = summarize_alpha_price_basis_panel(
+                alpha_panel,
+                configured_adjustment=str(args.price_adjustment),
+            )
+            _write_json_file(alpha_price_basis_path, alpha_price_basis_evidence)
+            if alpha_price_basis_evidence.get("status") != "pass":
+                raise ValueError(
+                    "Alpha panel price-basis evidence is incomplete or inconsistent; "
+                    f"status={alpha_price_basis_evidence.get('status')}."
+                )
 
             decision_config = DecisionConfig(
                 factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
@@ -603,6 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "decision_date": decision_date.isoformat(),
             "session_idx": int(resolved_session_idx),
             "order_plan_input_path": plan_input_path,
+            "alpha_price_basis": alpha_price_basis_evidence,
             "execution_broker": "ibkr_client_portal",
             "broker_account_id": broker_account_id,
             "account_equity": float(sizing_equity),
@@ -622,6 +637,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "alignment_after_execution": alignment_after,
             "outputs": {
                 "alpha_panel_csv": alpha_path.as_posix() if alpha_path else None,
+                "alpha_price_basis_json": (
+                    alpha_price_basis_path.as_posix() if alpha_price_basis_path else None
+                ),
                 "decision_targets_csv": decision_targets_path.as_posix() if decision_targets_path else None,
                 "order_plan_json": plan_path.as_posix(),
                 "broker_positions_before_csv": (output_root / "broker_positions_before.csv").as_posix(),
@@ -949,7 +967,9 @@ def _build_fallback_price_map(
         alpha_tmp["symbol"] = alpha_tmp["symbol"].astype(str).str.upper()
         for row in alpha_tmp.itertuples(index=False):
             symbol = str(row.symbol).upper()
-            px = _safe_float(getattr(row, "close", None))
+            # Historical adjusted closes are valid for alpha returns only.
+            # Sizing/execution fallback must remain in broker/raw price units.
+            px = _safe_float(getattr(row, "raw_close", None))
             if px is None or px <= 0:
                 px = _safe_float(getattr(row, "lagged_raw_close", None))
             if px is not None and px > 0:

@@ -48,6 +48,7 @@ from dynamic_symbol_pool import (  # noqa: E402
     _resolve_alpaca_credentials,
 )
 from executable_target_projector import project_executable_targets  # noqa: E402
+from price_basis import summarize_alpha_price_basis_panel  # noqa: E402
 from vendors import (  # noqa: E402
     AlpacaHttpClient,
     AlpacaRequestError,
@@ -439,7 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     parser.add_argument("--feed", default="sip", help="Feed used by AlphaCore bars fetch. MUST be 'sip' for full market coverage.")
-    parser.add_argument("--price-adjustment", default="all")
+    parser.add_argument("--price-adjustment", choices=("split", "all"), default="all")
     parser.add_argument("--bars-window-calendar-days", type=int, default=420)
     parser.add_argument("--bars-chunk-size", type=int, default=120)
     parser.add_argument("--bars-workers", type=int, default=8)
@@ -1072,6 +1073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbol_universe_csv_path = output_root / "symbol_universe_intersection.csv"
         source_universe_input_path: Path | None = None
         alpha_cache_provenance_path: Path | None = None
+        alpha_price_basis_path = output_root / "alpha_price_basis.json"
 
         strategy_inputs = [
             value
@@ -1540,6 +1542,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             if symbol_universe_quote_client is not None:
                 symbol_universe_quote_client.close()
                 symbol_universe_quote_client = None
+        precomputed_target_source = bool(args.order_plan_input_path or args.decision_targets_input_path)
+        if alpha_panel.empty and precomputed_target_source:
+            alpha_price_basis_evidence = {
+                "schema_version": "1.0",
+                "artifact_type": "alpha_price_basis_evidence",
+                "status": "not_applicable_precomputed_targets",
+                "reason": (
+                    "Execution consumed precomputed target weights and did not load an Alpha panel; "
+                    "live unadjusted prices remain authoritative for sizing and orders."
+                ),
+                "alpha_price_adjustment": str(args.price_adjustment),
+                "raw_price_adjustment": "raw",
+                "alpha_row_count": 0,
+            }
+        else:
+            alpha_price_basis_evidence = summarize_alpha_price_basis_panel(
+                alpha_panel,
+                configured_adjustment=str(args.price_adjustment),
+            )
+        _write_json_file(alpha_price_basis_path, alpha_price_basis_evidence)
+        _mark_event(
+            run_events,
+            "alpha_price_basis_resolved",
+            {
+                "status": alpha_price_basis_evidence.get("status"),
+                "alpha_price_adjustment": alpha_price_basis_evidence.get("alpha_price_adjustment"),
+                "raw_price_adjustment": alpha_price_basis_evidence.get("raw_price_adjustment"),
+                "path": alpha_price_basis_path.as_posix(),
+            },
+        )
+        if not precomputed_target_source and alpha_price_basis_evidence.get("status") != "pass":
+            raise ValueError(
+                "Alpha panel price-basis evidence is incomplete or inconsistent; "
+                f"status={alpha_price_basis_evidence.get('status')}, "
+                f"missing_columns={alpha_price_basis_evidence.get('missing_required_columns')}, "
+                f"observed_adjustments={alpha_price_basis_evidence.get('observed_alpha_price_adjustments')}. "
+                "Regenerate the Alpha panel with this branch before decision/execution."
+            )
         _mark_event(
             run_events,
             "decision_targets_resolved",
@@ -2712,6 +2752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.alpha_panel_input_path
                 else None
             ),
+            "alpha_price_basis": alpha_price_basis_evidence,
             "position_continuity_guard": position_continuity_guard,
             "account_equity_preflight": float(equity_before),
             "account_equity_preflight_source": str(equity_before_source),
@@ -2835,6 +2876,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "python_environment_json": (output_root / "python_environment.json").as_posix(),
                 "input_file_manifest_json": (output_root / "input_file_manifest.json").as_posix(),
                 "alpha_panel_csv": alpha_path.as_posix() if alpha_path else None,
+                "alpha_price_basis_json": alpha_price_basis_path.as_posix(),
                 "alpha_cache_provenance_json": (
                     alpha_cache_provenance_path.as_posix() if alpha_cache_provenance_path else None
                 ),
@@ -3666,7 +3708,9 @@ def _build_fallback_price_map(
         alpha_tmp["symbol"] = alpha_tmp["symbol"].astype(str).str.upper()
         for row in alpha_tmp.itertuples(index=False):
             symbol = str(row.symbol).upper()
-            px = _safe_float(getattr(row, "close", None))
+            # Historical adjusted closes are valid for alpha returns only.
+            # Sizing/execution fallback must remain in broker/raw price units.
+            px = _safe_float(getattr(row, "raw_close", None))
             if px is None or px <= 0:
                 px = _safe_float(getattr(row, "lagged_raw_close", None))
             if px is not None and px > 0:
@@ -8234,6 +8278,7 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
         "portfolio_intent": [
             "decision_targets.csv",
             "alpha_core_panel_" + output_root.name[:8] + ".csv",
+            "alpha_price_basis.json",
             "symbol_universe_intersection.json",
             "symbol_universe_intersection.csv",
             "target_weights_snapshot.json",

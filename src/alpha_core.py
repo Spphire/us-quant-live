@@ -29,6 +29,14 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
+from corporate_actions import index_corporate_actions, resolve_split_factor  # noqa: E402
+from price_basis import (  # noqa: E402
+    DEFAULT_ALPHA_PRICE_ADJUSTMENT,
+    build_dual_price_panel,
+    normalize_alpha_price_adjustment,
+    normalize_price_adjustment,
+    summarize_alpha_price_basis_panel,
+)
 from vendors import AlpacaHttpClient, AlpacaRequestError  # noqa: E402
 
 
@@ -455,6 +463,19 @@ class AlphaCore:
         self._beta_clip_high = beta_clip_high
         self._max_price_staleness_days = max(0, int(max_price_staleness_days))
         self._factor_weights = dict(factor_weights)
+        self._price_adjustment = normalize_alpha_price_adjustment(self._price_adjustment)
+        self.last_price_basis_diagnostics: dict[str, Any] = {
+            "schema_version": "1.0",
+            "artifact_type": "alpha_price_basis_evidence",
+            "status": "not_built",
+            "alpha_price_adjustment": self._price_adjustment,
+            "raw_price_adjustment": "raw",
+        }
+        self.last_share_price_basis_diagnostics: dict[str, Any] = {
+            "schema_version": "1.0",
+            "artifact_type": "share_price_basis_diagnostics",
+            "status": "not_built",
+        }
 
     def build_for_date(self, *, as_of_date: str | date | datetime, symbols: Sequence[str]) -> pd.DataFrame:
         target_date = _normalize_date(as_of_date)
@@ -500,15 +521,20 @@ class AlphaCore:
         merged["session_date"] = target_date_str
         merged["sic2_sector"] = merged["sic2_sector"].fillna("UNKNOWN").astype(str)
         merged["sic4_industry"] = merged["sic4_industry"].fillna("UNKNOWN").astype(str)
+        merged["market_cap_price_asof_session_date"] = merged["lagged_raw_close_session_date"].where(
+            merged["lagged_raw_close"].notna(),
+            merged["price_asof_session_date"],
+        )
+        merged = self._align_shares_to_market_cap_price_basis(merged)
 
         merged["market_cap_price"] = merged["lagged_raw_close"].where(
             merged["lagged_raw_close"].notna(),
-            merged["close"],
+            merged["raw_close"],
         )
         merged["market_cap_price_source"] = np.where(
             merged["lagged_raw_close"].notna(),
             "lagged_raw_close",
-            np.where(merged["close"].notna(), "close_fallback", ""),
+            np.where(merged["raw_close"].notna(), "raw_close_fallback", ""),
         )
         merged["market_cap"] = pd.to_numeric(merged["market_cap_price"], errors="coerce") * pd.to_numeric(
             merged["shares_outstanding"],
@@ -541,19 +567,50 @@ class AlphaCore:
         end = data_cutoff_date
         all_symbols = sorted(set(symbols).union({self._benchmark_symbol}))
 
-        bars = self._collect_bars_for_symbols(
+        adjusted_bars = self._collect_bars_for_symbols(
             symbols=all_symbols,
             start=start.isoformat(),
             end=end.isoformat(),
+            adjustment=self._price_adjustment,
         )
-        panel = _bars_to_price_panel(bars)
+        raw_bars = (
+            adjusted_bars
+            if self._price_adjustment == "raw"
+            else self._collect_bars_for_symbols(
+                symbols=all_symbols,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                adjustment="raw",
+            )
+        )
+        panel, self.last_price_basis_diagnostics = build_dual_price_panel(
+            raw_bars=raw_bars,
+            adjusted_bars=adjusted_bars,
+            adjusted_price_adjustment=self._price_adjustment,
+        )
+        if self.last_price_basis_diagnostics.get("status") == "partial":
+            raise ValueError(
+                "Raw/adjusted Alpaca bar coverage mismatch: "
+                f"raw_only={self.last_price_basis_diagnostics.get('raw_only_row_count')}, "
+                f"adjusted_only={self.last_price_basis_diagnostics.get('adjusted_only_row_count')}, "
+                f"matched={self.last_price_basis_diagnostics.get('matched_row_count')}, "
+                f"panel_rows={self.last_price_basis_diagnostics.get('panel_row_count')}."
+            )
         if panel.empty:
             return pd.DataFrame(
                 columns=[
                     "symbol",
                     "price_asof_session_date",
                     "close",
+                    "raw_close",
+                    "adjusted_close",
                     "lagged_raw_close",
+                    "lagged_raw_close_session_date",
+                    "lagged_adjusted_close",
+                    "adjustment_factor",
+                    "alpha_price_adjustment",
+                    "alpha_return_price_source",
+                    "absolute_price_source",
                     "return_5d",
                     "momentum_l120_s20",
                     "beta_raw",
@@ -564,16 +621,24 @@ class AlphaCore:
 
         benchmark = panel[panel["symbol"].eq(self._benchmark_symbol)].copy()
         benchmark = benchmark.sort_values("session_date")
-        benchmark["benchmark_return"] = benchmark["close"].pct_change()
+        benchmark["benchmark_return"] = benchmark["adjusted_close"].pct_change()
         benchmark_returns = benchmark[["session_date", "benchmark_return"]].copy()
 
         stocks = panel[panel["symbol"].isin(set(symbols))].copy()
         stocks = stocks.sort_values(["symbol", "session_date"])
         grouped = stocks.groupby("symbol", group_keys=False)
-        stocks["symbol_return"] = grouped["close"].pct_change()
-        stocks["return_5d"] = grouped["close"].pct_change(5)
-        stocks["momentum_l120_s20"] = grouped["close"].shift(20) / grouped["close"].shift(140) - 1.0
-        stocks["lagged_raw_close"] = grouped["close"].shift(1)
+        stocks["symbol_return"] = grouped["adjusted_close"].pct_change()
+        stocks["return_5d"] = grouped["adjusted_close"].pct_change(5)
+        stocks["momentum_l120_s20"] = (
+            grouped["adjusted_close"].shift(20) / grouped["adjusted_close"].shift(140) - 1.0
+        )
+        stocks["lagged_raw_close"] = grouped["raw_close"].shift(1)
+        stocks["lagged_raw_close_session_date"] = grouped["session_date"].shift(1)
+        stocks["lagged_adjusted_close"] = grouped["adjusted_close"].shift(1)
+        # ``close`` is retained as the legacy absolute-price field.  It is
+        # deliberately raw so executor fallbacks can never consume adjusted
+        # history as a share-sizing price.
+        stocks["close"] = stocks["raw_close"]
 
         return_pairs = stocks[["session_date", "symbol", "symbol_return"]].merge(
             benchmark_returns,
@@ -630,7 +695,15 @@ class AlphaCore:
                     "symbol",
                     "session_date",
                     "close",
+                    "raw_close",
+                    "adjusted_close",
                     "lagged_raw_close",
+                    "lagged_raw_close_session_date",
+                    "lagged_adjusted_close",
+                    "adjustment_factor",
+                    "alpha_price_adjustment",
+                    "alpha_return_price_source",
+                    "absolute_price_source",
                     "return_5d",
                     "momentum_l120_s20",
                     "beta_raw",
@@ -643,14 +716,189 @@ class AlphaCore:
         )
         return out
 
-    def _collect_bars_for_symbols(self, *, symbols: Sequence[str], start: str, end: str) -> list[dict[str, Any]]:
+    def _align_shares_to_market_cap_price_basis(self, frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.copy()
+        reported = pd.to_numeric(
+            out.get("shares_outstanding", pd.Series(index=out.index, dtype=float)),
+            errors="coerce",
+        )
+        out["shares_outstanding_reported"] = reported
+        out["shares_split_adjustment_factor"] = 1.0
+        out["shares_outstanding_price_basis"] = reported
+        out["shares_price_basis_status"] = np.where(
+            reported.notna() & reported.gt(0.0),
+            "unadjusted_pending",
+            "missing_reported_shares",
+        )
+        out["shares_split_adjustment_start"] = ""
+        out["shares_split_adjustment_end"] = out.get("market_cap_price_asof_session_date", "")
+        out["shares_split_adjustment_dates"] = ""
+        out["shares_split_action_count"] = 0
+
+        eligible: list[tuple[Any, str, str, str, bool]] = []
+        basis_errors: list[dict[str, Any]] = []
+        for index, row in out.iterrows():
+            shares = _safe_float(row.get("shares_outstanding_reported"))
+            price_date = _clean_date(row.get("market_cap_price_asof_session_date"))
+            period_end = _clean_date(row.get("share_period_end"))
+            filed_date = _clean_date(row.get("share_filed_date"))
+            if shares is None or shares <= 0.0:
+                continue
+            if not price_date:
+                out.at[index, "shares_price_basis_status"] = "missing_market_cap_price_date"
+                basis_errors.append(
+                    {
+                        "symbol": str(row.get("symbol") or ""),
+                        "reason": "missing_market_cap_price_date",
+                    }
+                )
+                continue
+            spot_raw = row.get("share_is_spot", False)
+            spot = bool(spot_raw) if not pd.isna(spot_raw) else False
+            start_date = period_end if spot else max(period_end, filed_date)
+            if not start_date:
+                out.at[index, "shares_price_basis_status"] = "missing_share_basis_date"
+                basis_errors.append(
+                    {
+                        "symbol": str(row.get("symbol") or ""),
+                        "reason": "missing_share_basis_date",
+                    }
+                )
+                continue
+            eligible.append((index, str(row.get("symbol") or "").upper(), start_date, price_date, spot))
+
+        if not eligible:
+            self.last_share_price_basis_diagnostics = {
+                "schema_version": "1.0",
+                "artifact_type": "share_price_basis_diagnostics",
+                "status": "pass",
+                "eligible_symbol_count": 0,
+                "adjusted_symbol_count": 0,
+                "split_event_count": 0,
+                "raw_action_count": 0,
+                "deduplicated_action_count": 0,
+                "errors": basis_errors,
+            }
+            if basis_errors:
+                self.last_share_price_basis_diagnostics["status"] = "error"
+                raise ValueError(
+                    f"Unable to align reported shares to raw price basis: {basis_errors[:10]}"
+                )
+            return out
+
+        query_start = min(min(item[2], item[3]) for item in eligible)
+        query_end = max(max(item[2], item[3]) for item in eligible)
+        actions = (
+            self._collect_corporate_actions_for_symbols(
+                symbols=sorted({item[1] for item in eligible}),
+                start=query_start,
+                end=query_end,
+            )
+            if query_start < query_end
+            else []
+        )
+        actions_by_date = index_corporate_actions(actions)
+        adjusted_symbol_count = 0
+        split_event_count = 0
+        errors: list[dict[str, Any]] = list(basis_errors)
+        for index, symbol, start_date, price_date, spot in eligible:
+            factor = 1.0
+            applied_dates: list[str] = []
+            for action_date, date_actions in actions_by_date.items():
+                forward = start_date < price_date and start_date < action_date <= price_date
+                backward = price_date < start_date and price_date < action_date <= start_date
+                if not forward and not backward:
+                    continue
+                for action in date_actions:
+                    if str(action.get("symbol") or "").upper() != symbol:
+                        continue
+                    if "split" not in str(action.get("action_type") or "").lower():
+                        continue
+                    split_factor = resolve_split_factor(action)
+                    if split_factor is None:
+                        errors.append(
+                            {
+                                "symbol": symbol,
+                                "ex_date": action_date,
+                                "action_id": str(action.get("id") or ""),
+                                "reason": "invalid_split_ratio",
+                            }
+                        )
+                        continue
+                    factor *= float(split_factor) if forward else 1.0 / float(split_factor)
+                    applied_dates.append(action_date)
+                    split_event_count += 1
+            if applied_dates:
+                adjusted_symbol_count += 1
+            out.at[index, "shares_split_adjustment_factor"] = float(factor)
+            out.at[index, "shares_outstanding_price_basis"] = float(
+                _safe_float(out.at[index, "shares_outstanding_reported"]) or 0.0
+            ) * float(factor)
+            out.at[index, "shares_price_basis_status"] = (
+                "adjusted_for_splits" if applied_dates else "no_split_adjustment"
+            )
+            out.at[index, "shares_split_adjustment_start"] = start_date
+            out.at[index, "shares_split_adjustment_end"] = price_date
+            out.at[index, "shares_split_adjustment_dates"] = ";".join(applied_dates)
+            out.at[index, "shares_split_action_count"] = len(applied_dates)
+
+        out["shares_outstanding"] = pd.to_numeric(
+            out["shares_outstanding_price_basis"],
+            errors="coerce",
+        )
+        self.last_share_price_basis_diagnostics = {
+            "schema_version": "1.0",
+            "artifact_type": "share_price_basis_diagnostics",
+            "status": "error" if errors else "pass",
+            "query_start": query_start,
+            "query_end": query_end,
+            "eligible_symbol_count": len(eligible),
+            "adjusted_symbol_count": adjusted_symbol_count,
+            "split_event_count": split_event_count,
+            "raw_action_count": len(actions),
+            "deduplicated_action_count": sum(len(rows) for rows in actions_by_date.values()),
+            "split_adjustments": [
+                {
+                    "symbol": str(row.get("symbol") or ""),
+                    "reported_shares": _safe_float(row.get("shares_outstanding_reported")),
+                    "adjustment_factor": _safe_float(row.get("shares_split_adjustment_factor")),
+                    "price_basis_shares": _safe_float(row.get("shares_outstanding_price_basis")),
+                    "start": str(row.get("shares_split_adjustment_start") or ""),
+                    "end": str(row.get("shares_split_adjustment_end") or ""),
+                    "split_dates": str(row.get("shares_split_adjustment_dates") or ""),
+                }
+                for row in out.to_dict("records")
+                if _safe_float(row.get("shares_split_adjustment_factor")) not in (None, 1.0)
+            ],
+            "errors": errors,
+        }
+        if errors:
+            raise ValueError(f"Invalid split data while aligning market-cap shares: {errors[:10]}")
+        return out
+
+    def _collect_bars_for_symbols(
+        self,
+        *,
+        symbols: Sequence[str],
+        start: str,
+        end: str,
+        adjustment: str | None = None,
+    ) -> list[dict[str, Any]]:
         if not symbols:
             return []
+        requested_adjustment = normalize_price_adjustment(
+            adjustment if adjustment is not None else self._price_adjustment,
+            field_name="bars_adjustment",
+        )
         rows: list[dict[str, Any]] = []
         chunks = [list(chunk) for chunk in _chunks(symbols, self._bars_chunk_size)]
         total_chunks = max(1, len(chunks))
         worker_count = max(1, min(self._bars_workers, total_chunks))
-        _print_progress(label="Alpaca bars", current=0, total=total_chunks)
+        _print_progress(
+            label=f"Alpaca bars ({requested_adjustment})",
+            current=0,
+            total=total_chunks,
+        )
         if worker_count == 1:
             for idx, chunk in enumerate(chunks, start=1):
                 bars = self._alpaca_client.get_stock_bars(
@@ -658,12 +906,16 @@ class AlphaCore:
                     start=start,
                     end=end,
                     timeframe="1Day",
-                    adjustment=self._price_adjustment,
+                    adjustment=requested_adjustment,
                     feed=self._feed,
                     limit=10000,
                 )
                 rows.extend(bar for bar in bars if isinstance(bar, Mapping))
-                _print_progress(label="Alpaca bars", current=idx, total=total_chunks)
+                _print_progress(
+                    label=f"Alpaca bars ({requested_adjustment})",
+                    current=idx,
+                    total=total_chunks,
+                )
             return rows
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
@@ -677,7 +929,7 @@ class AlphaCore:
                     start=start,
                     end=end,
                     timeframe="1Day",
-                    adjustment=self._price_adjustment,
+                    adjustment=requested_adjustment,
                     feed=self._feed,
                     limit=10000,
                 ): chunk
@@ -688,13 +940,75 @@ class AlphaCore:
                 bars = future.result()
                 rows.extend(bar for bar in bars if isinstance(bar, Mapping))
                 completed += 1
-                _print_progress(label="Alpaca bars", current=completed, total=total_chunks)
+                _print_progress(
+                    label=f"Alpaca bars ({requested_adjustment})",
+                    current=completed,
+                    total=total_chunks,
+                )
         except KeyboardInterrupt:
             interrupted = True
             for future in future_to_chunk:
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
             print("\n[AlphaCore] interrupted by Ctrl+C during Alpaca bars fetch.", flush=True)
+            raise
+        finally:
+            if not interrupted:
+                executor.shutdown(wait=True)
+        return rows
+
+    def _collect_corporate_actions_for_symbols(
+        self,
+        *,
+        symbols: Sequence[str],
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        if not symbols or str(start)[:10] >= str(end)[:10]:
+            return []
+        chunks = [list(chunk) for chunk in _chunks(symbols, min(self._bars_chunk_size, 100))]
+        worker_count = max(1, min(self._bars_workers, len(chunks)))
+        rows: list[dict[str, Any]] = []
+        _print_progress(label="Alpaca corporate actions", current=0, total=len(chunks))
+        if worker_count == 1:
+            for index, chunk in enumerate(chunks, start=1):
+                rows.extend(
+                    action
+                    for action in self._alpaca_client.get_corporate_actions(
+                        symbols=chunk,
+                        start=str(start)[:10],
+                        end=str(end)[:10],
+                        limit=1000,
+                    )
+                    if isinstance(action, Mapping)
+                )
+                _print_progress(label="Alpaca corporate actions", current=index, total=len(chunks))
+            return rows
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+        futures: dict[concurrent.futures.Future[list[dict[str, Any]]], list[str]] = {}
+        interrupted = False
+        try:
+            futures = {
+                executor.submit(
+                    self._alpaca_client.get_corporate_actions,
+                    symbols=chunk,
+                    start=str(start)[:10],
+                    end=str(end)[:10],
+                    limit=1000,
+                ): chunk
+                for chunk in chunks
+            }
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                rows.extend(action for action in future.result() if isinstance(action, Mapping))
+                completed += 1
+                _print_progress(label="Alpaca corporate actions", current=completed, total=len(chunks))
+        except KeyboardInterrupt:
+            interrupted = True
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             if not interrupted:
@@ -1243,35 +1557,6 @@ def _iter_fact_units(tag_payload: Mapping[str, Any]) -> list[tuple[str, list[Any
     return ordered
 
 
-def _bars_to_price_panel(bars: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for bar in bars:
-        symbol = str(bar.get("symbol") or "").strip().upper()
-        timestamp = str(bar.get("t") or bar.get("timestamp") or "")
-        session_date = timestamp[:10] if len(timestamp) >= 10 else ""
-        close = _safe_float(bar.get("c"))
-        if close is None:
-            close = _safe_float(bar.get("close"))
-        if not symbol or not session_date or close is None or close <= 0:
-            continue
-        rows.append(
-            {
-                "symbol": symbol,
-                "session_date": session_date,
-                "close": float(close),
-            }
-        )
-    if not rows:
-        return pd.DataFrame(columns=["symbol", "session_date", "close"])
-    frame = pd.DataFrame(rows)
-    frame = (
-        frame.sort_values(["symbol", "session_date"])
-        .drop_duplicates(["symbol", "session_date"], keep="last")
-        .reset_index(drop=True)
-    )
-    return frame
-
-
 def _lagged_rolling_beta(
     return_pairs: pd.DataFrame,
     *,
@@ -1426,7 +1711,13 @@ def _normalize_date(raw: str | date | datetime) -> date:
     return date.fromisoformat(str(raw))
 
 
-def _build_summary(*, panel: pd.DataFrame, output_path: Path, symbols_count: int) -> dict[str, Any]:
+def _build_summary(
+    *,
+    panel: pd.DataFrame,
+    output_path: Path,
+    price_basis_path: Path,
+    symbols_count: int,
+) -> dict[str, Any]:
     rows = int(len(panel))
     return {
         "ok": True,
@@ -1437,6 +1728,16 @@ def _build_summary(*, panel: pd.DataFrame, output_path: Path, symbols_count: int
             "market_cap_log_non_null_rate": float(panel["market_cap_log"].notna().mean()) if rows else 0.0,
             "cash_to_assets_non_null_rate": float(panel["cash_to_assets"].notna().mean()) if rows else 0.0,
             "composite_score_non_null_rate": float(panel["composite_score"].notna().mean()) if rows else 0.0,
+        },
+        "price_basis": {
+            "artifact_path": price_basis_path.as_posix(),
+            "alpha_price_adjustment": (
+                str(panel["alpha_price_adjustment"].dropna().iloc[0])
+                if "alpha_price_adjustment" in panel and panel["alpha_price_adjustment"].notna().any()
+                else DEFAULT_ALPHA_PRICE_ADJUSTMENT
+            ),
+            "alpha_return_price_source": "adjusted_close",
+            "absolute_price_source": "raw_close",
         },
         "output_path": output_path.as_posix(),
     }
@@ -1557,7 +1858,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     parser.add_argument("--feed", default="iex")
-    parser.add_argument("--price-adjustment", default="all", help="raw/split/dividend/all")
+    parser.add_argument(
+        "--price-adjustment",
+        choices=("split", "all"),
+        default="all",
+        help="Return-price adjustment for Alpha factors; all includes cash dividends.",
+    )
     parser.add_argument("--bars-window-calendar-days", type=int, default=420)
     parser.add_argument("--bars-chunk-size", type=int, default=120)
     parser.add_argument(
@@ -1757,7 +2063,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         panel.to_csv(output_path, index=False)
 
-        summary = _build_summary(panel=panel, output_path=output_path, symbols_count=len(symbols))
+        price_basis_path = output_path.with_name(output_path.stem + "_price_basis.json")
+        price_basis_path.write_text(
+            json.dumps(
+                summarize_alpha_price_basis_panel(
+                    panel,
+                    configured_adjustment=str(args.price_adjustment),
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        summary = _build_summary(
+            panel=panel,
+            output_path=output_path,
+            price_basis_path=price_basis_path,
+            symbols_count=len(symbols),
+        )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     except KeyboardInterrupt:
         print(json.dumps({"ok": False, "error": "Interrupted by user (Ctrl+C)."}, ensure_ascii=False, indent=2))

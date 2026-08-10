@@ -52,6 +52,8 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
+from corporate_actions import apply_corporate_actions, index_corporate_actions  # noqa: E402
+from price_basis import normalize_alpha_price_adjustment, normalize_price_adjustment  # noqa: E402
 from vendors import AlpacaHttpClient, AlpacaRequestError  # noqa: E402
 
 
@@ -113,7 +115,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dynamic-beta-full-observations", type=int, default=252)
 
     parser.add_argument("--feed", default="iex")
-    parser.add_argument("--price-adjustment", default="all", help="raw/split/dividend/all")
+    parser.add_argument(
+        "--price-adjustment",
+        choices=("split", "all"),
+        default="all",
+        help="Return-price adjustment for Alpha factors; all includes cash dividends.",
+    )
     parser.add_argument("--bars-chunk-size", type=int, default=120)
     parser.add_argument("--bars-workers", type=int, default=8)
     parser.add_argument("--bars-window-calendar-days", type=int, default=420)
@@ -249,6 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        configured_price_adjustment = normalize_alpha_price_adjustment(str(args.price_adjustment))
         start_date = _normalize_date(args.start_date)
         end_date = _normalize_date(args.end_date)
         if end_date < start_date:
@@ -328,6 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         warmup_days = int(args.bars_window_calendar_days) + int(args.prefetch_buffer_days)
         prefetch_start = start_date - timedelta(days=warmup_days)
         prefetch_end = end_date
+        corporate_action_prefetch_start = start_date - timedelta(days=5 * 366)
 
         all_prefetch_symbols = sorted(
             set(tradable_candidates).union({str(args.benchmark_symbol).upper(), str(args.compare_symbol).upper()})
@@ -337,7 +346,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({prefetch_start.isoformat()} -> {prefetch_end.isoformat()}) ...",
             flush=True,
         )
-        bars = _collect_bars_parallel(
+        adjusted_bars = _collect_bars_parallel(
             client=alpaca_client,
             symbols=all_prefetch_symbols,
             start=prefetch_start.isoformat(),
@@ -345,16 +354,77 @@ def main(argv: Sequence[str] | None = None) -> int:
             chunk_size=int(args.bars_chunk_size),
             workers=int(args.bars_workers),
             feed=str(args.feed),
-            adjustment=str(args.price_adjustment),
+            adjustment=configured_price_adjustment,
         )
-        if not bars:
-            raise ValueError("No bars fetched from Alpaca for backtest range.")
-        bars_index = _build_bars_index(bars)
-        panel = _bars_to_panel_for_backtest(bars)
+        raw_bars = _collect_bars_parallel(
+            client=alpaca_client,
+            symbols=all_prefetch_symbols,
+            start=prefetch_start.isoformat(),
+            end=prefetch_end.isoformat(),
+            chunk_size=int(args.bars_chunk_size),
+            workers=int(args.bars_workers),
+            feed=str(args.feed),
+            adjustment="raw",
+        )
+        if not adjusted_bars or not raw_bars:
+            raise ValueError("No complete raw/adjusted bars fetched from Alpaca for backtest range.")
+        backtest_price_basis_path = output_root / "price_basis.json"
+        backtest_price_basis_coverage = _summarize_backtest_bar_basis_coverage(
+            raw_bars=raw_bars,
+            adjusted_bars=adjusted_bars,
+            alpha_price_adjustment=configured_price_adjustment,
+        )
+        backtest_price_basis_path.write_text(
+            json.dumps(backtest_price_basis_coverage, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if backtest_price_basis_coverage.get("status") != "pass":
+            raise ValueError(
+                "Backtest raw/adjusted bar coverage mismatch: "
+                f"raw_only={backtest_price_basis_coverage.get('raw_only_row_count')}, "
+                f"adjusted_only={backtest_price_basis_coverage.get('adjusted_only_row_count')}."
+            )
+        raw_bars_index = _build_bars_index(raw_bars)
+        adjusted_bars_index = _build_bars_index(adjusted_bars)
+        panel = _bars_to_panel_for_backtest(raw_bars)
+        benchmark_total_return_bars = (
+            adjusted_bars
+            if configured_price_adjustment == "all"
+            else _collect_bars_parallel(
+                client=alpaca_client,
+                symbols=sorted({str(args.benchmark_symbol).upper(), str(args.compare_symbol).upper()}),
+                start=prefetch_start.isoformat(),
+                end=prefetch_end.isoformat(),
+                chunk_size=int(args.bars_chunk_size),
+                workers=int(args.bars_workers),
+                feed=str(args.feed),
+                adjustment="all",
+            )
+        )
+        adjusted_panel = _bars_to_panel_for_backtest(benchmark_total_return_bars)
         if panel.empty:
-            raise ValueError("Bars panel is empty after normalization.")
+            raise ValueError("Raw bars panel is empty after normalization.")
+        if adjusted_panel.empty:
+            raise ValueError("Adjusted bars panel is empty after normalization.")
         print(
-            f"[Backtest] Step 2/6 done: raw_bars={len(bars)}, panel_rows={len(panel)}",
+            f"[Backtest] Step 2/6 done: raw_bars={len(raw_bars)}, "
+            f"adjusted_bars={len(adjusted_bars)}, panel_rows={len(panel)}",
+            flush=True,
+        )
+
+        print("[Backtest] Step 2.5/6: collecting corporate actions ...", flush=True)
+        corporate_actions = _collect_corporate_actions_parallel(
+            client=alpaca_client,
+            symbols=tradable_candidates,
+            start=corporate_action_prefetch_start.isoformat(),
+            end=end_date.isoformat(),
+            chunk_size=int(args.bars_chunk_size),
+            workers=int(args.bars_workers),
+        )
+        corporate_actions_by_date = index_corporate_actions(corporate_actions)
+        print(
+            f"[Backtest] Step 2.5/6 done: actions={len(corporate_actions)}, "
+            f"ex_dates={len(corporate_actions_by_date)}",
             flush=True,
         )
 
@@ -438,7 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sec_submissions_workers=int(args.sec_submissions_workers),
             sec_companyfacts_workers=int(args.sec_companyfacts_workers),
             feed=str(args.feed),
-            price_adjustment=str(args.price_adjustment),
+            price_adjustment=configured_price_adjustment,
             bars_window_calendar_days=int(args.bars_window_calendar_days),
             bars_chunk_size=int(args.bars_chunk_size),
             bars_workers=int(args.bars_workers),
@@ -452,7 +522,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_price_staleness_days=int(args.max_price_staleness_days),
             factor_weights=DEFAULT_FACTOR_WEIGHTS,
         )
-        alpha_core._collect_bars_for_symbols = _bind_cached_bar_collector(alpha_core, bars_index)  # type: ignore[attr-defined]
+        alpha_core._collect_bars_for_symbols = _bind_cached_bar_collector(  # type: ignore[attr-defined]
+            alpha_core,
+            {"raw": raw_bars_index, "adjusted": adjusted_bars_index},
+        )
+        alpha_core._collect_corporate_actions_for_symbols = _bind_cached_corporate_action_collector(  # type: ignore[attr-defined]
+            alpha_core,
+            corporate_actions,
+            coverage_start=corporate_action_prefetch_start.isoformat(),
+            coverage_end=end_date.isoformat(),
+        )
         print("[Backtest] Step 4.5/6: building SEC snapshot timelines from cache ...", flush=True)
         sec_symbol_snapshots = _build_sec_symbol_snapshots(
             sec_client=sec_client,
@@ -497,6 +576,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             panel.pivot_table(index="session_date", columns="symbol", values="open", aggfunc="last")
             .sort_index()
         )
+        benchmark_adjusted_close_pivot = (
+            adjusted_panel.pivot_table(index="session_date", columns="symbol", values="close", aggfunc="last")
+            .sort_index()
+        )
+        benchmark_adjusted_open_pivot = (
+            adjusted_panel.pivot_table(index="session_date", columns="symbol", values="open", aggfunc="last")
+            .sort_index()
+        )
 
         print("[Backtest] Step 5/6: running daily alpha -> decision -> open-execution loop ...", flush=True)
         daily_rows: list[dict[str, Any]] = []
@@ -536,6 +623,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             next_open = open_pivot.loc[next_session_ts] if next_session_ts in open_pivot.index else pd.Series(dtype=float)
             session_close = close_pivot.loc[session_ts] if session_ts in close_pivot.index else pd.Series(dtype=float)
             next_close = close_pivot.loc[next_session_ts] if next_session_ts in close_pivot.index else pd.Series(dtype=float)
+            benchmark_session_open = (
+                benchmark_adjusted_open_pivot.loc[session_ts]
+                if session_ts in benchmark_adjusted_open_pivot.index
+                else pd.Series(dtype=float)
+            )
+            benchmark_next_open = (
+                benchmark_adjusted_open_pivot.loc[next_session_ts]
+                if next_session_ts in benchmark_adjusted_open_pivot.index
+                else pd.Series(dtype=float)
+            )
+            benchmark_session_close = (
+                benchmark_adjusted_close_pivot.loc[session_ts]
+                if session_ts in benchmark_adjusted_close_pivot.index
+                else pd.Series(dtype=float)
+            )
+            benchmark_next_close = (
+                benchmark_adjusted_close_pivot.loc[next_session_ts]
+                if next_session_ts in benchmark_adjusted_close_pivot.index
+                else pd.Series(dtype=float)
+            )
             in_performance_window = bool(session_idx >= performance_warmup_sessions)
 
             symbols_today = _select_dynamic_pool_for_date(
@@ -547,7 +654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             data_cutoff_day = session_day - timedelta(days=1)
             symbols_ready = _filter_symbols_by_recent_price(
                 symbols=symbols_today,
-                bars_index=bars_index,
+                bars_index=raw_bars_index,
                 cutoff_date=data_cutoff_day.isoformat(),
                 max_staleness_days=int(args.max_price_staleness_days),
             )
@@ -580,21 +687,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             spy_ret = _open_to_open_return(
                 symbol=benchmark_symbol,
-                open_today=session_open,
-                open_next=next_open,
-                close_today=session_close,
-                close_next=next_close,
+                open_today=benchmark_session_open,
+                open_next=benchmark_next_open,
+                close_today=benchmark_session_close,
+                close_next=benchmark_next_close,
             )
             qqq_ret = _open_to_open_return(
                 symbol=compare_symbol,
-                open_today=session_open,
-                open_next=next_open,
-                close_today=session_close,
-                close_next=next_close,
+                open_today=benchmark_session_open,
+                open_next=benchmark_next_open,
+                close_today=benchmark_session_close,
+                close_next=benchmark_next_close,
             )
             if in_performance_window:
                 spy_equity_raw *= 1.0 + spy_ret
                 qqq_equity_raw *= 1.0 + qqq_ret
+
+            next_session_actions = corporate_actions_by_date.get(next_session_date, [])
+            _, session_action_diag = apply_corporate_actions(
+                shares={},
+                cash=0.0,
+                actions=next_session_actions,
+            )
+            if session_action_diag.get("errors"):
+                raise RuntimeError(
+                    f"Invalid corporate actions on ex_date={next_session_date}: "
+                    f"{session_action_diag['errors']}"
+                )
 
             tier_metrics: dict[str, dict[str, Any]] = {}
             for state in portfolio_states:
@@ -637,6 +756,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     instructions=instructions,
                     cost_model=cost_model,
                 )
+                state.cash, state_action_diag = apply_corporate_actions(
+                    shares=state.shares,
+                    cash=state.cash,
+                    actions=next_session_actions,
+                )
+                if state_action_diag.get("errors"):
+                    raise RuntimeError(
+                        f"Invalid corporate actions for portfolio={state.tag} "
+                        f"on ex_date={next_session_date}: {state_action_diag['errors']}"
+                    )
                 equity_next, _, after_missing = _portfolio_equity_and_notional(
                     state=state,
                     primary_prices=next_open,
@@ -676,6 +805,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "target_short_floor_realized_notional": float(target_floor_diag["realized_short_notional"]),
                     "order_count": int(len(instructions)),
                     "skipped_order_count": int(len(skipped_orders)),
+                    "corporate_action_cash_delta": float(state_action_diag["cash_delta"]),
+                    "corporate_action_split_count": int(state_action_diag["split_event_count"]),
+                    "corporate_action_dividend_count": int(state_action_diag["dividend_event_count"]),
+                    "corporate_action_unsupported_count": int(state_action_diag["unsupported_event_count"]),
                 }
 
             primary_metrics = tier_metrics[primary_equity_tag]
@@ -707,6 +840,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "gross_exposure": float(sum(abs(value) for value in target_signed_weights.values())),
                 "net_exposure": float(sum(target_signed_weights.values())),
                 "skip_reason": str(diagnostics.get("skip_reason", "") or diagnostics.get("carry_reason", "")),
+                "corporate_action_effective_date": next_session_date,
+                "corporate_action_count": int(session_action_diag["action_count"]),
+                "corporate_action_split_count": int(session_action_diag["split_event_count"]),
+                "corporate_action_dividend_count": int(session_action_diag["dividend_event_count"]),
+                "corporate_action_unsupported_count": int(session_action_diag["unsupported_event_count"]),
+                "corporate_action_cash_delta": float(primary_metrics["corporate_action_cash_delta"]),
             }
             for tag in strategy_tags:
                 metrics = tier_metrics[tag]
@@ -733,6 +872,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 row[f"strategy_orders_{tag}"] = int(metrics["order_count"])
                 row[f"strategy_skipped_orders_{tag}"] = int(metrics["skipped_order_count"])
+                row[f"strategy_corporate_action_cash_delta_{tag}"] = float(
+                    metrics["corporate_action_cash_delta"]
+                )
+                row[f"strategy_corporate_action_split_count_{tag}"] = int(
+                    metrics["corporate_action_split_count"]
+                )
+                row[f"strategy_corporate_action_dividend_count_{tag}"] = int(
+                    metrics["corporate_action_dividend_count"]
+                )
+                row[f"strategy_corporate_action_unsupported_count_{tag}"] = int(
+                    metrics["corporate_action_unsupported_count"]
+                )
             daily_rows.append(row)
 
             if checkpoint_every > 0 and ((session_idx + 1) % checkpoint_every == 0 or (session_idx + 1) == n_intervals):
@@ -790,6 +941,61 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             for scenario in execution_scenarios
         }
+        corporate_actions_path = output_root / "corporate_actions.json"
+        corporate_actions_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "artifact_type": "backtest_corporate_actions",
+                    "source": "Alpaca /v1/corporate-actions",
+                    "query_start": corporate_action_prefetch_start.isoformat(),
+                    "query_end": end_date.isoformat(),
+                    "raw_action_count": int(len(corporate_actions)),
+                    "deduplicated_action_count": int(
+                        sum(len(rows) for rows in corporate_actions_by_date.values())
+                    ),
+                    "ex_date_count": int(len(corporate_actions_by_date)),
+                    "actions": corporate_actions,
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        summary["price_basis"] = {
+            "artifact_path": backtest_price_basis_path.as_posix(),
+            "coverage_status": backtest_price_basis_coverage.get("status"),
+            "matched_row_count": backtest_price_basis_coverage.get("matched_row_count"),
+            "alpha_return_prices": f"adjustment={configured_price_adjustment}",
+            "absolute_price_and_liquidity": "adjustment=raw",
+            "portfolio_execution_and_mark_to_market": "raw OHLC plus explicit corporate actions",
+            "benchmark_returns": "adjustment=all (total return)",
+            "cash_dividend_timing": "economic ex-date cash; payable-date settlement timing is not modeled",
+            "unsupported_held_actions": "fail_closed",
+        }
+        summary["corporate_actions"] = {
+            "artifact_path": corporate_actions_path.as_posix(),
+            "raw_action_count": int(len(corporate_actions)),
+            "deduplicated_action_count": int(
+                sum(len(rows) for rows in corporate_actions_by_date.values())
+            ),
+            "applied_session_action_count": int(
+                _daily_numeric_sum(daily, "corporate_action_count")
+            ),
+            "split_event_count": int(
+                _daily_numeric_sum(daily, "corporate_action_split_count")
+            ),
+            "dividend_event_count": int(
+                _daily_numeric_sum(daily, "corporate_action_dividend_count")
+            ),
+            "unsupported_event_count": int(
+                _daily_numeric_sum(daily, "corporate_action_unsupported_count")
+            ),
+            "primary_portfolio_dividend_cash_delta": float(
+                _daily_numeric_sum(daily, "corporate_action_cash_delta")
+            ),
+        }
 
         print("[Backtest] Step 6/6: writing outputs ...", flush=True)
         daily_path = output_root / "daily_backtest_results.csv"
@@ -838,6 +1044,13 @@ def _normalize_date(raw: str | date | datetime) -> date:
     if isinstance(raw, date):
         return raw
     return date.fromisoformat(str(raw))
+
+
+def _daily_numeric_sum(frame: pd.DataFrame, column: str) -> float:
+    if column not in frame:
+        return 0.0
+    values = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    return float(values.sum())
 
 
 def _parse_float_list(text: str) -> list[float]:
@@ -1529,6 +1742,114 @@ def _collect_bars_parallel(
     return rows
 
 
+def _collect_corporate_actions_parallel(
+    *,
+    client: AlpacaHttpClient,
+    symbols: Sequence[str],
+    start: str,
+    end: str,
+    chunk_size: int,
+    workers: int,
+) -> list[dict[str, Any]]:
+    if not symbols:
+        return []
+    effective_chunk_size = max(1, min(int(chunk_size), 100))
+    chunks = [list(chunk) for chunk in _chunks(list(symbols), effective_chunk_size)]
+    total_chunks = max(1, len(chunks))
+    worker_count = max(1, min(int(workers), total_chunks))
+    rows: list[dict[str, Any]] = []
+    _print_progress(label="Alpaca corporate actions", current=0, total=total_chunks)
+    if worker_count == 1:
+        for idx, chunk in enumerate(chunks, start=1):
+            actions = client.get_corporate_actions(
+                symbols=chunk,
+                start=start,
+                end=end,
+                limit=1000,
+            )
+            rows.extend(action for action in actions if isinstance(action, Mapping))
+            _print_progress(label="Alpaca corporate actions", current=idx, total=total_chunks)
+        return rows
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    interrupted = False
+    futures: dict[concurrent.futures.Future[list[dict[str, Any]]], list[str]] = {}
+    try:
+        futures = {
+            executor.submit(
+                client.get_corporate_actions,
+                symbols=chunk,
+                start=start,
+                end=end,
+                limit=1000,
+            ): chunk
+            for chunk in chunks
+        }
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            actions = future.result()
+            rows.extend(action for action in actions if isinstance(action, Mapping))
+            completed += 1
+            _print_progress(label="Alpaca corporate actions", current=completed, total=total_chunks)
+    except KeyboardInterrupt:
+        interrupted = True
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        print("\n[Backtest] interrupted by Ctrl+C during corporate-action prefetch.", flush=True)
+        raise
+    finally:
+        if not interrupted:
+            executor.shutdown(wait=True)
+    return rows
+
+
+def _summarize_backtest_bar_basis_coverage(
+    *,
+    raw_bars: Sequence[Mapping[str, Any]],
+    adjusted_bars: Sequence[Mapping[str, Any]],
+    alpha_price_adjustment: str,
+) -> dict[str, Any]:
+    def keys(rows: Sequence[Mapping[str, Any]]) -> set[tuple[str, str]]:
+        return {
+            (str(row.get("symbol") or "").strip().upper(), timestamp[:10])
+            for row in rows
+            for timestamp in [str(row.get("t") or row.get("timestamp") or "")]
+            if str(row.get("symbol") or "").strip() and len(timestamp) >= 10
+        }
+
+    raw_keys = keys(raw_bars)
+    adjusted_keys = keys(adjusted_bars)
+    raw_only = sorted(raw_keys - adjusted_keys)
+    adjusted_only = sorted(adjusted_keys - raw_keys)
+    matched = raw_keys & adjusted_keys
+    return {
+        "schema_version": "1.0",
+        "artifact_type": "backtest_price_basis_coverage",
+        "status": "pass" if raw_keys and not raw_only and not adjusted_only else "partial",
+        "semantics": {
+            "alpha_return_prices": f"Alpaca adjustment={alpha_price_adjustment}",
+            "absolute_and_execution_prices": "Alpaca adjustment=raw",
+            "match_key": ["symbol", "session_date"],
+        },
+        "raw_input_row_count": len(raw_bars),
+        "adjusted_input_row_count": len(adjusted_bars),
+        "raw_unique_row_count": len(raw_keys),
+        "adjusted_unique_row_count": len(adjusted_keys),
+        "matched_row_count": len(matched),
+        "raw_only_row_count": len(raw_only),
+        "adjusted_only_row_count": len(adjusted_only),
+        "raw_only_sample": [
+            {"symbol": symbol, "session_date": session_date}
+            for symbol, session_date in raw_only[:100]
+        ],
+        "adjusted_only_sample": [
+            {"symbol": symbol, "session_date": session_date}
+            for symbol, session_date in adjusted_only[:100]
+        ],
+    }
+
+
 def _build_bars_index(bars: Sequence[Mapping[str, Any]]) -> dict[str, tuple[list[str], list[dict[str, Any]]]]:
     by_symbol_date: dict[str, dict[str, dict[str, Any]]] = {}
     for raw in bars:
@@ -1564,8 +1885,39 @@ def _build_bars_index(bars: Sequence[Mapping[str, Any]]) -> dict[str, tuple[list
     return out
 
 
-def _bind_cached_bar_collector(alpha_core: AlphaCore, bars_index: Mapping[str, tuple[list[str], list[dict[str, Any]]]]):
-    def _collect_cached(self: AlphaCore, *, symbols: Sequence[str], start: str, end: str) -> list[dict[str, Any]]:
+def _bind_cached_bar_collector(
+    alpha_core: AlphaCore,
+    bars_indexes: Mapping[str, Mapping[str, tuple[list[str], list[dict[str, Any]]]]],
+):
+    configured_adjustment = normalize_price_adjustment(
+        str(getattr(alpha_core, "_price_adjustment", "all")),
+        field_name="cached_alpha_price_adjustment",
+    )
+
+    def _collect_cached(
+        self: AlphaCore,
+        *,
+        symbols: Sequence[str],
+        start: str,
+        end: str,
+        adjustment: str | None = None,
+    ) -> list[dict[str, Any]]:
+        requested_adjustment = normalize_price_adjustment(
+            adjustment if adjustment is not None else configured_adjustment,
+            field_name="cached_bars_adjustment",
+        )
+        if requested_adjustment == "raw":
+            basis = "raw"
+        elif requested_adjustment == configured_adjustment:
+            basis = "adjusted"
+        else:
+            raise ValueError(
+                "Cached backtest bars do not contain requested adjustment "
+                f"{requested_adjustment!r}; configured adjusted basis is {configured_adjustment!r}."
+            )
+        bars_index = bars_indexes.get(basis)
+        if bars_index is None:
+            raise ValueError(f"Cached backtest bars are missing required {basis!r} basis.")
         rows: list[dict[str, Any]] = []
         start_token = str(start)[:10]
         end_token = str(end)[:10]
@@ -1579,6 +1931,46 @@ def _bind_cached_bar_collector(alpha_core: AlphaCore, bars_index: Mapping[str, t
             hi = bisect.bisect_right(dates, end_token)
             if hi > lo:
                 rows.extend(bars[lo:hi])
+        return rows
+
+    return _collect_cached.__get__(alpha_core, AlphaCore)
+
+
+def _bind_cached_corporate_action_collector(
+    alpha_core: AlphaCore,
+    actions: Sequence[Mapping[str, Any]],
+    *,
+    coverage_start: str,
+    coverage_end: str,
+):
+    indexed = index_corporate_actions(actions)
+    start_bound = str(coverage_start)[:10]
+    end_bound = str(coverage_end)[:10]
+
+    def _collect_cached(
+        self: AlphaCore,
+        *,
+        symbols: Sequence[str],
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        start_token = str(start)[:10]
+        end_token = str(end)[:10]
+        if start_token < start_bound or end_token > end_bound:
+            raise ValueError(
+                "Cached backtest corporate-action coverage is insufficient: "
+                f"requested={start_token}..{end_token}, available={start_bound}..{end_bound}."
+            )
+        requested_symbols = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+        rows: list[dict[str, Any]] = []
+        for action_date, date_actions in indexed.items():
+            if not start_token <= action_date <= end_token:
+                continue
+            rows.extend(
+                action
+                for action in date_actions
+                if str(action.get("symbol") or "").upper() in requested_symbols
+            )
         return rows
 
     return _collect_cached.__get__(alpha_core, AlphaCore)
