@@ -25,16 +25,19 @@ from src.alpaca_executor import (  # noqa: E402
     _build_target_capability_snapshot,
     OrderInstruction,
     _build_order_instructions,
+    _client_order_id,
     _collect_intraday_bars_snapshot,
     _collect_portfolio_history_snapshot,
     _effective_min_trade_notional,
     _execution_attempt_outcome_summary,
+    _execution_run_succeeded,
     _final_logical_execution_records,
     _is_insufficient_buying_power_error,
     _is_insufficient_qty_available_error,
     _marketable_offset_ladder,
     _mark_event,
     _submit_and_track_orders,
+    _submit_order_with_collision_recovery,
     _submit_staged_regt_orders,
     _total_regt_buying_power_capacity,
     _write_json_file_if_absent,
@@ -177,6 +180,68 @@ class _FractionalClosePrecisionClient(_ImmediateFillConcurrencyClient):
                 f'"message":"{self.error_message}"}}'
             )
         return super().submit_order(**kwargs)
+
+
+class _AmbiguousSubmitClient:
+    """Simulate a POST accepted by Alpaca before its response is lost."""
+
+    def __init__(self, existing_status: str | None) -> None:
+        self.existing_status = existing_status
+        self.submit_requests: list[dict[str, object]] = []
+        self.lookup_count = 0
+        self.orders: dict[str, dict[str, object]] = {}
+
+    @staticmethod
+    def _order(kwargs: dict[str, object], *, status: str) -> dict[str, object]:
+        qty = str(kwargs.get("qty") or "0")
+        filled_qty = qty if status == "filled" else "0"
+        return {
+            "id": f"order-{kwargs.get('client_order_id')}",
+            "client_order_id": str(kwargs.get("client_order_id") or ""),
+            "symbol": str(kwargs.get("symbol") or ""),
+            "side": str(kwargs.get("side") or ""),
+            "type": str(kwargs.get("type") or ""),
+            "time_in_force": str(kwargs.get("time_in_force") or ""),
+            "qty": qty,
+            "limit_price": kwargs.get("limit_price"),
+            "status": status,
+            "filled_qty": filled_qty,
+            "filled_avg_price": kwargs.get("limit_price") if status == "filled" else None,
+            "updated_at": "2026-08-10T14:00:00Z",
+        }
+
+    def submit_order(self, **kwargs):
+        request = dict(kwargs)
+        self.submit_requests.append(request)
+        client_order_id = str(request.get("client_order_id") or "")
+        if len(self.submit_requests) == 1:
+            if self.existing_status is not None:
+                self.orders[client_order_id] = self._order(
+                    request,
+                    status=self.existing_status,
+                )
+            raise AlpacaRequestError(
+                'Alpaca request failed with HTTP 422: '
+                '{"code":40010001,"message":"client_order_id must be unique"}'
+            )
+        order = self._order(request, status="filled")
+        self.orders[client_order_id] = dict(order)
+        return order
+
+    def get_order_by_client_order_id(self, client_order_id):
+        self.lookup_count += 1
+        if str(client_order_id) not in self.orders:
+            raise AlpacaRequestError("Alpaca request failed with HTTP 404: order not found")
+        return dict(self.orders[str(client_order_id)])
+
+    def get_order(self, order_id):
+        for order in self.orders.values():
+            if str(order.get("id")) == str(order_id):
+                return dict(order)
+        raise AlpacaRequestError("Alpaca request failed with HTTP 404: order not found")
+
+    def cancel_order(self, order_id):
+        return {}
 
 
 class _StagedNeverFillClient(_QuoteNeverFillClient):
@@ -1122,6 +1187,139 @@ def test_order_batch_caps_workers_at_empirical_rate_limit_boundary():
     print("  [OK] requested concurrency above ten is capped before broker submission")
 
 
+def test_duplicate_client_order_id_recovers_existing_fill():
+    client = _AmbiguousSubmitClient(existing_status="filled")
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=[
+            OrderInstruction(
+                symbol="BUD",
+                side="buy",
+                qty=2.0,
+                reference_price=82.7,
+                sizing_price=82.8,
+                current_notional=-2300.0,
+                target_notional=-2134.6,
+                delta_notional=165.4,
+                opening_short=False,
+                current_signed_qty=-28.0,
+                target_signed_qty=-26.0,
+            )
+        ],
+        session_token="ambiguous-fill",
+        timeout_seconds=2.0,
+        poll_seconds=0.05,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=1,
+    )
+    attempt = records[0]["attempts"][0]
+    assert len(client.submit_requests) == 1, client.submit_requests
+    assert client.lookup_count == 1, client.lookup_count
+    assert records[0]["status_latest"] == "filled", records[0]
+    assert records[0]["filled_qty"] == 2.0, records[0]
+    assert records[0]["remaining_qty"] == 0.0, records[0]
+    assert attempt["submit_recovery"]["outcome"] == "reconciled_existing_order", attempt
+    assert attempt["submit_recovery"]["request_match"] is True, attempt
+    print("  [OK] ambiguous duplicate-ID submit adopts the already-filled broker order")
+
+
+def test_duplicate_client_order_id_requotes_existing_canceled_order():
+    client = _AmbiguousSubmitClient(existing_status="canceled")
+    records = _submit_and_track_orders(
+        client=client,
+        instructions=[
+            OrderInstruction(
+                symbol="SHOP",
+                side="sell",
+                qty=22.0,
+                reference_price=153.73,
+                sizing_price=153.6,
+                current_notional=0.0,
+                target_notional=-3382.06,
+                delta_notional=-3382.06,
+                opening_short=True,
+                current_signed_qty=0.0,
+                target_signed_qty=-22.0,
+            )
+        ],
+        session_token="ambiguous-cancel",
+        timeout_seconds=2.0,
+        poll_seconds=0.05,
+        execution_order_style="marketable_limit",
+        marketable_limit_base_offset_bps=12.0,
+        marketable_limit_max_offset_bps=150.0,
+        marketable_limit_requote_steps_bps=[0.0, 25.0],
+        marketable_limit_requote_wait_seconds=0.1,
+        marketable_limit_max_attempts=2,
+    )
+    attempts = records[0]["attempts"]
+    assert len(client.submit_requests) == 2, client.submit_requests
+    assert records[0]["status_latest"] == "filled", records[0]
+    assert records[0]["filled_qty"] == 22.0, records[0]
+    assert len(attempts) == 2, attempts
+    assert attempts[0]["status_latest"] == "canceled", attempts
+    assert attempts[0]["submit_recovery"]["outcome"] == "reconciled_existing_order", attempts
+    assert attempts[1]["submit_recovery"]["outcome"] == "normal", attempts
+    assert attempts[0]["client_order_id"] != attempts[1]["client_order_id"], attempts
+    print("  [OK] recovered canceled order proceeds through the bounded requote ladder")
+
+
+def test_duplicate_client_order_id_without_order_uses_fresh_id():
+    client = _AmbiguousSubmitClient(existing_status=None)
+    original_id = "sm_original"
+    order, recovery = _submit_order_with_collision_recovery(
+        client=client,
+        request={
+            "symbol": "BUD",
+            "side": "buy",
+            "type": "limit",
+            "time_in_force": "day",
+            "qty": "2",
+            "limit_price": "82.8",
+            "client_order_id": original_id,
+        },
+        replacement_id_factory=lambda: "sm_replacement",
+        lookup_attempts=2,
+        lookup_wait_seconds=0.0,
+    )
+    assert client.lookup_count == 2, client.lookup_count
+    assert len(client.submit_requests) == 2, client.submit_requests
+    assert client.submit_requests[0]["client_order_id"] == original_id, client.submit_requests
+    assert client.submit_requests[1]["client_order_id"] == "sm_replacement", client.submit_requests
+    assert client.submit_requests[1]["qty"] == "2", client.submit_requests
+    assert order["status"] == "filled", order
+    assert recovery["outcome"] == "resubmitted_with_fresh_client_order_id", recovery
+    assert recovery["replacement_client_order_id"] == "sm_replacement", recovery
+    print("  [OK] unresolved duplicate-ID reservation resubmits unchanged intent with a fresh ID")
+
+
+def test_client_order_id_preserves_uniqueness_under_length_limit():
+    first = _client_order_id(
+        "very_long_entry_repair_session_token_i999",
+        idx=999,
+        side="sell",
+        symbol="LONGSYMBOL",
+        attempt_no=12,
+        nonce="abcdef",
+    )
+    second = _client_order_id(
+        "very_long_entry_repair_session_token_i999",
+        idx=999,
+        side="sell",
+        symbol="LONGSYMBOL",
+        attempt_no=12,
+        nonce="abcdeg",
+    )
+    assert len(first) <= 48, first
+    assert len(second) <= 48, second
+    assert first != second, (first, second)
+    print("  [OK] long staged IDs remain distinct inside Alpaca's 48-character limit")
+
+
 def test_fractional_long_close_retries_one_minimum_unit_lower():
     client = _FractionalClosePrecisionClient()
     records = _submit_and_track_orders(
@@ -1809,6 +2007,25 @@ def test_attempt_outcome_summary_separates_requotes_from_terminal_misses():
     print("  [OK] audit separates superseded requotes from final unfilled instructions")
 
 
+def test_terminal_unfilled_orders_force_an_execution_retry_status():
+    assert _execution_run_succeeded(
+        submit_error_count=0,
+        staged_abort_reason="",
+        attempt_outcome_summary={"terminal_unfilled_record_count": 1},
+    ) is False
+    assert _execution_run_succeeded(
+        submit_error_count=0,
+        staged_abort_reason="",
+        attempt_outcome_summary={"terminal_unfilled_record_count": 0},
+    ) is True
+    assert _execution_run_succeeded(
+        submit_error_count=0,
+        staged_abort_reason="entry_unfilled",
+        attempt_outcome_summary={"terminal_unfilled_record_count": 0},
+    ) is False
+    print("  [OK] terminal unfilled instructions cannot be reported as a successful execution")
+
+
 def test_audit_keeps_requote_fields():
     records = [
         {
@@ -1836,6 +2053,10 @@ def test_audit_keeps_requote_fields():
                     "offset_bps": 10.0,
                     "requote_step_index": 1,
                     "requote_cycle": 1,
+                    "submit_recovery": {
+                        "outcome": "reconciled_existing_order",
+                        "recovered_order_id": "broker-1",
+                    },
                     "cancel_reason": "requote_wait_elapsed",
                     "cancel_requested_at_utc": "2026-07-27T14:00:01Z",
                     "status_latest": "canceled",
@@ -1864,6 +2085,8 @@ def test_audit_keeps_requote_fields():
     assert attempt_rows[1]["max_offset_bps"] == 50.0
     assert attempt_rows[0]["cancel_reason"] == "requote_wait_elapsed"
     assert attempt_rows[0]["cancel_requested_at_utc"] == "2026-07-27T14:00:01Z"
+    assert attempt_rows[0]["submit_recovery_outcome"] == "reconciled_existing_order"
+    assert '"recovered_order_id": "broker-1"' in attempt_rows[0]["submit_recovery"]
 
     execution_rows, summary = _build_execution_attribution_outputs(records, [])
     assert execution_rows[1]["requote_step_index"] == 2
@@ -2295,6 +2518,10 @@ def main() -> int:
         ("Live quote marketable-limit reference", test_marketable_limit_uses_live_quote_side),
         ("Concurrent symbol execution", test_order_batch_runs_symbols_concurrently),
         ("Empirical execution worker safety cap", test_order_batch_caps_workers_at_empirical_rate_limit_boundary),
+        ("Ambiguous submit existing-fill recovery", test_duplicate_client_order_id_recovers_existing_fill),
+        ("Ambiguous submit canceled-order requote", test_duplicate_client_order_id_requotes_existing_canceled_order),
+        ("Ambiguous submit fresh-ID fallback", test_duplicate_client_order_id_without_order_uses_fresh_id),
+        ("Client-order ID length uniqueness", test_client_order_id_preserves_uniqueness_under_length_limit),
         ("Fractional long-close precision fallback", test_fractional_long_close_retries_one_minimum_unit_lower),
         ("Per-symbol attempt budget", test_per_symbol_attempt_budget_bounds_requotes),
         ("Cross-round staged attempt budget", test_staged_release_attempt_budget_is_global_across_rounds),
@@ -2307,6 +2534,7 @@ def main() -> int:
         ("Controlled post-release quote abort", test_staged_quote_failure_after_release_is_controlled_abort),
         ("Staged entry residual repair", test_staged_entry_residual_repair_fills_weight_priority_gap),
         ("Attempt outcome classification", test_attempt_outcome_summary_separates_requotes_from_terminal_misses),
+        ("Terminal unfilled retry status", test_terminal_unfilled_orders_force_an_execution_retry_status),
         ("Audit requote field propagation", test_audit_keeps_requote_fields),
         ("Audit submit-error payload parsing", test_audit_parses_submit_error_payload),
         ("Audit not-submitted reason", test_audit_marks_not_submitted_reason),

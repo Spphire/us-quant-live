@@ -8,6 +8,7 @@ import math
 import os
 import platform
 import re
+import uuid
 import socket
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -2230,7 +2231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     open_buffer_seconds=int(args.open_buffer_seconds),
                 )
 
-            session_token = f"{int(time.time() * 1000) % 100000000:08d}"
+            session_token = _new_session_token()
             if str(args.execution_mode) == "staged_regt":
                 release_timeout = (
                     float(args.staged_release_timeout_seconds)
@@ -2649,11 +2650,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             broker_weights=broker_weights_after,
         )
         staged_abort_reason = str(staged_diagnostics.get("entry_abort_reason") or "") if staged_diagnostics else ""
-        run_ok = bool(submit_error_count == 0 and not staged_abort_reason)
+        run_ok = _execution_run_succeeded(
+            submit_error_count=submit_error_count,
+            staged_abort_reason=staged_abort_reason,
+            attempt_outcome_summary=execution_attempt_outcome_summary,
+        )
+        terminal_unfilled_record_count = int(
+            execution_attempt_outcome_summary.get("terminal_unfilled_record_count") or 0
+        )
         phase_timings.finish(
             "post_run_audit_and_finalize",
             {
                 "run_ok": bool(run_ok),
+                "terminal_unfilled_record_count": terminal_unfilled_record_count,
                 "position_count_after": len(positions_after),
                 "order_poll_event_count": int(order_poll_timeline.get("event_count") or 0),
             },
@@ -2663,6 +2672,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             context={
                 "run_ok": bool(run_ok),
                 "submit_enabled": bool(should_submit),
+                "submit_error_count": int(submit_error_count),
+                "staged_abort_reason": staged_abort_reason,
+                "terminal_unfilled_record_count": terminal_unfilled_record_count,
             },
         )
         _mark_event(
@@ -4311,11 +4323,142 @@ def _client_order_id(
     side: str,
     symbol: str,
     attempt_no: int | None = None,
+    nonce: str | None = None,
 ) -> str:
     side_code = "b" if str(side).lower() == "buy" else "s"
     symbol_text = re.sub(r"[^a-z0-9]", "", str(symbol).lower())[:10] or "sym"
     suffix = f"a{int(attempt_no):02d}" if attempt_no is not None else "m"
-    return f"sm_{str(run_token).lower()}_{int(idx):03d}_{side_code}_{symbol_text}_{suffix}"[:48]
+    nonce_text = f"_n{str(nonce).lower()}" if nonce else ""
+    raw = f"sm_{str(run_token).lower()}_{int(idx):03d}_{side_code}_{symbol_text}_{suffix}{nonce_text}"
+    if len(raw) <= 48:
+        return raw
+    # Keep the broker's 48-character limit while retaining uniqueness when a
+    # long staged session token would otherwise truncate the attempt suffix.
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{raw[:39]}_{digest}"
+
+
+def _new_session_token() -> str:
+    """Return a compact process-unique token for broker client order IDs."""
+    return uuid.uuid4().hex[:8]
+
+
+def _is_client_order_id_collision_error(exc: Exception) -> bool:
+    payload = _alpaca_error_payload(exc)
+    return str(payload.get("code") or "") == "40010001" or (
+        "client_order_id must be unique" in str(payload.get("message") or "").lower()
+        or "client_order_id must be unique" in str(exc).lower()
+    )
+
+
+def _order_matches_submit_request(
+    order: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> tuple[bool, list[str]]:
+    """Verify that a recovered broker order is the order we intended."""
+    mismatches: list[str] = []
+    for field in ("symbol", "side", "time_in_force"):
+        requested = str(request.get(field) or "").strip().lower()
+        actual = str(order.get(field) or "").strip().lower()
+        if requested and actual != requested:
+            mismatches.append(field)
+    requested_type = str(request.get("type") or "").strip().lower()
+    actual_type = str(order.get("type") or order.get("order_type") or "").strip().lower()
+    if requested_type and actual_type != requested_type:
+        mismatches.append("type")
+
+    for field in ("qty", "notional", "limit_price"):
+        requested_value = _safe_float(request.get(field))
+        if requested_value is None:
+            continue
+        actual_value = _safe_float(order.get(field))
+        if actual_value is None or not math.isclose(
+            requested_value,
+            actual_value,
+            rel_tol=1e-8,
+            abs_tol=max(EPS, abs(requested_value) * 1e-8),
+        ):
+            mismatches.append(field)
+    return not mismatches, mismatches
+
+
+def _submit_order_with_collision_recovery(
+    *,
+    client: AlpacaHttpClient,
+    request: Mapping[str, Any],
+    replacement_id_factory: Callable[[], str],
+    lookup_attempts: int = 3,
+    lookup_wait_seconds: float = 0.5,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Submit once and resolve an ambiguous duplicate-ID response safely."""
+    initial_request = dict(request)
+    requested_id = str(initial_request.get("client_order_id") or "").strip()
+    if not requested_id:
+        return dict(client.submit_order(**initial_request)), {
+            "outcome": "normal",
+            "requested_client_order_id": "",
+        }
+    try:
+        return dict(client.submit_order(**initial_request)), {
+            "outcome": "normal",
+            "requested_client_order_id": requested_id,
+            "active_client_order_id": requested_id,
+        }
+    except AlpacaRequestError as exc:
+        if not _is_client_order_id_collision_error(exc):
+            raise
+        collision_payload = _alpaca_error_payload(exc)
+        lookup_errors: list[str] = []
+        recovered_order: dict[str, Any] | None = None
+        lookup = getattr(client, "get_order_by_client_order_id", None)
+        for lookup_index in range(1, max(1, int(lookup_attempts)) + 1):
+            if not callable(lookup):
+                lookup_errors.append("client does not expose client-order lookup")
+                break
+            try:
+                candidate = lookup(requested_id)
+                if isinstance(candidate, Mapping):
+                    recovered_order = dict(candidate)
+                    break
+            except AlpacaRequestError as lookup_exc:
+                lookup_errors.append(str(lookup_exc))
+                if lookup_index < max(1, int(lookup_attempts)):
+                    time.sleep(max(0.0, float(lookup_wait_seconds)))
+        if recovered_order is not None:
+            matches, mismatches = _order_matches_submit_request(recovered_order, initial_request)
+            if matches:
+                return recovered_order, {
+                    "outcome": "reconciled_existing_order",
+                    "requested_client_order_id": requested_id,
+                    "active_client_order_id": str(recovered_order.get("client_order_id") or requested_id),
+                    "recovered_order_id": str(recovered_order.get("id") or ""),
+                    "collision_error_code": collision_payload.get("code"),
+                    "collision_error_message": collision_payload.get("message"),
+                    "lookup_attempt_count": lookup_index,
+                    "lookup_errors": lookup_errors,
+                    "request_match": True,
+                }
+            lookup_errors.append(f"recovered order request mismatch: {','.join(mismatches)}")
+
+        replacement_id = str(replacement_id_factory()).strip()
+        if not replacement_id or replacement_id == requested_id:
+            raise AlpacaRequestError(
+                "Unable to produce a fresh client_order_id after collision."
+            ) from exc
+        replacement_request = dict(initial_request)
+        replacement_request["client_order_id"] = replacement_id
+        replacement_order = dict(client.submit_order(**replacement_request))
+        return replacement_order, {
+            "outcome": "resubmitted_with_fresh_client_order_id",
+            "requested_client_order_id": requested_id,
+            "active_client_order_id": replacement_id,
+            "replacement_client_order_id": replacement_id,
+            "collision_error_code": collision_payload.get("code"),
+            "collision_error_message": collision_payload.get("message"),
+            "lookup_attempt_count": lookup_index if callable(lookup) else 0,
+            "lookup_errors": lookup_errors,
+            "request_match": False,
+        }
 
 
 def _format_limit_price(value: float) -> str:
@@ -5160,6 +5303,24 @@ def _execution_attempt_outcome_summary(
     }
 
 
+def _execution_run_succeeded(
+    *,
+    submit_error_count: int,
+    staged_abort_reason: str,
+    attempt_outcome_summary: Mapping[str, Any],
+) -> bool:
+    """Require every final logical instruction to finish before declaring success."""
+    terminal_unfilled = int(
+        _safe_float(attempt_outcome_summary.get("terminal_unfilled_record_count"))
+        or 0
+    )
+    return bool(
+        int(submit_error_count) == 0
+        and not str(staged_abort_reason or "").strip()
+        and terminal_unfilled == 0
+    )
+
+
 def _submit_and_track_orders(
     *,
     client: AlpacaHttpClient,
@@ -5279,13 +5440,26 @@ def _submit_and_track_orders(
         try:
             if str(execution_order_style) == "market":
                 client_order_id = _client_order_id(session_token, idx=idx, side=item.side, symbol=item.symbol)
-                placed_order = client.submit_order(
-                    symbol=item.symbol,
-                    side=item.side,
-                    type="market",
-                    time_in_force="day",
-                    qty=_format_qty(item.qty),
-                    client_order_id=client_order_id,
+                placed_order, submit_recovery = _submit_order_with_collision_recovery(
+                    client=client,
+                    request={
+                        "symbol": item.symbol,
+                        "side": item.side,
+                        "type": "market",
+                        "time_in_force": "day",
+                        "qty": _format_qty(item.qty),
+                        "client_order_id": client_order_id,
+                    },
+                    replacement_id_factory=lambda: _client_order_id(
+                        session_token,
+                        idx=idx,
+                        side=item.side,
+                        symbol=item.symbol,
+                        nonce=uuid.uuid4().hex[:6],
+                    ),
+                )
+                client_order_id = str(
+                    submit_recovery.get("active_client_order_id") or client_order_id
                 )
                 order_id = str(placed_order.get("id") or "")
                 deadline = time.monotonic() + max(1.0, float(timeout_seconds))
@@ -5310,6 +5484,7 @@ def _submit_and_track_orders(
                     **base_record,
                     "execution_order_style": "market",
                     "client_order_id": client_order_id,
+                    "submit_recovery": submit_recovery,
                     "order_id": order_id,
                     "status_initial": _order_status(placed_order),
                     "status_latest": _order_status(latest_order),
@@ -5382,15 +5557,34 @@ def _submit_and_track_orders(
                     symbol=item.symbol,
                     attempt_no=attempt_no,
                 )
+                submit_recovery: dict[str, Any] = {
+                    "outcome": "normal",
+                    "requested_client_order_id": client_order_id,
+                    "active_client_order_id": client_order_id,
+                }
                 try:
-                    placed_order = client.submit_order(
-                        symbol=item.symbol,
-                        side=item.side,
-                        type="limit",
-                        time_in_force="day",
-                        qty=_format_qty(remaining_qty),
-                        limit_price=_format_limit_price(limit_price),
-                        client_order_id=client_order_id,
+                    placed_order, submit_recovery = _submit_order_with_collision_recovery(
+                        client=client,
+                        request={
+                            "symbol": item.symbol,
+                            "side": item.side,
+                            "type": "limit",
+                            "time_in_force": "day",
+                            "qty": _format_qty(remaining_qty),
+                            "limit_price": _format_limit_price(limit_price),
+                            "client_order_id": client_order_id,
+                        },
+                        replacement_id_factory=lambda: _client_order_id(
+                            session_token,
+                            idx=idx,
+                            side=item.side,
+                            symbol=item.symbol,
+                            attempt_no=attempt_no,
+                            nonce=uuid.uuid4().hex[:6],
+                        ),
+                    )
+                    client_order_id = str(
+                        submit_recovery.get("active_client_order_id") or client_order_id
                     )
                 except AlpacaRequestError as exc:
                     retry_qty = _fractional_long_close_retry_qty(
@@ -5415,15 +5609,45 @@ def _submit_and_track_orders(
                         - float(retry_qty),
                     )
                     remaining_qty = float(retry_qty)
-                    placed_order = client.submit_order(
-                        symbol=item.symbol,
+                    adjusted_client_order_id = _client_order_id(
+                        session_token,
+                        idx=idx,
                         side=item.side,
-                        type="limit",
-                        time_in_force="day",
-                        qty=_format_qty(remaining_qty),
-                        limit_price=_format_limit_price(limit_price),
-                        client_order_id=client_order_id,
+                        symbol=item.symbol,
+                        attempt_no=attempt_no,
+                        nonce=f"q{fractional_close_retry_count}{uuid.uuid4().hex[:4]}",
                     )
+                    placed_order, adjusted_submit_recovery = _submit_order_with_collision_recovery(
+                        client=client,
+                        request={
+                            "symbol": item.symbol,
+                            "side": item.side,
+                            "type": "limit",
+                            "time_in_force": "day",
+                            "qty": _format_qty(remaining_qty),
+                            "limit_price": _format_limit_price(limit_price),
+                            "client_order_id": adjusted_client_order_id,
+                        },
+                        replacement_id_factory=lambda: _client_order_id(
+                            session_token,
+                            idx=idx,
+                            side=item.side,
+                            symbol=item.symbol,
+                            attempt_no=attempt_no,
+                            nonce=f"q{fractional_close_retry_count}{uuid.uuid4().hex[:6]}",
+                        ),
+                    )
+                    client_order_id = str(
+                        adjusted_submit_recovery.get("active_client_order_id")
+                        or adjusted_client_order_id
+                    )
+                    submit_recovery = {
+                        "outcome": "fractional_qty_retry",
+                        "initial_rejection": _alpaca_error_payload(exc),
+                        "adjusted_submission": adjusted_submit_recovery,
+                        "requested_client_order_id": adjusted_client_order_id,
+                        "active_client_order_id": client_order_id,
+                    }
                 order_id = str(placed_order.get("id") or "")
                 attempt_deadline = min(
                     global_deadline,
@@ -5525,6 +5749,7 @@ def _submit_and_track_orders(
                         "requote_cycle": int(cycle_no + 1),
                         "client_order_id": client_order_id,
                         "order_id": order_id,
+                        "submit_recovery": submit_recovery,
                         "qty_submitted": float(
                             _safe_float(placed_order.get("qty")) or remaining_qty + filled_qty_this_attempt
                         ),

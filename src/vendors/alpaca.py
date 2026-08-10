@@ -399,6 +399,26 @@ class AlpacaHttpClient:
             raise AlpacaRequestError("Unexpected Alpaca order payload shape.")
         return payload
 
+    def get_order_by_client_order_id(self, client_order_id: str) -> dict[str, Any]:
+        """Look up an order after an ambiguous submit response.
+
+        A POST can reach Alpaca while its response is lost in transit.  The
+        subsequent retry then returns ``client_order_id must be unique`` even
+        though the original order may already be working or filled.  This
+        endpoint lets the execution layer resolve that state without placing a
+        duplicate order.
+        """
+        value = str(client_order_id or "").strip()
+        if not value:
+            raise ValueError("client_order_id is required for order lookup.")
+        payload = self._get_trading(
+            "/v2/orders:by_client_order_id",
+            {"client_order_id": value},
+        )
+        if not isinstance(payload, dict):
+            raise AlpacaRequestError("Unexpected Alpaca client-order lookup payload shape.")
+        return payload
+
     def get_latest_trades(
         self,
         *,

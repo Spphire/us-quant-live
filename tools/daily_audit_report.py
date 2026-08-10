@@ -391,6 +391,11 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
             "stage_symbol_attempts_remaining": _safe_int(
                 record.get("stage_symbol_attempts_remaining")
             ),
+            "record_submit_recovery_outcome": str(
+                (record.get("submit_recovery") or {}).get("outcome")
+                if isinstance(record.get("submit_recovery"), dict)
+                else ""
+            ),
         }
         attempts = record.get("attempts")
         if isinstance(attempts, list) and attempts:
@@ -400,12 +405,22 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
                 order_id = str(attempt.get("order_id") or "")
                 stats = fill_stats.get(order_id, {})
                 error_payload = _broker_error_payload(attempt, record)
+                submit_recovery = attempt.get("submit_recovery") or record.get("submit_recovery") or {}
                 rows.append(
                     {
                         **base,
                         "attempt_index": int(attempt_index),
                         "attempt_no": _safe_int(attempt.get("attempt_no"), default=attempt_index),
                         "attempt_client_order_id": str(attempt.get("client_order_id") or ""),
+                        "submit_recovery_outcome": str(
+                            submit_recovery.get("outcome") if isinstance(submit_recovery, dict) else ""
+                        ),
+                        "submit_recovery": json.dumps(
+                            submit_recovery,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ) if submit_recovery else "",
                         "attempt_order_id": order_id,
                         "qty_submitted": _safe_float(attempt.get("qty_submitted")),
                         "limit_price": _safe_float(attempt.get("limit_price")),
@@ -485,12 +500,22 @@ def _build_order_attempt_rows(records: list[dict[str, Any]], fill_rows: list[dic
             order_id = str(record.get("order_id") or "")
             stats = fill_stats.get(order_id, {})
             error_payload = _broker_error_payload(record)
+            submit_recovery = record.get("submit_recovery") or {}
             rows.append(
                 {
                     **base,
                     "attempt_index": 1,
                     "attempt_no": 1,
                     "attempt_client_order_id": str(record.get("client_order_id") or ""),
+                    "submit_recovery_outcome": str(
+                        submit_recovery.get("outcome") if isinstance(submit_recovery, dict) else ""
+                    ),
+                    "submit_recovery": json.dumps(
+                        submit_recovery,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ) if submit_recovery else "",
                     "attempt_order_id": order_id,
                     "qty_submitted": _safe_float(record.get("qty")),
                     "limit_price": "",
@@ -9736,6 +9761,13 @@ def _build_order_trace(
                 "opening_short": bool(order.get("opening_short")),
                 "client_order_id": rec.get("client_order_id", ""),
                 "order_id": rec.get("order_id", ""),
+                "submit_recovery_outcome": rec.get("submit_recovery_outcome", ""),
+                "submit_recovery": json.dumps(
+                    rec.get("submit_recovery") or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ) if rec.get("submit_recovery") else "",
                 "status_latest": status_latest,
                 "not_submitted_reason": not_submitted_reason,
                 "filled_qty": _safe_float(rec.get("filled_qty")),
@@ -9842,6 +9874,12 @@ def _aggregate_order_records_for_plan(*, order: dict[str, Any], records: list[di
         "abort_remaining_orders": any(bool(record.get("abort_remaining_orders")) for record in records_sorted),
         "error_type": latest_record.get("error_type", ""),
         "error": latest_record.get("error", ""),
+        "submit_recovery": latest_record.get("submit_recovery") or {},
+        "submit_recovery_outcome": str(
+            (latest_record.get("submit_recovery") or {}).get("outcome")
+            if isinstance(latest_record.get("submit_recovery"), dict)
+            else ""
+        ),
     }
 
 
@@ -11579,6 +11617,7 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
     _write_csv(audit_dir / "03_order_trace.csv", order_rows, [
         "symbol", "side", "stage", "planned_qty", "planned_delta_notional", "reference_price", "sizing_price",
         "target_notional", "current_notional", "opening_short", "client_order_id", "order_id", "status_latest",
+        "submit_recovery_outcome", "submit_recovery",
         "not_submitted_reason", "filled_qty", "remaining_qty", "filled_avg_price", "attempt_count",
         "submitted_at_utc", "updated_at", "slippage_bps", "filled_notional", "requested_qty",
         "submit_error_class", "broker_error_code", "broker_error_message", "broker_available_qty",
@@ -11639,7 +11678,8 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         "batch_started_at_utc", "queue_wait_ms", "order_wall_time_seconds", "attempt_index",
         "stage_symbol_attempt_cap", "stage_symbol_attempt_count_before",
         "stage_symbol_attempt_count_after", "stage_symbol_attempts_remaining",
-        "attempt_no", "attempt_client_order_id", "attempt_order_id", "qty_submitted", "limit_price",
+        "attempt_no", "attempt_client_order_id", "submit_recovery_outcome", "submit_recovery",
+        "attempt_order_id", "qty_submitted", "limit_price",
         "offset_bps", "requote_step_index", "requote_cycle", "max_offset_bps", "status_latest",
         "cancel_reason", "cancel_requested_at_utc", "cancel_error_type", "cancel_error",
         "live_reference_price", "reference_price_source", "quote_refresh_error",
