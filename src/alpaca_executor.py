@@ -2721,9 +2721,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         latest_quotes_after_snapshot = _safe_broker_call(
             "get_latest_quotes_for_after_symbols",
-            lambda: execution_quote_client.get_latest_quotes(
-                symbols=intraday_bar_symbols_after,
-                feed=execution_quote_feed,
+            lambda: (
+                execution_quote_client.get_latest_quotes(
+                    symbols=intraday_bar_symbols_after,
+                    feed=execution_quote_feed,
+                    require_fresh=True,
+                    allow_wide_spread=True,
+                )
+                if active_quote_provider == "longbridge"
+                else execution_quote_client.get_latest_quotes(
+                    symbols=intraday_bar_symbols_after,
+                    feed=execution_quote_feed,
+                )
             )
             if intraday_bar_symbols_after
             else {},
