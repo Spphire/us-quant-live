@@ -15,7 +15,7 @@ for path in (SRC_ROOT, ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from alpha_core import AlphaCore  # noqa: E402
+from alpha_core import AlphaCore, _extract_share_snapshot  # noqa: E402
 from alpaca_executor import _build_fallback_price_map  # noqa: E402
 from price_basis import (  # noqa: E402
     build_dual_price_panel,
@@ -193,6 +193,65 @@ def test_market_cap_shares_are_forward_adjusted_to_raw_price_date() -> None:
     assert reverse_row["shares_outstanding"] == 2_460_000_000.0
 
 
+def test_share_snapshot_rejects_future_measurement_dates() -> None:
+    payload = {
+        "facts": {
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {
+                        "shares": [
+                            {
+                                "end": "2027-07-17",
+                                "val": 661_969_951,
+                                "accn": "future",
+                                "form": "10-Q",
+                                "filed": "2026-07-23",
+                            },
+                            {
+                                "end": "2026-05-01",
+                                "val": 650_000_000,
+                                "accn": "valid",
+                                "form": "10-Q",
+                                "filed": "2026-05-03",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    snapshot = _extract_share_snapshot(payload, as_of_date="2026-08-06")
+    assert snapshot["shares_outstanding"] == 650_000_000.0
+    assert snapshot["share_accession"] == "valid"
+
+
+def test_share_alignment_rejects_future_measurement_dates() -> None:
+    core = AlphaCore(
+        alpaca_client=SimpleNamespace(),
+        sec_client=SimpleNamespace(),
+        industry_map=pd.DataFrame(columns=["symbol", "sic2_sector", "sic4_industry"]),
+    )
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAL",
+                "session_date": "2026-08-07",
+                "shares_outstanding": 661_969_951.0,
+                "share_is_spot": True,
+                "share_period_end": "2027-07-17",
+                "share_filed_date": "2026-07-23",
+                "market_cap_price_asof_session_date": "2026-08-06",
+            }
+        ]
+    )
+    try:
+        core._align_shares_to_market_cap_price_basis(frame)  # type: ignore[attr-defined]
+    except ValueError as exc:
+        assert "share_period_end_after_decision_date" in str(exc)
+    else:
+        raise AssertionError("future share measurement date must fail closed")
+
+
 def main() -> int:
     tests = [
         test_alpha_returns_use_adjusted_closes_but_keep_raw_absolute_prices,
@@ -200,6 +259,8 @@ def main() -> int:
         test_alpha_price_basis_evidence_rejects_old_or_mismatched_panels,
         test_execution_fallback_uses_raw_only_and_rejects_adjusted_only_history,
         test_market_cap_shares_are_forward_adjusted_to_raw_price_date,
+        test_share_snapshot_rejects_future_measurement_dates,
+        test_share_alignment_rejects_future_measurement_dates,
     ]
     for test in tests:
         test()

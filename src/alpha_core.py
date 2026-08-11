@@ -753,6 +753,18 @@ class AlphaCore:
                     }
                 )
                 continue
+            decision_date = _clean_date(row.get("session_date"))
+            if decision_date and period_end and period_end > decision_date:
+                out.at[index, "shares_price_basis_status"] = "future_share_period_end"
+                basis_errors.append(
+                    {
+                        "symbol": str(row.get("symbol") or ""),
+                        "period_end": period_end,
+                        "decision_date": decision_date,
+                        "reason": "share_period_end_after_decision_date",
+                    }
+                )
+                continue
             spot_raw = row.get("share_is_spot", False)
             spot = bool(spot_raw) if not pd.isna(spot_raw) else False
             start_date = period_end if spot else max(period_end, filed_date)
@@ -1423,6 +1435,11 @@ def _extract_share_snapshot(payload: Mapping[str, Any], *, as_of_date: str) -> d
                     if not filed_date or not period_end or form not in FACT_FORMS:
                         continue
                     if filed_date > as_of_date:
+                        continue
+                    # SEC occasionally publishes malformed/future-dated facts.
+                    # A point-in-time Alpha run must never use a share count
+                    # whose measurement date is after the decision cutoff.
+                    if period_end > as_of_date:
                         continue
                     value = _safe_float(fact.get("val"))
                     if value is None or not np.isfinite(value) or value <= 0:
