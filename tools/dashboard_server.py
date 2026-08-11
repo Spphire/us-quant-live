@@ -45,9 +45,22 @@ except ModuleNotFoundError:
 class DataAggregator:
     """Aggregate and cache data from artifacts directory."""
 
-    def __init__(self, artifacts_root: Path, project_root: Path):
+    def __init__(
+        self,
+        artifacts_root: Path,
+        project_root: Path,
+        dashboard_port: int = 18076,
+    ):
         self.artifacts_root = artifacts_root
         self.project_root = project_root
+        self.dashboard_port = int(dashboard_port)
+        self.autostart_task_name = str(
+            os.environ.get("US_QUANT_LIVE_AUTOSTART_TASK_NAME")
+            or "US Quant Live Tray"
+        )
+        self.start_script_name = str(
+            os.environ.get("US_QUANT_LIVE_START_SCRIPT_NAME") or "Start.bat"
+        )
         self.cache: dict[str, Any] = {}
         self.cache_lock = Lock()
         self._last_refresh = 0.0
@@ -631,13 +644,13 @@ class DataAggregator:
 
         return {
             "trading": {
-                "account": "ALPACA_US_FULL",
+                "account": os.environ.get("US_QUANT_LIVE_ACCOUNT_NAME") or "ALPACA_US_FULL",
                 "feed": "sip",
                 "execution_mode": "staged_regt",
-                "target_ny_time": "10:00",
-                "prepare_time_cn": "12:30",
-                "decision_time_cn": "21:00",
-                "execute_time_cn": "22:00",
+                "target_ny_time": os.environ.get("US_QUANT_LIVE_TARGET_NY_TIME") or "10:00",
+                "prepare_time_cn": os.environ.get("US_QUANT_LIVE_PREPARE_TIME_CN") or "12:30",
+                "decision_time_cn": os.environ.get("US_QUANT_LIVE_DECISION_TIME_CN") or "21:00",
+                "execute_time_cn": os.environ.get("US_QUANT_LIVE_EXECUTE_TIME_CN") or "22:00",
             },
             "system": {
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
@@ -679,8 +692,8 @@ class DataAggregator:
             "schema_version": "1.0",
             "generated_at_utc": datetime.utcnow().isoformat() + "Z",
             "start_bat": {
-                "path": (self.project_root / "Start.bat").as_posix(),
-                "exists": (self.project_root / "Start.bat").exists(),
+                "path": (self.project_root / self.start_script_name).as_posix(),
+                "exists": (self.project_root / self.start_script_name).exists(),
             },
             "startup_log": self._file_tail_info(startup_log, max_lines=80, max_bytes=20000),
             "pid_files": {key: self._file_tail_info(path, max_lines=1, max_bytes=2000) for key, path in pid_paths.items()},
@@ -730,6 +743,10 @@ class DataAggregator:
             str(script),
             "-ProjectRoot",
             str(self.project_root),
+            "-TaskName",
+            self.autostart_task_name,
+            "-StartScript",
+            self.start_script_name,
             "-Status",
         ]
         try:
@@ -779,7 +796,7 @@ class DataAggregator:
         processes = self._project_processes()
         by_pid = {int(p["pid"]): p for p in processes if p.get("pid") is not None}
         dashboard_pid = os.getpid()
-        listener_pid = self._port_listener_pid(18076)
+        listener_pid = self._port_listener_pid(self.dashboard_port)
         launcher_pid = target_pids.get("launcher")
         scheduler_pid = target_pids.get("scheduler")
 
@@ -868,12 +885,16 @@ class DataAggregator:
         ps = (
             "$root = " + self._ps_single_quoted(root) + "; "
             "$self = [int]$PID; "
-            "$needles=@('tools\\tray_launcher.py','tools\\daily_alpaca_scheduler.py','tools\\dashboard_server.py','tools\\watch_daily_alpaca_scheduler.ps1'); "
+            "$needles=@("
+            "  (Join-Path $root 'tools\\tray_launcher.py'),"
+            "  (Join-Path $root 'tools\\daily_alpaca_scheduler.py'),"
+            "  (Join-Path $root 'tools\\dashboard_server.py'),"
+            "  (Join-Path $root 'tools\\watch_daily_alpaca_scheduler.ps1')"
+            "); "
             "$items = @(Get-CimInstance Win32_Process | Where-Object { "
             "  if([int]$_.ProcessId -eq $self){ return $false }; "
             "  $cmd=[string]$_.CommandLine; "
             "  if(-not $cmd){ return $false }; "
-            "  ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and "
             "  (($needles | Where-Object { $cmd.IndexOf($_,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0) "
             "} | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine); "
             "$items | ConvertTo-Json -Compress"
@@ -2237,7 +2258,7 @@ def main(argv: list[str] | None = None) -> int:
     html_path = tools_dir / "dashboard.html"
 
     # Initialize data aggregator
-    aggregator = DataAggregator(artifacts_root, project_root)
+    aggregator = DataAggregator(artifacts_root, project_root, dashboard_port=args.port)
 
     # Set class attributes for handler (HTML loaded on each request for hot-reload)
     DashboardHandler.aggregator = aggregator

@@ -29,7 +29,7 @@ import pystray
 from PIL import Image
 
 
-# Paths
+# Paths and instance configuration
 SCRIPT_DIR = Path(__file__).resolve().parent
 # When frozen by PyInstaller, sys.executable is the .exe (not python).
 # The project structure must live alongside the .exe (tools/, src/, venv/, etc.)
@@ -37,17 +37,86 @@ if getattr(sys, 'frozen', False):
     PROJECT_ROOT = Path(sys.executable).resolve().parent
 else:
     PROJECT_ROOT = SCRIPT_DIR.parent
-ICON_PATH = SCRIPT_DIR / "tray_icon.ico"
+
+
+def _configured_path(name: str, default: Path) -> Path:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return default.resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _configured_optional_path(name: str) -> Path | None:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    return _configured_path(name, PROJECT_ROOT / raw)
+
+
+APP_NAME = str(os.environ.get("US_QUANT_LIVE_APP_NAME") or "US Quant Live").strip()
+APP_ID = str(os.environ.get("US_QUANT_LIVE_APP_ID") or "us-quant-live").strip()
+ICON_PATH = _configured_path("US_QUANT_LIVE_ICON_PATH", SCRIPT_DIR / "tray_icon.ico")
 SCHEDULER_SCRIPT = PROJECT_ROOT / "tools" / "daily_alpaca_scheduler.py"
-ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts" / "daily_alpaca_scheduler"
+ARTIFACTS_ROOT = _configured_path(
+    "US_QUANT_LIVE_ARTIFACTS_ROOT",
+    PROJECT_ROOT / "artifacts" / "daily_alpaca_scheduler",
+)
 DASHBOARD_LOG = ARTIFACTS_ROOT / "daemon" / "scheduler.out.log"
 SCHEDULER_PID_PATH = ARTIFACTS_ROOT / "daemon" / "scheduler.pid"
 LAUNCHER_LOG = ARTIFACTS_ROOT / "daemon" / "tray_launcher.log"
 LAUNCHER_PID_PATH = ARTIFACTS_ROOT / "daemon" / "tray_launcher.pid"
 
-DASHBOARD_URL = "http://127.0.0.1:18076"
-DASHBOARD_PORT = 18076
-MUTEX_NAME = r"Global\us-quant-live-tray-launcher-singleton"
+DASHBOARD_PORT = int(os.environ.get("US_QUANT_LIVE_DASHBOARD_PORT") or "18076")
+DASHBOARD_URL = str(
+    os.environ.get("US_QUANT_LIVE_DASHBOARD_URL")
+    or f"http://127.0.0.1:{DASHBOARD_PORT}"
+).rstrip("/")
+MUTEX_NAME = str(
+    os.environ.get("US_QUANT_LIVE_MUTEX_NAME")
+    or r"Global\us-quant-live-tray-launcher-singleton"
+)
+PYTHON_EXE_OVERRIDE = _configured_optional_path("US_QUANT_LIVE_PYTHON_EXE")
+SCHEDULER_ACCOUNTS_JSON_PATH = _configured_optional_path(
+    "US_QUANT_LIVE_ACCOUNTS_JSON_PATH"
+)
+SCHEDULER_LONG_BRIDGE_CONFIG_PATH = _configured_optional_path(
+    "US_QUANT_LIVE_LONG_BRIDGE_CONFIG_PATH"
+)
+SCHEDULER_OUTPUT_ROOT = _configured_optional_path("US_QUANT_LIVE_OUTPUT_ROOT")
+SCHEDULER_STATE_PATH = _configured_optional_path("US_QUANT_LIVE_STATE_PATH")
+
+
+def _scheduler_command(python_exe: str) -> list[str]:
+    cmd = [
+        python_exe,
+        str(SCHEDULER_SCRIPT),
+        "--project-root",
+        str(PROJECT_ROOT),
+        "--dashboard-port",
+        str(DASHBOARD_PORT),
+    ]
+    configured_options: tuple[tuple[str, object | None], ...] = (
+        ("--accounts-json-path", SCHEDULER_ACCOUNTS_JSON_PATH),
+        ("--account-name", os.environ.get("US_QUANT_LIVE_ACCOUNT_NAME")),
+        ("--longbridge-config-path", SCHEDULER_LONG_BRIDGE_CONFIG_PATH),
+        ("--output-root", SCHEDULER_OUTPUT_ROOT),
+        ("--state-path", SCHEDULER_STATE_PATH),
+        ("--prepare-time-cn", os.environ.get("US_QUANT_LIVE_PREPARE_TIME_CN")),
+        ("--decision-time-cn", os.environ.get("US_QUANT_LIVE_DECISION_TIME_CN")),
+        ("--execute-time-cn", os.environ.get("US_QUANT_LIVE_EXECUTE_TIME_CN")),
+        ("--target-ny-time", os.environ.get("US_QUANT_LIVE_TARGET_NY_TIME")),
+        ("--trading-day-source", os.environ.get("US_QUANT_LIVE_TRADING_DAY_SOURCE")),
+    )
+    for flag, value in configured_options:
+        text = str(value or "").strip()
+        if text:
+            cmd.extend([flag, text])
+    return cmd
+
+
 # Threshold: scheduler dying before this uptime is considered a hard fail (don't auto-restart)
 EARLY_DEATH_THRESHOLD_SECONDS = 30.0
 _LOG_FP = None
@@ -205,7 +274,7 @@ def _pid_file_has_live_launcher() -> int | None:
     cmd = _command_line_for_pid(pid)
     if not cmd:
         return None
-    if str(PROJECT_ROOT).lower() in cmd.lower() and "tray_launcher.py" in cmd.lower():
+    if str(Path(__file__).resolve()).lower() in cmd.lower():
         return pid
     return None
 
@@ -216,6 +285,7 @@ def _running_project_launcher_pids() -> list[int]:
         return []
     try:
         root_literal = _ps_single_quoted(str(PROJECT_ROOT))
+        launcher_literal = _ps_single_quoted(str(Path(__file__).resolve()))
         result = subprocess.run(
             [
                 "powershell",
@@ -223,14 +293,14 @@ def _running_project_launcher_pids() -> list[int]:
                 "-Command",
                 (
                     "$root = [string]" + root_literal + "; "
+                    "$launcher = [string]" + launcher_literal + "; "
                     "  $name=[string]$_.Name; "
                     "$items = @(Get-CimInstance Win32_Process | Where-Object { "
                     "  $name=[string]$_.Name; "
                     "  if($name -notin @('python.exe','pythonw.exe','USQuantLive.exe')){ return $false }; "
                     "  $cmd=[string]$_.CommandLine; "
                     "  if(-not $cmd){ return $false }; "
-                    "  ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and "
-                    "  ($cmd.IndexOf('tray_launcher.py',[StringComparison]::OrdinalIgnoreCase) -ge 0) "
+                    "  ($cmd.IndexOf($launcher,[StringComparison]::OrdinalIgnoreCase) -ge 0) "
                     "} | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine); "
                     "$items | ConvertTo-Json -Compress"
                 ),
@@ -316,6 +386,14 @@ class SchedulerSupervisor:
 
     def _resolve_python_exe(self) -> str | None:
         """Find the Python interpreter to launch the scheduler with."""
+        if PYTHON_EXE_OVERRIDE is not None:
+            if PYTHON_EXE_OVERRIDE.exists():
+                return str(PYTHON_EXE_OVERRIDE)
+            print(
+                f"[Launcher] configured Python interpreter does not exist: {PYTHON_EXE_OVERRIDE}",
+                flush=True,
+            )
+            return None
         # Always prefer console python.exe for child daemons.  When the tray is
         # launched by pythonw.exe, reusing sys.executable can create confusing
         # invisible child chains and makes process matching/tray binding brittle.
@@ -409,7 +487,7 @@ class SchedulerSupervisor:
             python_exe = self._resolve_python_exe()
             if python_exe is None:
                 show_notification(
-                    "US Quant Live - Error",
+                    f"{APP_NAME} - Error",
                     f"Cannot find Python interpreter.\n\n"
                     f"Expected venv at: {PROJECT_ROOT}/venv/Scripts/python.exe\n"
                     f"Please ensure venv is set up.",
@@ -418,7 +496,7 @@ class SchedulerSupervisor:
 
             if not SCHEDULER_SCRIPT.exists():
                 show_notification(
-                    "US Quant Live - Error",
+                    f"{APP_NAME} - Error",
                     f"Scheduler script not found:\n{SCHEDULER_SCRIPT}\n\n"
                     f"The .exe must be placed next to the 'tools/' directory.",
                 )
@@ -432,7 +510,7 @@ class SchedulerSupervisor:
                     print(f"[Launcher] attached to existing scheduler (PID {existing_pid})", flush=True)
                     return True
                 show_notification(
-                    "US Quant Live - Port In Use",
+                    f"{APP_NAME} - Port In Use",
                     f"Port {DASHBOARD_PORT} is already in use.\n\n"
                     f"Another instance of the scheduler/dashboard may still be running.\n"
                     f"Check Task Manager for leftover python.exe processes, or wait 30s.",
@@ -442,14 +520,7 @@ class SchedulerSupervisor:
             # Ensure log directory exists
             DASHBOARD_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-            cmd = [
-                python_exe,
-                str(SCHEDULER_SCRIPT),
-                "--project-root",
-                str(PROJECT_ROOT),
-                "--dashboard-port",
-                str(DASHBOARD_PORT),
-            ]
+            cmd = _scheduler_command(python_exe)
 
             # Open log file (keep handle so we can close it)
             try:
@@ -459,7 +530,7 @@ class SchedulerSupervisor:
                 )
                 self.log_fp.flush()
             except Exception as exc:
-                show_notification("US Quant Live - Error", f"Cannot open log file:\n{exc}")
+                show_notification(f"{APP_NAME} - Error", f"Cannot open log file:\n{exc}")
                 return False
 
             try:
@@ -483,7 +554,7 @@ class SchedulerSupervisor:
             except Exception as exc:
                 # Clean up log handle on failure
                 self._close_log_fp()
-                show_notification("US Quant Live - Error", f"Failed to start scheduler:\n{exc}")
+                show_notification(f"{APP_NAME} - Error", f"Failed to start scheduler:\n{exc}")
                 return False
 
     def _close_log_fp(self) -> None:
@@ -690,7 +761,7 @@ class SchedulerSupervisor:
                 if suppressed_until_manual_restart:
                     # Notify user, do not block the monitor (use async dialog)
                     show_notification_async(
-                        "US Quant Live - Scheduler Crashed",
+                        f"{APP_NAME} - Scheduler Crashed",
                         f"Scheduler exited unexpectedly within {uptime:.1f}s.\n\n"
                         f"This usually means a config error. Check the log:\n{DASHBOARD_LOG}\n\n"
                         f"Use the tray menu 'Restart Scheduler' to retry after fixing.",
@@ -741,13 +812,13 @@ def make_menu(supervisor: SchedulerSupervisor, on_exit_callback) -> pystray.Menu
         if DASHBOARD_LOG.exists():
             os.startfile(str(DASHBOARD_LOG))
         else:
-            show_notification("US Quant Live", "Log file not yet created. Wait a few seconds.")
+            show_notification(APP_NAME, "Log file not yet created. Wait a few seconds.")
 
     def restart_scheduler(icon, item):
         def _do_restart():
             ok = supervisor.restart()
             show_notification(
-                "US Quant Live",
+                APP_NAME,
                 "Scheduler restarted successfully" if ok else
                 "Restart failed — check the log file via 'Open Latest Log'",
             )
@@ -761,7 +832,7 @@ def make_menu(supervisor: SchedulerSupervisor, on_exit_callback) -> pystray.Menu
             f"PID: {pid if pid is not None else 'N/A'}\n"
             f"Dashboard: {DASHBOARD_URL}"
         )
-        show_notification("US Quant Live - Status", msg)
+        show_notification(f"{APP_NAME} - Status", msg)
 
     def quit_app(icon, item):
         print("[Launcher] exit requested by user", flush=True)
@@ -787,7 +858,7 @@ def make_menu(supervisor: SchedulerSupervisor, on_exit_callback) -> pystray.Menu
 # === Main ===
 def main():
     _redirect_std_streams_to_log()
-    print(f"[Launcher] US Quant Live Tray Launcher starting...", flush=True)
+    print(f"[Launcher] {APP_NAME} Tray Launcher starting...", flush=True)
     print(f"[Launcher] PROJECT_ROOT: {PROJECT_ROOT}", flush=True)
     print(f"[Launcher] ICON: {ICON_PATH}", flush=True)
 
@@ -796,7 +867,7 @@ def main():
     singleton = SingleInstance(MUTEX_NAME)
     if not singleton.acquire():
         show_notification(
-            "US Quant Live",
+            APP_NAME,
             "Launcher is already running.\nCheck system tray for the icon (bottom-right).",
         )
         return 1
@@ -827,7 +898,7 @@ def main():
             # In frozen mode the generator script isn't bundled — show clear error.
             if getattr(sys, 'frozen', False):
                 show_notification(
-                    "US Quant Live - Error",
+                    f"{APP_NAME} - Error",
                     f"Tray icon not found in bundled .exe.\n\n"
                     f"This is a build issue. Rebuild with:\n"
                     f"python tools/build_exe.py",
@@ -837,10 +908,14 @@ def main():
             print(f"[Launcher] icon not found, attempting to generate...", flush=True)
             try:
                 from generate_tray_icon import main as gen_icon
-                gen_icon()
+                gen_icon(
+                    variant="dev" if APP_ID.endswith("-dev") else "production",
+                    output_path=ICON_PATH,
+                    write_preview=False,
+                )
                 actual_icon = ICON_PATH
             except Exception as exc:
-                show_notification("US Quant Live - Error", f"Failed to generate icon: {exc}")
+                show_notification(f"{APP_NAME} - Error", f"Failed to generate icon: {exc}")
                 return 1
 
         # Load icon into memory and close the file handle immediately so that:
@@ -868,9 +943,9 @@ def main():
 
         # Create tray icon
         icon = pystray.Icon(
-            'us-quant-live',
+            APP_ID,
             icon_image,
-            'US Quant Live\nDashboard: ' + DASHBOARD_URL,
+            APP_NAME + '\nDashboard: ' + DASHBOARD_URL,
             menu=make_menu(supervisor, cleanup),
         )
 
@@ -882,7 +957,7 @@ def main():
             target=lambda: (
                 time.sleep(1),
                 show_notification(
-                    "US Quant Live - Started",
+                    f"{APP_NAME} - Started",
                     f"Trading daemon is running.\n\n"
                     f"Dashboard: {DASHBOARD_URL}\n\n"
                     f"Right-click the tray icon (bottom-right) for options.",
@@ -900,7 +975,7 @@ def main():
         print(f"[Launcher] fatal error: {exc}", flush=True)
         import traceback
         traceback.print_exc()
-        show_notification("US Quant Live - Fatal Error", str(exc))
+        show_notification(f"{APP_NAME} - Fatal Error", str(exc))
         return 1
     finally:
         # Ensure scheduler stopped and mutex released on every exit path

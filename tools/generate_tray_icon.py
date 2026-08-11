@@ -1,7 +1,8 @@
 """
 Generate K-line (candlestick) style icon for the tray launcher.
-Creates multi-resolution ICO file with dark theme.
+Creates multi-resolution production or Dev ICO files.
 """
+import argparse
 from PIL import Image, ImageDraw
 from pathlib import Path
 
@@ -23,15 +24,16 @@ def draw_candlestick(draw, x, y_high, y_low, y_open, y_close, width, is_green):
     draw.rectangle([(x, body_top), (x + width, body_bottom)], fill=color_body)
 
 
-def create_kline_icon(size: int) -> Image.Image:
+def create_kline_icon(size: int, variant: str = "production") -> Image.Image:
     """Create a K-line chart icon at the given size."""
-    # Dark background
-    img = Image.new('RGBA', (size, size), (10, 14, 39, 255))
+    is_dev = variant == "dev"
+    background = (17, 24, 39, 255) if is_dev else (10, 14, 39, 255)
+    border_color = (245, 158, 11) if is_dev else (30, 42, 74)
+    img = Image.new('RGBA', (size, size), background)
     draw = ImageDraw.Draw(img)
 
-    # Draw subtle border
     border = max(1, size // 32)
-    draw.rectangle([(0, 0), (size - 1, size - 1)], outline=(30, 42, 74), width=border)
+    draw.rectangle([(0, 0), (size - 1, size - 1)], outline=border_color, width=border)
 
     # Calculate layout
     padding = max(2, size // 12)
@@ -63,19 +65,34 @@ def create_kline_icon(size: int) -> Image.Image:
         y_close = chart_top + int(chart_height * c)
         draw_candlestick(draw, x, y_high, y_low, y_open, y_close, candle_width, g)
 
+    if is_dev:
+        badge_size = max(3, size // 4)
+        badge_left = size - badge_size - border
+        draw.rectangle(
+            [(badge_left, border), (size - border - 1, badge_size + border)],
+            fill=(245, 158, 11, 255),
+        )
+
     return img
 
 
-def main():
+def main(
+    *,
+    variant: str = "production",
+    output_path: Path | None = None,
+    write_preview: bool = True,
+):
     out_dir = Path(__file__).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Standard ICO sizes for Windows
     sizes = [16, 24, 32, 48, 64, 128, 256]
-    images = [create_kline_icon(s) for s in sizes]
+    images = [create_kline_icon(s, variant=variant) for s in sizes]
 
     # Save ICO (multi-resolution)
-    ico_path = out_dir / "tray_icon.ico"
+    ico_path = output_path or out_dir / (
+        "tray_icon_dev.ico" if variant == "dev" else "tray_icon.ico"
+    )
     images[0].save(
         ico_path,
         format='ICO',
@@ -84,11 +101,21 @@ def main():
     )
     print(f"[OK] Saved ICO: {ico_path}")
 
-    # Also save large PNG preview
-    png_path = out_dir / "tray_icon_preview.png"
-    images[-1].save(png_path)
-    print(f"[OK] Saved PNG preview: {png_path}")
+    if write_preview:
+        suffix = "_dev" if variant == "dev" else ""
+        png_path = out_dir / f"tray_icon_preview{suffix}.png"
+        images[-1].save(png_path)
+        print(f"[OK] Saved PNG preview: {png_path}")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Generate US Quant Live tray icons")
+    parser.add_argument("--variant", choices=("production", "dev"), default="production")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--no-preview", action="store_true")
+    cli_args = parser.parse_args()
+    main(
+        variant=cli_args.variant,
+        output_path=cli_args.output,
+        write_preview=not cli_args.no_preview,
+    )

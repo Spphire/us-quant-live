@@ -80,6 +80,44 @@ def test_supervisor_lifecycle():
     print("  [OK] start() correctly refuses when should_run=False")
 
 
+def test_scheduler_command_supports_isolated_instance(monkeypatch=None):
+    """Verify a configured instance carries its own account, state, and dashboard."""
+    from unittest.mock import patch
+
+    with patch.multiple(
+        tray_launcher,
+        DASHBOARD_PORT=18077,
+        SCHEDULER_ACCOUNTS_JSON_PATH=Path("dev-accounts.local.json"),
+        SCHEDULER_LONG_BRIDGE_CONFIG_PATH=Path("dev-longbridge.local.json"),
+        SCHEDULER_OUTPUT_ROOT=Path("artifacts/dev_candidate_scheduler"),
+        SCHEDULER_STATE_PATH=Path("artifacts/dev_candidate_scheduler/state.json"),
+    ), patch.dict(
+        tray_launcher.os.environ,
+        {
+            "US_QUANT_LIVE_ACCOUNT_NAME": "ALPACA_DEV_CANDIDATE",
+            "US_QUANT_LIVE_PREPARE_TIME_CN": "12:30",
+            "US_QUANT_LIVE_DECISION_TIME_CN": "21:00",
+            "US_QUANT_LIVE_EXECUTE_TIME_CN": "22:00",
+            "US_QUANT_LIVE_TARGET_NY_TIME": "10:00",
+            "US_QUANT_LIVE_TRADING_DAY_SOURCE": "alpaca_calendar",
+        },
+        clear=False,
+    ):
+        command = tray_launcher._scheduler_command("python.exe")
+
+    expected = {
+        "--dashboard-port": "18077",
+        "--account-name": "ALPACA_DEV_CANDIDATE",
+        "--output-root": "artifacts\\dev_candidate_scheduler",
+        "--state-path": "artifacts\\dev_candidate_scheduler\\state.json",
+    }
+    for flag, value in expected.items():
+        assert command[command.index(flag) + 1] == value, command
+    assert "--force" not in command, command
+    assert "--run-once" not in command, command
+    print("  [OK] Isolated scheduler command contains no forced rerun flags")
+
+
 def test_port_check():
     """Test the port-availability check helper."""
     import socket
@@ -132,6 +170,7 @@ def main():
         ("Icon validity", test_icon_valid),
         ("Singleton mutex", test_singleton_mutex),
         ("Supervisor lifecycle", test_supervisor_lifecycle),
+        ("Isolated scheduler command", test_scheduler_command_supports_isolated_instance),
         ("Port availability check", test_port_check),
         ("Log handle lifecycle", test_supervisor_log_handle_lifecycle),
     ]

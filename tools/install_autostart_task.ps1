@@ -4,6 +4,7 @@ param(
     [string]$AccountsJsonPath = "",
     [string]$TaskName = "US Quant Live Tray",
     [string]$TaskPath = "\USQuant\",
+    [string]$StartScript = "Start.bat",
     [int]$DelaySeconds = 60,
     [switch]$Status,
     [switch]$Unregister,
@@ -37,9 +38,13 @@ if (-not $AccountsJsonPath) {
 }
 $AccountsJsonPath = (Resolve-Path -LiteralPath $AccountsJsonPath).Path
 
-$startBatPath = Join-Path $ProjectRoot "Start.bat"
+$startBatPath = if ([System.IO.Path]::IsPathRooted($StartScript)) {
+    $StartScript
+} else {
+    Join-Path $ProjectRoot $StartScript
+}
 if (-not (Test-Path -LiteralPath $startBatPath)) {
-    throw "Start.bat not found: $startBatPath"
+    throw "Startup script not found: $startBatPath"
 }
 $startBatPath = (Resolve-Path -LiteralPath $startBatPath).Path
 
@@ -150,7 +155,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Starts the visible US Quant Live tray app at user logon." `
+    -Description "Starts the visible $TaskName app at user logon." `
     -Force | Out-Null
 
 Write-Host "[Autostart] registered: $TaskPath$TaskName" -ForegroundColor Green

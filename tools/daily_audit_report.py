@@ -17,6 +17,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import platform
 import subprocess
 import urllib.request
@@ -1157,6 +1158,10 @@ def _autostart_task_status(project_root: Path) -> dict[str, Any]:
         str(script),
         "-ProjectRoot",
         str(project_root),
+        "-TaskName",
+        str(os.environ.get("US_QUANT_LIVE_AUTOSTART_TASK_NAME") or "US Quant Live Tray"),
+        "-StartScript",
+        str(os.environ.get("US_QUANT_LIVE_START_SCRIPT_NAME") or "Start.bat"),
         "-Status",
     ]
     try:
@@ -1228,7 +1233,10 @@ def _flatten_daemon_event(prefix: str, payload: dict[str, Any]) -> dict[str, Any
 
 def _capture_process_health(root: Path) -> dict[str, Any]:
     path = root / "process_health_latest.json"
-    url = "http://127.0.0.1:18076/api/process-health"
+    url = str(
+        os.environ.get("US_QUANT_LIVE_DASHBOARD_URL")
+        or "http://127.0.0.1:18076"
+    ).rstrip("/") + "/api/process-health"
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             raw = resp.read(2_000_000)
@@ -1261,7 +1269,8 @@ def _build_startup_binding_audit(root: Path = SCHED_ROOT) -> tuple[list[dict[str
     due_latest_path = daemon_dir / "scheduler_due_latest.json"
     runtime_latest_path = daemon_dir / "scheduler_runtime_latest.json"
     process_health_path = root / "process_health_latest.json"
-    start_bat = project_root / "Start.bat"
+    start_script_name = str(os.environ.get("US_QUANT_LIVE_START_SCRIPT_NAME") or "Start.bat")
+    start_bat = project_root / start_script_name
     due_latest = _read_json(due_latest_path, {})
     runtime_latest = _read_json(runtime_latest_path, {})
     process_health = _capture_process_health(root)
@@ -1328,7 +1337,7 @@ def _build_startup_binding_audit(root: Path = SCHED_ROOT) -> tuple[list[dict[str
         observed=file_infos["startup_log"],
         expected="startup.bat.log exists and is updated on launch",
         evidence_path=startup_log,
-        detail="Start.bat appends restart/start evidence here.",
+        detail=f"{start_script_name} appends restart/start evidence here.",
     )
     add_row(
         "autostart",
@@ -1338,7 +1347,9 @@ def _build_startup_binding_audit(root: Path = SCHED_ROOT) -> tuple[list[dict[str
         observed=autostart,
         expected="registered",
         evidence_path=autostart.get("script"),
-        detail="Windows logon task should invoke Start.bat so the visible tray process owns the workflow.",
+        detail=(
+            f"Windows logon task should invoke {start_script_name} so the visible tray process owns the workflow."
+        ),
     )
     add_row(
         "daemon",
@@ -1425,7 +1436,7 @@ def _build_startup_binding_audit(root: Path = SCHED_ROOT) -> tuple[list[dict[str
         "autostart_task": autostart,
         "process_health": process_health,
         "note": (
-            "Startup binding is operational evidence: it proves whether Windows logon, Start.bat, tray pid, "
+            f"Startup binding is operational evidence: it proves whether Windows logon, {start_script_name}, tray pid, "
             "scheduler pid, due checks, runtime heartbeat, and process binding were observable."
         ),
     }
