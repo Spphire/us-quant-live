@@ -535,6 +535,46 @@ class _IntradayFallbackClient:
         ]
 
 
+class _ProviderIntradayClient:
+    provider_name = "longbridge"
+    intraday_bar_feed_name = "longbridge_us_1min"
+
+    def get_intraday_bars(self, *, symbols, session_date):
+        return {
+            "provider": self.provider_name,
+            "feed": self.intraday_bar_feed_name,
+            "timeframe": "1Min",
+            "adjustment": "raw",
+            "trade_sessions": "all",
+            "collected_at_utc": "2026-07-24T14:00:00Z",
+            "bars": [
+                {
+                    "symbol": symbol,
+                    "t": "2026-07-24T14:00:00Z",
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 1000,
+                    "capture_feed": self.intraday_bar_feed_name,
+                    "capture_source": "primary",
+                }
+                for symbol in symbols
+            ],
+            "errors": [],
+            "api_calls": [
+                {
+                    "operation": "history_candlesticks_by_date",
+                    "symbol": symbol,
+                    "elapsed_ms": 10.0,
+                    "ok": True,
+                }
+                for symbol in symbols
+            ],
+            "metrics": {"worker_count": 4, "rate_limit_error_count": 0},
+        }
+
+
 def _instructions_for_case(*, target_notional: float, current_notional: float, current_qty: float, price: float):
     return _build_order_instructions(
         target_signed_weights={"X": target_notional / 89945.44},
@@ -894,6 +934,27 @@ def test_intraday_bar_capture_falls_back_for_primary_missing_symbols():
         "fallback_for_primary_missing",
     }
     print("  [OK] missing IEX minute bars are backfilled from SIP with per-symbol source evidence")
+
+
+def test_intraday_bar_capture_uses_execution_provider_without_fallback():
+    snapshot = _collect_intraday_bars_snapshot(
+        client=_ProviderIntradayClient(),
+        symbols=["X", "Y"],
+        session_date=date(2026, 7, 24),
+        feed="longbridge_us_1min",
+        fallback_feed=None,
+        label="test",
+    )
+    assert snapshot["schema_version"] == "1.1", snapshot
+    assert snapshot["provider"] == "longbridge", snapshot
+    assert snapshot["feed"] == "longbridge_us_1min", snapshot
+    assert snapshot["adjustment"] == "raw", snapshot
+    assert snapshot["fallback_attempted"] is False, snapshot
+    assert snapshot["missing_bar_symbols"] == [], snapshot
+    assert snapshot["bar_symbol_count"] == 2, snapshot
+    assert snapshot["metrics"]["worker_count"] == 4, snapshot
+    assert len(snapshot["api_calls"]) == 2, snapshot
+    print("  [OK] intraday evidence follows Longbridge without an Alpaca fallback")
 
 
 def test_projection_audit_prefers_staged_entry_snapshot():
@@ -2509,6 +2570,7 @@ def main() -> int:
         ("Total RegT capacity reconstruction", test_total_regt_capacity_reconstruction),
         ("Portfolio-history request parameters", test_portfolio_history_uses_explicit_range_without_period),
         ("Intraday SIP fallback evidence", test_intraday_bar_capture_falls_back_for_primary_missing_symbols),
+        ("Execution-provider intraday evidence", test_intraday_bar_capture_uses_execution_provider_without_fallback),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
         ("Min-trade short carry safety", test_min_trade_short_carry_cannot_emit_residual_order),
         ("Weight-based min-trade threshold", test_min_trade_threshold_scales_with_weight_error_budget),

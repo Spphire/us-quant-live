@@ -216,6 +216,65 @@ def test_intraday_bars_exclude_context_only_symbols_from_status(tmp_path: Path) 
     assert summary["context_missing_bar_symbol_count"] == 2
 
 
+def test_zero_volume_only_bars_are_not_counted_as_trade_evidence(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "execution_intraday_bars_1min.json",
+        {
+            "ok": True,
+            "provider": "longbridge",
+            "requested_symbols": ["AAA"],
+            "bars": [
+                {
+                    "symbol": "AAA",
+                    "t": "2026-08-11T12:31:00Z",
+                    "o": 100.0,
+                    "h": 100.0,
+                    "l": 100.0,
+                    "c": 100.0,
+                    "v": 0,
+                    "vw": None,
+                }
+            ],
+            "errors": [],
+        },
+    )
+
+    rows, summary = _build_intraday_bar_evidence(
+        run_dir=tmp_path,
+        market_price_evidence_rows=[
+            {
+                "symbol": "AAA",
+                "in_execute_target_symbols": True,
+                "in_execute_broker_position_before": False,
+                "execute_reference_price_used": 100.0,
+            }
+        ],
+        fill_rows=[],
+    )
+
+    assert rows[0]["status"] == "zero_volume_only"
+    assert rows[0]["raw_bar_count"] == 1
+    assert rows[0]["bar_count"] == 0
+    assert summary["status"] == "partial"
+    assert summary["missing_bar_symbol_count"] == 1
+    assert summary["zero_volume_only_symbol_count"] == 1
+
+    _, filled_summary = _build_intraday_bar_evidence(
+        run_dir=tmp_path,
+        market_price_evidence_rows=[
+            {
+                "symbol": "AAA",
+                "in_execute_target_symbols": True,
+                "in_execute_broker_position_before": False,
+                "execute_reference_price_used": 100.0,
+            }
+        ],
+        fill_rows=[{"symbol": "AAA", "qty": 1.0, "price": 100.0, "side": "buy"}],
+    )
+    assert filled_summary["status"] == "attention"
+    assert filled_summary["filled_symbols_missing_bars_count"] == 1
+
+
 def test_market_prices_exclude_context_only_symbols_from_status(tmp_path: Path) -> None:
     decision_dir = tmp_path / "decision"
     execute_dir = tmp_path / "execute"

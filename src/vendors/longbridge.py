@@ -6,7 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -69,6 +69,7 @@ class LongbridgeQuoteClient:
 
     provider_name = "longbridge"
     feed_name = "us_lv1_nbbo"
+    intraday_bar_feed_name = "longbridge_us_1min"
 
     def __init__(
         self,
@@ -963,6 +964,241 @@ class LongbridgeQuoteClient:
             self._snapshot_refresh_failure_history = self._snapshot_refresh_failure_history[-20:]
         return result
 
+    def get_intraday_bars(
+        self,
+        *,
+        symbols: Sequence[str],
+        session_date: date | str,
+    ) -> dict[str, Any]:
+        """Fetch one trading session of unadjusted one-minute bars."""
+        requested = _normalize_symbols(symbols)
+        normalized_date = (
+            session_date
+            if isinstance(session_date, date)
+            else date.fromisoformat(str(session_date)[:10])
+        )
+        started_at_utc = _utc_now(milliseconds=True)
+        started_monotonic = time.monotonic()
+        if not requested:
+            return {
+                "schema_version": "1.0",
+                "provider": self.provider_name,
+                "feed": self.intraday_bar_feed_name,
+                "timeframe": "1Min",
+                "adjustment": "raw",
+                "trade_sessions": "all",
+                "session_date": normalized_date.isoformat(),
+                "requested_symbols": [],
+                "bars": [],
+                "errors": [],
+                "api_calls": [],
+                "metrics": {
+                    "elapsed_seconds": 0.0,
+                    "aggregate_request_work_seconds": 0.0,
+                    "parallel_speedup_ratio": None,
+                    "worker_count": 0,
+                    "context_count": 0,
+                    "rate_limit_error_count": 0,
+                },
+            }
+
+        self._ensure_context()
+        try:
+            from longport.openapi import AdjustType, Period, TradeSessions
+        except ImportError as exc:
+            raise LongbridgeQuoteError(
+                "The longport package is required for Longbridge intraday bars."
+            ) from exc
+
+        contexts, context_creation_errors = self._snapshot_contexts_for_batch(len(requested))
+        use_legacy_worker_pool = (
+            self._context_factory is not None and self._snapshot_context_factory is None
+        )
+        if use_legacy_worker_pool:
+            worker_count = min(8, len(requested))
+            execution_mode = "single_context_thread_pool"
+        else:
+            worker_count = min(len(contexts), len(requested))
+            execution_mode = (
+                "sharded_quote_contexts" if worker_count > 1 else "single_quote_context_sequential"
+            )
+
+        def fetch_symbol(
+            context: Any,
+            symbol: str,
+        ) -> tuple[str, list[dict[str, Any]], dict[str, Any], Exception | None]:
+            provider_symbol = _provider_symbol(symbol)
+            request_started_at_utc = _utc_now(milliseconds=True)
+            request_started_monotonic = time.monotonic()
+            try:
+                events = list(
+                    context.history_candlesticks_by_date(
+                        provider_symbol,
+                        Period.Min_1,
+                        AdjustType.NoAdjust,
+                        normalized_date,
+                        normalized_date,
+                        TradeSessions.All,
+                    )
+                    or []
+                )
+                rows = [
+                    _candlestick_payload(
+                        symbol=symbol,
+                        event=event,
+                        provider=self.provider_name,
+                        feed=self.intraday_bar_feed_name,
+                    )
+                    for event in events
+                ]
+                elapsed_seconds = time.monotonic() - request_started_monotonic
+                return (
+                    symbol,
+                    rows,
+                    {
+                        "operation": "history_candlesticks_by_date",
+                        "symbol": symbol,
+                        "started_at_utc": request_started_at_utc,
+                        "elapsed_ms": round(elapsed_seconds * 1000.0, 3),
+                        "ok": True,
+                        "row_count": len(rows),
+                        "error_type": "",
+                        "rate_limited": False,
+                    },
+                    None,
+                )
+            except Exception as exc:
+                elapsed_seconds = time.monotonic() - request_started_monotonic
+                return (
+                    symbol,
+                    [],
+                    {
+                        "operation": "history_candlesticks_by_date",
+                        "symbol": symbol,
+                        "started_at_utc": request_started_at_utc,
+                        "elapsed_ms": round(elapsed_seconds * 1000.0, 3),
+                        "ok": False,
+                        "row_count": 0,
+                        "error_type": type(exc).__name__,
+                        "rate_limited": _is_rate_limit_error(exc),
+                    },
+                    exc,
+                )
+
+        results: list[tuple[str, list[dict[str, Any]], dict[str, Any], Exception | None]] = []
+        if use_legacy_worker_pool:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(fetch_symbol, self._context, symbol)
+                    for symbol in requested
+                ]
+                results = [future.result() for future in as_completed(futures)]
+        else:
+            shards: list[list[str]] = [[] for _ in range(worker_count)]
+            for index, symbol in enumerate(requested):
+                shards[index % worker_count].append(symbol)
+
+            def fetch_shard(context: Any, shard: Sequence[str]):
+                return [fetch_symbol(context, symbol) for symbol in shard]
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(fetch_shard, context, shard)
+                    for context, shard in zip(contexts, shards)
+                    if shard
+                ]
+                for future in as_completed(futures):
+                    results.extend(future.result())
+
+        bars: list[dict[str, Any]] = []
+        api_calls: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for symbol, rows, api_call, error in sorted(results, key=lambda item: item[0]):
+            bars.extend(rows)
+            api_calls.append(api_call)
+            if error is not None:
+                errors.append(
+                    {
+                        "scope": "intraday_bars",
+                        "symbol": symbol,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "rate_limited": bool(api_call.get("rate_limited")),
+                    }
+                )
+
+        elapsed_seconds = time.monotonic() - started_monotonic
+        request_seconds = [float(row.get("elapsed_ms") or 0.0) / 1000.0 for row in api_calls]
+        aggregate_work_seconds = float(sum(request_seconds))
+        bar_symbols = sorted(
+            {str(row.get("symbol") or "") for row in bars if str(row.get("symbol") or "")}
+        )
+        positive_volume_bars = [row for row in bars if float(row.get("v") or 0.0) > 0.0]
+        positive_volume_symbols = sorted(
+            {
+                str(row.get("symbol") or "")
+                for row in positive_volume_bars
+                if str(row.get("symbol") or "")
+            }
+        )
+        trade_session_counts: dict[str, int] = {}
+        for row in bars:
+            trade_session = str(row.get("trade_session") or "unknown")
+            trade_session_counts[trade_session] = trade_session_counts.get(trade_session, 0) + 1
+        return {
+            "schema_version": "1.0",
+            "provider": self.provider_name,
+            "feed": self.intraday_bar_feed_name,
+            "timeframe": "1Min",
+            "adjustment": "raw",
+            "trade_sessions": "all",
+            "session_date": normalized_date.isoformat(),
+            "collected_at_utc": _utc_now(milliseconds=True),
+            "started_at_utc": started_at_utc,
+            "requested_symbols": requested,
+            "bar_symbols": bar_symbols,
+            "missing_bar_symbols": sorted(set(requested) - set(bar_symbols)),
+            "positive_volume_bar_symbols": positive_volume_symbols,
+            "missing_positive_volume_bar_symbols": sorted(
+                set(requested) - set(positive_volume_symbols)
+            ),
+            "bars": bars,
+            "errors": errors,
+            "api_calls": api_calls,
+            "context_creation_errors": context_creation_errors,
+            "metrics": {
+                "elapsed_seconds": round(elapsed_seconds, 6),
+                "aggregate_request_work_seconds": round(aggregate_work_seconds, 6),
+                "parallel_speedup_ratio": (
+                    aggregate_work_seconds / elapsed_seconds if elapsed_seconds > 0.0 else None
+                ),
+                "request_min_seconds": round(min(request_seconds), 6) if request_seconds else None,
+                "request_mean_seconds": (
+                    round(aggregate_work_seconds / len(request_seconds), 6)
+                    if request_seconds
+                    else None
+                ),
+                "request_max_seconds": round(max(request_seconds), 6) if request_seconds else None,
+                "worker_count": int(worker_count),
+                "context_count": int(min(len(contexts), worker_count)),
+                "execution_mode": execution_mode,
+                "api_call_count": len(api_calls),
+                "bar_count": len(bars),
+                "positive_volume_bar_count": len(positive_volume_bars),
+                "zero_volume_bar_count": len(bars) - len(positive_volume_bars),
+                "zero_volume_bar_ratio": (
+                    (len(bars) - len(positive_volume_bars)) / len(bars)
+                    if bars
+                    else 0.0
+                ),
+                "positive_volume_bar_symbol_count": len(positive_volume_symbols),
+                "trade_session_counts": dict(sorted(trade_session_counts.items())),
+                "rate_limit_error_count": sum(
+                    1 for row in api_calls if bool(row.get("rate_limited"))
+                ),
+            },
+        }
+
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
     return sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
@@ -1008,6 +1244,39 @@ def _datetime_to_utc(value: Any) -> str | None:
     if value.tzinfo is None:
         value = value.astimezone()
     return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _candlestick_payload(
+    *,
+    symbol: str,
+    event: Any,
+    provider: str,
+    feed: str,
+) -> dict[str, Any]:
+    volume = _positive_float(getattr(event, "volume", None)) or 0.0
+    turnover = _positive_float(getattr(event, "turnover", None)) or 0.0
+    return {
+        "symbol": str(symbol),
+        "t": _datetime_to_utc(getattr(event, "timestamp", None)),
+        "o": _positive_float(getattr(event, "open", None)),
+        "h": _positive_float(getattr(event, "high", None)),
+        "l": _positive_float(getattr(event, "low", None)),
+        "c": _positive_float(getattr(event, "close", None)),
+        "v": volume,
+        "vw": turnover / volume if turnover > 0.0 and volume > 0.0 else None,
+        "turnover": turnover,
+        "trade_session": str(getattr(event, "trade_session", "") or ""),
+        "provider": str(provider),
+        "feed": str(feed),
+        "capture_feed": str(feed),
+        "capture_source": "primary",
+        "adjustment": "raw",
+    }
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    text = str(error or "").lower()
+    return any(token in text for token in ("429", "rate limit", "too many requests"))
 
 
 def _package_payload(item: Any) -> dict[str, Any]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -41,6 +41,7 @@ class _FakeContext:
         static_quotes: dict[str, tuple[float, str]] | None = None,
         snapshot_depth_error: bool = False,
         snapshot_depth_delay_seconds: float = 0.0,
+        candlestick_delay_seconds: float = 0.0,
     ) -> None:
         self.bid = bid
         self.ask = ask
@@ -48,12 +49,14 @@ class _FakeContext:
         self.static_quotes = static_quotes or {}
         self.snapshot_depth_error = bool(snapshot_depth_error)
         self.snapshot_depth_delay_seconds = max(0.0, float(snapshot_depth_delay_seconds))
+        self.candlestick_delay_seconds = max(0.0, float(candlestick_delay_seconds))
         self.on_quote = None
         self.on_depth = None
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
         self.quote_calls: list[list[str]] = []
         self.depth_calls: list[str] = []
+        self.candlestick_calls: list[dict[str, object]] = []
         self.closed = False
 
     def set_on_quote(self, callback):
@@ -126,6 +129,40 @@ class _FakeContext:
             bids=[SimpleNamespace(price=self.bid, volume=100)],
             asks=[SimpleNamespace(price=self.ask, volume=200)],
         )
+
+    def history_candlesticks_by_date(
+        self,
+        symbol,
+        period,
+        adjust_type,
+        start,
+        end,
+        trade_sessions,
+    ):
+        self.candlestick_calls.append(
+            {
+                "symbol": str(symbol),
+                "period": str(period),
+                "adjust_type": str(adjust_type),
+                "start": start,
+                "end": end,
+                "trade_sessions": str(trade_sessions),
+            }
+        )
+        if self.candlestick_delay_seconds > 0.0:
+            time.sleep(self.candlestick_delay_seconds)
+        return [
+            SimpleNamespace(
+                timestamp=datetime(2026, 8, 10, 13, 30, tzinfo=timezone.utc),
+                open=100.0,
+                high=101.0,
+                low=99.5,
+                close=100.5,
+                volume=1000,
+                turnover=100250.0,
+                trade_session="TradeSession.Normal",
+            )
+        ]
 
 
 def _credentials() -> LongbridgeCredentials:
@@ -504,6 +541,46 @@ def test_execution_uses_directional_longbridge_quote() -> None:
     assert error is None
 
 
+def test_intraday_bars_are_unadjusted_and_sharded() -> None:
+    primary = _FakeContext(candlestick_delay_seconds=0.01)
+    auxiliary = _FakeContext(candlestick_delay_seconds=0.01)
+    auxiliary_contexts = [auxiliary]
+    client = LongbridgeQuoteClient(
+        _credentials(),
+        snapshot_context_count=2,
+        context_factory=lambda credentials: primary,
+        snapshot_context_factory=lambda credentials: auxiliary_contexts.pop(0),
+    )
+    symbols = [f"TEST{index}" for index in range(9)]
+    payload = client.get_intraday_bars(
+        symbols=symbols,
+        session_date=date(2026, 8, 10),
+    )
+    assert payload["adjustment"] == "raw"
+    assert payload["trade_sessions"] == "all"
+    assert payload["missing_bar_symbols"] == []
+    assert payload["errors"] == []
+    assert len(payload["bars"]) == len(symbols)
+    assert payload["metrics"]["worker_count"] == 2
+    assert payload["metrics"]["context_count"] == 2
+    assert payload["metrics"]["api_call_count"] == len(symbols)
+    assert payload["metrics"]["rate_limit_error_count"] == 0
+    assert payload["metrics"]["positive_volume_bar_count"] == len(symbols)
+    assert payload["metrics"]["zero_volume_bar_count"] == 0
+    assert payload["metrics"]["positive_volume_bar_symbol_count"] == len(symbols)
+    assert payload["metrics"]["trade_session_counts"] == {
+        "TradeSession.Normal": len(symbols)
+    }
+    assert payload["missing_positive_volume_bar_symbols"] == []
+    assert payload["metrics"]["parallel_speedup_ratio"] > 1.0
+    calls = [*primary.candlestick_calls, *auxiliary.candlestick_calls]
+    assert len(calls) == len(symbols)
+    assert all("NoAdjust" in str(call["adjust_type"]) for call in calls)
+    assert all(row["provider"] == "longbridge" for row in payload["bars"])
+    assert all(row["capture_source"] == "primary" for row in payload["bars"])
+    client.close()
+
+
 def test_quote_failure_never_reaches_broker_submit() -> None:
     class _Broker:
         def __init__(self) -> None:
@@ -564,6 +641,7 @@ def main() -> int:
         test_halted_is_covered_but_rejected_for_execution,
         test_decision_intersection_and_execute_exit_scope,
         test_execution_uses_directional_longbridge_quote,
+        test_intraday_bars_are_unadjusted_and_sharded,
         test_quote_failure_never_reaches_broker_submit,
     ]
     for test in tests:

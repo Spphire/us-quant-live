@@ -4484,21 +4484,40 @@ def _bar_stats(source: str, symbol: str, bars: list[dict[str, Any]]) -> dict[str
             "source": source,
             "symbol": symbol,
             "bar_count": 0,
+            "raw_bar_count": 0,
+            "positive_volume_bar_count": 0,
+            "zero_volume_bar_count": 0,
         }
-    open_price = _safe_float(sorted_bars[0].get("o") or sorted_bars[0].get("open"))
-    close_price = _safe_float(sorted_bars[-1].get("c") or sorted_bars[-1].get("close"))
-    highs = [_safe_float(row.get("h") or row.get("high")) for row in sorted_bars]
-    lows = [_safe_float(row.get("l") or row.get("low")) for row in sorted_bars]
-    closes = [_safe_float(row.get("c") or row.get("close")) for row in sorted_bars]
-    volumes = [_safe_float(row.get("v") or row.get("volume")) for row in sorted_bars]
-    vwaps = [_safe_float(row.get("vw") or row.get("vwap")) for row in sorted_bars]
+    volume_fields_present = any("v" in row or "volume" in row for row in sorted_bars)
+    positive_volume_bars = [
+        row
+        for row in sorted_bars
+        if _safe_float(row.get("v") or row.get("volume")) > 0.0
+    ]
+    evidence_bars = positive_volume_bars if volume_fields_present else sorted_bars
+    if not evidence_bars:
+        return {
+            "source": source,
+            "symbol": symbol,
+            "bar_count": 0,
+            "raw_bar_count": len(sorted_bars),
+            "positive_volume_bar_count": 0,
+            "zero_volume_bar_count": len(sorted_bars),
+        }
+    open_price = _safe_float(evidence_bars[0].get("o") or evidence_bars[0].get("open"))
+    close_price = _safe_float(evidence_bars[-1].get("c") or evidence_bars[-1].get("close"))
+    highs = [_safe_float(row.get("h") or row.get("high")) for row in evidence_bars]
+    lows = [_safe_float(row.get("l") or row.get("low")) for row in evidence_bars]
+    closes = [_safe_float(row.get("c") or row.get("close")) for row in evidence_bars]
+    volumes = [_safe_float(row.get("v") or row.get("volume")) for row in evidence_bars]
+    vwaps = [_safe_float(row.get("vw") or row.get("vwap")) for row in evidence_bars]
     total_volume = sum(volumes)
     vwap_numer = sum(vwap * volume for vwap, volume in zip(vwaps, volumes) if vwap > 0 and volume > 0)
     if total_volume > 0 and vwap_numer > 0:
         vwap = vwap_numer / total_volume
     elif total_volume > 0:
         typical_numer = 0.0
-        for row, volume in zip(sorted_bars, volumes):
+        for row, volume in zip(evidence_bars, volumes):
             high = _safe_float(row.get("h") or row.get("high"))
             low = _safe_float(row.get("l") or row.get("low"))
             close = _safe_float(row.get("c") or row.get("close"))
@@ -4511,28 +4530,31 @@ def _bar_stats(source: str, symbol: str, bars: list[dict[str, Any]]) -> dict[str
     high_price = max([value for value in highs if value > 0], default=0.0)
     low_price = min([value for value in lows if value > 0], default=0.0)
     capture_feeds = sorted(
-        {str(row.get("capture_feed") or "").strip() for row in sorted_bars if str(row.get("capture_feed") or "").strip()}
+        {str(row.get("capture_feed") or "").strip() for row in evidence_bars if str(row.get("capture_feed") or "").strip()}
     )
     capture_sources = sorted(
         {
             str(row.get("capture_source") or "").strip()
-            for row in sorted_bars
+            for row in evidence_bars
             if str(row.get("capture_source") or "").strip()
         }
     )
     return {
         "source": source,
         "symbol": symbol,
-        "bar_count": len(sorted_bars),
-        "first_bar_time": _bar_time(sorted_bars[0]),
-        "last_bar_time": _bar_time(sorted_bars[-1]),
+        "bar_count": len(evidence_bars),
+        "raw_bar_count": len(sorted_bars),
+        "positive_volume_bar_count": len(positive_volume_bars),
+        "zero_volume_bar_count": len(sorted_bars) - len(positive_volume_bars),
+        "first_bar_time": _bar_time(evidence_bars[0]),
+        "last_bar_time": _bar_time(evidence_bars[-1]),
         "open": open_price,
         "high": high_price,
         "low": low_price,
         "close": close_price,
         "vwap": vwap,
         "volume": total_volume,
-        "trade_count": sum(_safe_float(row.get("n") or row.get("trade_count")) for row in sorted_bars),
+        "trade_count": sum(_safe_float(row.get("n") or row.get("trade_count")) for row in evidence_bars),
         "range_bps": _bps_change(high_price, low_price),
         "close_vs_open_bps": _bps_change(close_price, open_price),
         "capture_feeds": ";".join(capture_feeds),
@@ -6053,7 +6075,9 @@ def _build_intraday_bar_evidence(
             "error_count": len(errors),
             "collected_at_utc": payload.get("collected_at_utc", ""),
             "label": payload.get("label") or source,
+            "provider": payload.get("provider", ""),
             "feed": payload.get("feed", ""),
+            "adjustment": payload.get("adjustment", ""),
             "primary_feed": payload.get("primary_feed") or payload.get("feed", ""),
             "fallback_feed": payload.get("fallback_feed", ""),
             "fallback_attempted": bool(payload.get("fallback_attempted")),
@@ -6063,6 +6087,7 @@ def _build_intraday_bar_evidence(
             "fallback_bar_symbol_count": _safe_int(payload.get("fallback_bar_symbol_count")),
             "fallback_bar_symbols": payload.get("fallback_bar_symbols") or [],
             "source_counts": payload.get("source_counts") or {},
+            "metrics": payload.get("metrics") or {},
         }
 
     market_by_symbol = {
@@ -6116,8 +6141,12 @@ def _build_intraday_bar_evidence(
         if not any_raw_exists:
             status = "historical_limited"
         elif _safe_int(chosen.get("bar_count")) <= 0:
-            status = "missing_bars"
-            hints.append("missing_intraday_bars")
+            if _safe_int(chosen.get("raw_bar_count")) > 0:
+                status = "zero_volume_only"
+                hints.append("zero_volume_only_intraday_bars")
+            else:
+                status = "missing_bars"
+                hints.append("missing_intraday_bars")
         else:
             status = "pass"
         reference_position = _range_position_pct(execute_reference, low_price, high_price)
@@ -6150,6 +6179,11 @@ def _build_intraday_bar_evidence(
                 "before_bar_count": _safe_int(before.get("bar_count")),
                 "after_bar_count": _safe_int(after.get("bar_count")),
                 "bar_count": _safe_int(chosen.get("bar_count")),
+                "raw_bar_count": _safe_int(chosen.get("raw_bar_count")),
+                "positive_volume_bar_count": _safe_int(
+                    chosen.get("positive_volume_bar_count")
+                ),
+                "zero_volume_bar_count": _safe_int(chosen.get("zero_volume_bar_count")),
                 "first_bar_time": chosen.get("first_bar_time", ""),
                 "last_bar_time": chosen.get("last_bar_time", ""),
                 "open": open_price,
@@ -6185,10 +6219,15 @@ def _build_intraday_bar_evidence(
 
     relevant_rows = [row for row in rows if bool(row.get("required_for_execution"))]
     context_only_rows = [row for row in rows if not bool(row.get("required_for_execution"))]
-    missing_rows = [row for row in relevant_rows if row.get("status") == "missing_bars"]
-    context_missing_rows = [row for row in context_only_rows if row.get("status") == "missing_bars"]
+    unusable_bar_statuses = {"missing_bars", "zero_volume_only"}
+    missing_rows = [row for row in relevant_rows if row.get("status") in unusable_bar_statuses]
+    context_missing_rows = [
+        row for row in context_only_rows if row.get("status") in unusable_bar_statuses
+    ]
     filled_rows = [row for row in relevant_rows if _safe_int(row.get("fill_count")) > 0]
-    filled_missing = [row for row in filled_rows if row.get("status") == "missing_bars"]
+    filled_missing = [
+        row for row in filled_rows if row.get("status") in unusable_bar_statuses
+    ]
     status_counts = Counter(str(row.get("status") or "") for row in relevant_rows)
     all_status_counts = Counter(str(row.get("status") or "") for row in rows)
     if not any_raw_exists:
@@ -6213,6 +6252,14 @@ def _build_intraday_bar_evidence(
         "all_symbol_status_counts": dict(sorted(all_status_counts.items())),
         "missing_bar_symbol_count": len(missing_rows),
         "missing_bar_symbols": [row.get("symbol") for row in missing_rows][:100],
+        "zero_volume_only_symbol_count": sum(
+            row.get("status") == "zero_volume_only" for row in relevant_rows
+        ),
+        "zero_volume_only_symbols": [
+            row.get("symbol")
+            for row in relevant_rows
+            if row.get("status") == "zero_volume_only"
+        ][:100],
         "context_missing_bar_symbol_count": len(context_missing_rows),
         "context_missing_bar_symbols": [row.get("symbol") for row in context_missing_rows][:100],
         "filled_symbol_count": len(filled_rows),

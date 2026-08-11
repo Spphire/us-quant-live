@@ -1671,6 +1671,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_quote_feed = str(
             getattr(execution_quote_client, "feed_name", None) or args.execution_price_feed
         )
+        execution_intraday_bar_client = (
+            execution_quote_client
+            if callable(getattr(execution_quote_client, "get_intraday_bars", None))
+            else client
+        )
+        execution_intraday_bar_provider = str(
+            getattr(execution_intraday_bar_client, "provider_name", None) or "alpaca"
+        )
+        execution_intraday_bar_feed = str(
+            getattr(execution_intraday_bar_client, "intraday_bar_feed_name", None)
+            or args.execution_price_feed
+        )
         reference_prices = _resolve_reference_prices(
             client=execution_quote_client,
             symbols=reference_price_symbols,
@@ -1725,11 +1737,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(
             output_root / "execution_intraday_bars_1min.json",
             _collect_intraday_bars_snapshot(
-                client=client,
+                client=execution_intraday_bar_client,
                 symbols=audit_price_symbols,
                 session_date=decision_date,
-                feed=str(args.execution_price_feed),
+                feed=execution_intraday_bar_feed,
                 label="before_submit",
+                fallback_feed=(
+                    None if execution_intraday_bar_provider == "longbridge" else "sip"
+                ),
             ),
         )
         _write_json_file(
@@ -1738,7 +1753,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "collected_at_utc": _utc_now(),
                 "provider": active_quote_provider,
                 "feed": execution_quote_feed,
-                "alpaca_intraday_bar_feed": str(args.execution_price_feed),
+                "intraday_bar_provider": execution_intraday_bar_provider,
+                "intraday_bar_feed": execution_intraday_bar_feed,
+                "alpaca_intraday_bar_feed": (
+                    str(args.execution_price_feed)
+                    if execution_intraday_bar_provider == "alpaca"
+                    else None
+                ),
                 "target_symbols": sorted(target_signed_weights),
                 "broker_position_symbols_before": sorted(broker_signed_notional_before),
                 "audit_benchmark_symbols": benchmark_symbols,
@@ -1757,6 +1778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "active_asset_count": len(assets),
                 "audit_price_symbol_count": len(audit_price_symbols),
+                "intraday_bar_provider": execution_intraday_bar_provider,
+                "intraday_bar_feed": execution_intraday_bar_feed,
                 "reference_price_count": len(reference_prices),
                 "missing_reference_price_count": len(
                     (set(target_signed_weights) | set(broker_signed_notional_before)) - set(reference_prices)
@@ -2553,11 +2576,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(
             output_root / "execution_intraday_bars_1min_after.json",
             _collect_intraday_bars_snapshot(
-                client=client,
+                client=execution_intraday_bar_client,
                 symbols=intraday_bar_symbols_after,
                 session_date=decision_date,
-                feed=str(args.execution_price_feed),
+                feed=execution_intraday_bar_feed,
                 label="after_execution",
+                fallback_feed=(
+                    None if execution_intraday_bar_provider == "longbridge" else "sip"
+                ),
             ),
         )
         latest_quotes_after_snapshot = _safe_broker_call(
@@ -2772,7 +2798,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "execution_quote_provider_active": active_quote_provider,
             "execution_quote_feed": execution_quote_feed,
             "execution_quote_provider_health": quote_provider_health,
-            "alpaca_intraday_bar_feed": str(args.execution_price_feed),
+            # Keep the provider/feed explicit at the run-summary level.  The
+            # legacy Alpaca-only field remains for consumers that still read
+            # it, but must not claim IEX when Longbridge supplied the bars.
+            "execution_intraday_bar_provider": execution_intraday_bar_provider,
+            "execution_intraday_bar_feed": execution_intraday_bar_feed,
+            "execution_intraday_bar_adjustment": "raw",
+            "alpaca_intraday_bar_feed": (
+                str(args.execution_price_feed)
+                if execution_intraday_bar_provider == "alpaca"
+                else None
+            ),
             "adverse_price_offset_bps": float(adverse_price_offset_bps),
             "marketable_limit_base_offset_bps": float(marketable_limit_base_offset_bps),
             "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
@@ -4944,7 +4980,7 @@ def _collect_calendar_window(
 
 def _collect_intraday_bars_snapshot(
     *,
-    client: AlpacaHttpClient,
+    client: Any,
     symbols: Sequence[str],
     session_date: date,
     feed: str,
@@ -4955,6 +4991,123 @@ def _collect_intraday_bars_snapshot(
     requested_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
     start = f"{session_date.isoformat()}T00:00:00Z"
     end = f"{(session_date + timedelta(days=1)).isoformat()}T00:00:00Z"
+    provider_collector = getattr(client, "get_intraday_bars", None)
+    if callable(provider_collector):
+        try:
+            provider_payload = provider_collector(
+                symbols=requested_symbols,
+                session_date=session_date,
+            )
+        except Exception as exc:
+            provider_payload = {
+                "provider": str(getattr(client, "provider_name", None) or "unknown"),
+                "feed": str(feed),
+                "bars": [],
+                "errors": [
+                    {
+                        "scope": "intraday_bars_batch",
+                        "symbols": requested_symbols,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                ],
+                "api_calls": [],
+                "metrics": {},
+            }
+        if not isinstance(provider_payload, Mapping):
+            provider_payload = {
+                "provider": str(getattr(client, "provider_name", None) or "unknown"),
+                "feed": str(feed),
+                "bars": [],
+                "errors": [
+                    {
+                        "scope": "intraday_bars_batch",
+                        "symbols": requested_symbols,
+                        "error_type": "InvalidProviderPayload",
+                        "error": "get_intraday_bars returned a non-mapping payload",
+                    }
+                ],
+                "api_calls": [],
+                "metrics": {},
+            }
+        bars = [
+            dict(row)
+            for row in provider_payload.get("bars", [])
+            if isinstance(row, Mapping)
+        ]
+        errors = [
+            dict(row)
+            for row in provider_payload.get("errors", [])
+            if isinstance(row, Mapping)
+        ]
+        provider_feed = str(provider_payload.get("feed") or feed)
+        provider_name = str(
+            provider_payload.get("provider")
+            or getattr(client, "provider_name", None)
+            or "unknown"
+        )
+        bar_symbols = sorted(
+            {
+                str(row.get("symbol") or "").strip().upper()
+                for row in bars
+                if str(row.get("symbol") or "").strip()
+            }
+        )
+        missing_bar_symbols = sorted(set(requested_symbols) - set(bar_symbols))
+        source_by_symbol = {symbol: provider_feed for symbol in bar_symbols}
+        return {
+            "schema_version": "1.1",
+            "ok": not errors and not missing_bar_symbols,
+            "name": "get_intraday_bars_1min_relevant",
+            "label": str(label),
+            "collected_at_utc": str(provider_payload.get("collected_at_utc") or _utc_now()),
+            "session_date": session_date.isoformat(),
+            "provider": provider_name,
+            "feed": provider_feed,
+            "primary_feed": provider_feed,
+            "fallback_feed": None,
+            "fallback_attempted": False,
+            "fallback_requested_symbol_count": 0,
+            "fallback_requested_symbols": [],
+            "primary_bar_symbol_count": len(bar_symbols),
+            "primary_bar_symbols": bar_symbols,
+            "fallback_bar_symbol_count": 0,
+            "fallback_bar_symbols": [],
+            "source_by_symbol": source_by_symbol,
+            "source_counts": {provider_feed: len(bar_symbols)} if bar_symbols else {},
+            "timeframe": str(provider_payload.get("timeframe") or "1Min"),
+            "adjustment": str(provider_payload.get("adjustment") or "raw"),
+            "trade_sessions": provider_payload.get("trade_sessions"),
+            "start": provider_payload.get("start") or start,
+            "end": provider_payload.get("end") or end,
+            "requested_symbol_count": len(requested_symbols),
+            "requested_symbols": requested_symbols,
+            "bar_symbol_count": len(bar_symbols),
+            "bar_symbols": bar_symbols,
+            "bar_count": len(bars),
+            "missing_bar_symbols": missing_bar_symbols,
+            "chunk_size": 1,
+            "primary_chunk_count": len(requested_symbols),
+            "fallback_chunk_count": 0,
+            "chunk_count": len(requested_symbols),
+            "bars": bars,
+            "errors": errors,
+            "api_calls": [
+                dict(row)
+                for row in provider_payload.get("api_calls", [])
+                if isinstance(row, Mapping)
+            ],
+            "metrics": (
+                dict(provider_payload.get("metrics") or {})
+                if isinstance(provider_payload.get("metrics"), Mapping)
+                else {}
+            ),
+            "context_creation_errors": [
+                dict(row)
+                for row in provider_payload.get("context_creation_errors", [])
+                if isinstance(row, Mapping)
+            ],
+        }
     bars: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     source_by_symbol: dict[str, str] = {}
