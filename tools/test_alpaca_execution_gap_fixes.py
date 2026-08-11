@@ -28,6 +28,7 @@ from src.alpaca_executor import (  # noqa: E402
     _client_order_id,
     _collect_intraday_bars_snapshot,
     _collect_portfolio_history_snapshot,
+    _derive_intraday_bars_before_snapshot,
     _effective_min_trade_notional,
     _execution_attempt_outcome_summary,
     _execution_run_succeeded,
@@ -955,6 +956,75 @@ def test_intraday_bar_capture_uses_execution_provider_without_fallback():
     assert snapshot["metrics"]["worker_count"] == 4, snapshot
     assert len(snapshot["api_calls"]) == 2, snapshot
     print("  [OK] intraday evidence follows Longbridge without an Alpaca fallback")
+
+
+def test_deferred_intraday_bar_capture_derives_before_view_without_duplicate_api_calls():
+    source = {
+        "schema_version": "1.1",
+        "ok": True,
+        "label": "after_execution",
+        "collected_at_utc": "2026-08-11T14:03:30+00:00",
+        "session_date": "2026-08-11",
+        "provider": "longbridge",
+        "feed": "longbridge_us_1min",
+        "primary_feed": "longbridge_us_1min",
+        "requested_symbols": ["A", "B", "POST_ONLY"],
+        "bars": [
+            {
+                "symbol": "A",
+                "t": "2026-08-11T14:00:00+00:00",
+                "v": 100.0,
+                "trade_session": "TradeSession.Intraday",
+            },
+            {
+                "symbol": "B",
+                "t": "2026-08-11T14:01:00+00:00",
+                "v": 0.0,
+                "trade_session": "TradeSession.Intraday",
+            },
+            {
+                "symbol": "A",
+                "t": "2026-08-11T14:03:00+00:00",
+                "v": 25.0,
+                "trade_session": "TradeSession.Intraday",
+            },
+            {
+                "symbol": "POST_ONLY",
+                "t": "2026-08-11T14:00:00+00:00",
+                "v": 50.0,
+                "trade_session": "TradeSession.Intraday",
+            },
+        ],
+        "errors": [],
+        "api_calls": [{"symbol": "A"}, {"symbol": "B"}, {"symbol": "POST_ONLY"}],
+        "metrics": {
+            "elapsed_seconds": 12.0,
+            "aggregate_request_work_seconds": 24.0,
+            "api_call_count": 3,
+            "rate_limit_error_count": 0,
+        },
+    }
+
+    before = _derive_intraday_bars_before_snapshot(
+        source_snapshot=source,
+        symbols=["A", "B"],
+        cutoff_at_utc="2026-08-11T14:01:30+00:00",
+    )
+
+    assert before["status"] == "pass", before
+    assert before["capture_mode"] == "post_execution_async_single_fetch", before
+    assert before["execution_critical_path_blocked"] is False, before
+    assert before["requested_symbols"] == ["A", "B"], before
+    assert before["bar_symbol_count"] == 2, before
+    assert before["bar_count"] == 2, before
+    assert before["filtered_after_cutoff_bar_count"] == 1, before
+    assert before["filtered_unrequested_bar_count"] == 1, before
+    assert before["api_calls"] == [], before
+    assert before["metrics"]["api_call_count"] == 0, before
+    assert before["metrics"]["source_api_call_count"] == 3, before
+    assert before["metrics"]["positive_volume_bar_count"] == 1, before
+    assert before["metrics"]["zero_volume_bar_count"] == 1, before
+    print("  [OK] one post-execution bar fetch produces a cutoff-safe before view")
 
 
 def test_projection_audit_prefers_staged_entry_snapshot():
@@ -2571,6 +2641,10 @@ def main() -> int:
         ("Portfolio-history request parameters", test_portfolio_history_uses_explicit_range_without_period),
         ("Intraday SIP fallback evidence", test_intraday_bar_capture_falls_back_for_primary_missing_symbols),
         ("Execution-provider intraday evidence", test_intraday_bar_capture_uses_execution_provider_without_fallback),
+        (
+            "Deferred single-fetch intraday evidence",
+            test_deferred_intraday_bar_capture_derives_before_view_without_duplicate_api_calls,
+        ),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
         ("Min-trade short carry safety", test_min_trade_short_carry_cannot_emit_residual_order),
         ("Weight-based min-trade threshold", test_min_trade_threshold_scales_with_weight_error_budget),

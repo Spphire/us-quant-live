@@ -795,6 +795,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     execution_quote_client: Any | None = None
     symbol_universe_quote_client: LongbridgeQuoteClient | None = None
+    intraday_bar_capture_executor: ThreadPoolExecutor | None = None
+    intraday_bar_capture_future: Any | None = None
     try:
         decision_date = _normalize_date(args.date)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1734,19 +1736,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         _write_json_file(output_root / "execution_latest_quotes_snapshot.json", latest_quotes_snapshot)
-        _write_json_file(
-            output_root / "execution_intraday_bars_1min.json",
-            _collect_intraday_bars_snapshot(
-                client=execution_intraday_bar_client,
-                symbols=audit_price_symbols,
-                session_date=decision_date,
-                feed=execution_intraday_bar_feed,
-                label="before_submit",
-                fallback_feed=(
-                    None if execution_intraday_bar_provider == "longbridge" else "sip"
-                ),
-            ),
+        intraday_bar_before_cutoff_at_utc = _utc_now()
+        # Longbridge bars are audit evidence, so one post-trade fetch must not delay orders.
+        intraday_bar_capture_mode = (
+            "post_execution_async_single_fetch"
+            if execution_intraday_bar_provider == "longbridge"
+            else "synchronous_before_after"
         )
+        if execution_intraday_bar_provider == "longbridge":
+            _write_json_file(
+                output_root / "execution_intraday_bars_1min.json",
+                _pending_intraday_bars_snapshot(
+                    provider=execution_intraday_bar_provider,
+                    feed=execution_intraday_bar_feed,
+                    symbols=audit_price_symbols,
+                    session_date=decision_date,
+                    cutoff_at_utc=intraday_bar_before_cutoff_at_utc,
+                ),
+            )
+            _mark_event(
+                run_events,
+                "intraday_bar_capture_deferred",
+                {
+                    "capture_mode": intraday_bar_capture_mode,
+                    "requested_symbol_count": len(audit_price_symbols),
+                    "before_cutoff_at_utc": intraday_bar_before_cutoff_at_utc,
+                    "execution_critical_path_blocked": False,
+                },
+            )
+        else:
+            _write_json_file(
+                output_root / "execution_intraday_bars_1min.json",
+                _collect_intraday_bars_snapshot(
+                    client=execution_intraday_bar_client,
+                    symbols=audit_price_symbols,
+                    session_date=decision_date,
+                    feed=execution_intraday_bar_feed,
+                    label="before_submit",
+                    fallback_feed="sip",
+                ),
+            )
         _write_json_file(
             output_root / "execution_price_snapshot.json",
             {
@@ -1755,6 +1784,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "feed": execution_quote_feed,
                 "intraday_bar_provider": execution_intraday_bar_provider,
                 "intraday_bar_feed": execution_intraday_bar_feed,
+                "intraday_bar_capture_mode": intraday_bar_capture_mode,
+                "intraday_bar_before_cutoff_at_utc": intraday_bar_before_cutoff_at_utc,
+                "intraday_bar_execution_critical_path_blocked": False
+                if execution_intraday_bar_provider == "longbridge"
+                else True,
                 "alpaca_intraday_bar_feed": (
                     str(args.execution_price_feed)
                     if execution_intraday_bar_provider == "alpaca"
@@ -1780,6 +1814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "audit_price_symbol_count": len(audit_price_symbols),
                 "intraday_bar_provider": execution_intraday_bar_provider,
                 "intraday_bar_feed": execution_intraday_bar_feed,
+                "intraday_bar_capture_mode": intraday_bar_capture_mode,
                 "reference_price_count": len(reference_prices),
                 "missing_reference_price_count": len(
                     (set(target_signed_weights) | set(broker_signed_notional_before)) - set(reference_prices)
@@ -2541,6 +2576,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _write_json_file(output_root / "broker_position_account_stability_after.json", position_account_stability_after)
         broker_frame_after, broker_signed_notional_after = _positions_to_frame_and_notional(positions_after)
+        intraday_bar_symbols_after = sorted(
+            set(reference_price_symbols)
+            | set(benchmark_symbols)
+            | set(broker_signed_notional_after)
+            | {item.symbol for item in instructions}
+        )
+        intraday_bar_capture_started_at_utc: str | None = None
+        intraday_bar_capture_started_monotonic: float | None = None
+        if execution_intraday_bar_provider == "longbridge":
+            intraday_bar_capture_started_at_utc = _utc_now()
+            intraday_bar_capture_started_monotonic = time.monotonic()
+            intraday_bar_capture_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="intraday-bar-audit",
+            )
+            intraday_bar_capture_future = intraday_bar_capture_executor.submit(
+                _collect_intraday_bars_snapshot,
+                client=execution_intraday_bar_client,
+                symbols=intraday_bar_symbols_after,
+                session_date=decision_date,
+                feed=execution_intraday_bar_feed,
+                label="after_execution",
+                fallback_feed=None,
+            )
+            _mark_event(
+                run_events,
+                "intraday_bar_capture_started",
+                {
+                    "capture_mode": intraday_bar_capture_mode,
+                    "requested_symbol_count": len(intraday_bar_symbols_after),
+                    "started_at_utc": intraday_bar_capture_started_at_utc,
+                    "execution_critical_path_blocked": False,
+                },
+            )
         _write_json_file(
             output_root / "broker_clock_after.json",
             _safe_broker_call("get_clock_after", client.get_clock),
@@ -2567,15 +2636,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "broker_corporate_actions_expanded_after_positions",
                 {"symbol_count": len(corporate_action_symbols), "path": broker_corporate_actions_path.as_posix()},
             )
-        intraday_bar_symbols_after = sorted(
-            set(reference_price_symbols)
-            | set(benchmark_symbols)
-            | set(broker_signed_notional_after)
-            | {item.symbol for item in instructions}
-        )
-        _write_json_file(
-            output_root / "execution_intraday_bars_1min_after.json",
-            _collect_intraday_bars_snapshot(
+        intraday_bar_join_started_monotonic = time.monotonic()
+        if intraday_bar_capture_future is not None:
+            intraday_bars_after_snapshot = intraday_bar_capture_future.result()
+            intraday_bar_capture_executor.shutdown(wait=True, cancel_futures=False)
+            intraday_bar_capture_future = None
+            intraday_bar_capture_executor = None
+        else:
+            intraday_bars_after_snapshot = _collect_intraday_bars_snapshot(
                 client=execution_intraday_bar_client,
                 symbols=intraday_bar_symbols_after,
                 session_date=decision_date,
@@ -2584,8 +2652,73 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fallback_feed=(
                     None if execution_intraday_bar_provider == "longbridge" else "sip"
                 ),
-            ),
+            )
+        intraday_bar_capture_finished_monotonic = time.monotonic()
+        _write_json_file(
+            output_root / "execution_intraday_bars_1min_after.json",
+            intraday_bars_after_snapshot,
         )
+        if execution_intraday_bar_provider == "longbridge":
+            intraday_bars_before_snapshot = _derive_intraday_bars_before_snapshot(
+                source_snapshot=intraday_bars_after_snapshot,
+                symbols=audit_price_symbols,
+                cutoff_at_utc=intraday_bar_before_cutoff_at_utc,
+            )
+            _write_json_file(
+                output_root / "execution_intraday_bars_1min.json",
+                intraday_bars_before_snapshot,
+            )
+            capture_elapsed_seconds = (
+                intraday_bar_capture_finished_monotonic - intraday_bar_capture_started_monotonic
+                if intraday_bar_capture_started_monotonic is not None
+                else 0.0
+            )
+            join_wait_seconds = max(
+                0.0,
+                intraday_bar_capture_finished_monotonic - intraday_bar_join_started_monotonic,
+            )
+            capture_metrics = (
+                intraday_bars_after_snapshot.get("metrics", {})
+                if isinstance(intraday_bars_after_snapshot, Mapping)
+                else {}
+            )
+            intraday_bar_capture_diagnostics = {
+                "schema_version": "1.0",
+                "generated_at_utc": _utc_now(),
+                "capture_mode": intraday_bar_capture_mode,
+                "provider": execution_intraday_bar_provider,
+                "feed": execution_intraday_bar_feed,
+                "execution_critical_path_blocked": False,
+                "before_cutoff_at_utc": intraday_bar_before_cutoff_at_utc,
+                "capture_started_at_utc": intraday_bar_capture_started_at_utc,
+                "capture_elapsed_seconds": round(capture_elapsed_seconds, 6),
+                "join_wait_seconds": round(join_wait_seconds, 6),
+                "overlapped_post_execution_work_seconds": round(
+                    max(0.0, capture_elapsed_seconds - join_wait_seconds),
+                    6,
+                ),
+                "requested_symbol_count": len(intraday_bar_symbols_after),
+                "before_requested_symbol_count": len(audit_price_symbols),
+                "api_call_count": int(capture_metrics.get("api_call_count") or 0),
+                "rate_limit_error_count": int(
+                    capture_metrics.get("rate_limit_error_count") or 0
+                ),
+                "before_artifact_derived_from_after_fetch": True,
+                "legacy_two_fetch_api_call_estimate": int(
+                    capture_metrics.get("api_call_count") or 0
+                )
+                + len(audit_price_symbols),
+                "avoided_api_call_estimate": len(audit_price_symbols),
+            }
+            _write_json_file(
+                output_root / "execution_intraday_bar_capture_diagnostics.json",
+                intraday_bar_capture_diagnostics,
+            )
+            _mark_event(
+                run_events,
+                "intraday_bar_capture_completed",
+                intraday_bar_capture_diagnostics,
+            )
         latest_quotes_after_snapshot = _safe_broker_call(
             "get_latest_quotes_for_after_symbols",
             lambda: execution_quote_client.get_latest_quotes(
@@ -2804,6 +2937,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "execution_intraday_bar_provider": execution_intraday_bar_provider,
             "execution_intraday_bar_feed": execution_intraday_bar_feed,
             "execution_intraday_bar_adjustment": "raw",
+            "execution_intraday_bar_capture_mode": intraday_bar_capture_mode,
+            "execution_intraday_bar_before_cutoff_at_utc": intraday_bar_before_cutoff_at_utc,
+            "execution_intraday_bar_execution_critical_path_blocked": False
+            if execution_intraday_bar_provider == "longbridge"
+            else True,
             "alpaca_intraday_bar_feed": (
                 str(args.execution_price_feed)
                 if execution_intraday_bar_provider == "alpaca"
@@ -2993,6 +3131,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "execution_intraday_bars_1min_after_json": (
                     output_root / "execution_intraday_bars_1min_after.json"
                 ).as_posix(),
+                "execution_intraday_bar_capture_diagnostics_json": (
+                    output_root / "execution_intraday_bar_capture_diagnostics.json"
+                ).as_posix()
+                if (output_root / "execution_intraday_bar_capture_diagnostics.json").exists()
+                else None,
                 "execution_price_snapshot_json": (output_root / "execution_price_snapshot.json").as_posix(),
                 "target_weights_snapshot_json": (output_root / "target_weights_snapshot.json").as_posix(),
                 "executable_target_projection_json": (
@@ -3017,6 +3160,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(execution_summary, indent=2, ensure_ascii=False))
         return 0 if run_ok else 1
     except (ValueError, FileNotFoundError, AlpacaRequestError, RuntimeError, Exception) as exc:
+        if intraday_bar_capture_executor is not None:
+            try:
+                intraday_bar_capture_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
         if isinstance(execution_quote_client, LongbridgeQuoteClient):
             try:
                 execution_quote_client.close()
@@ -5219,6 +5367,227 @@ def _collect_intraday_bars_snapshot(
         "bars": [dict(row) if isinstance(row, Mapping) else row for row in bars],
         "errors": errors,
     }
+
+
+def _pending_intraday_bars_snapshot(
+    *,
+    provider: str,
+    feed: str,
+    symbols: Sequence[str],
+    session_date: date,
+    cutoff_at_utc: str,
+) -> dict[str, Any]:
+    requested_symbols = sorted(
+        {
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        }
+    )
+    return {
+        "schema_version": "1.2",
+        "ok": False,
+        "status": "pending",
+        "name": "get_intraday_bars_1min_relevant",
+        "label": "before_submit",
+        "collected_at_utc": None,
+        "session_date": session_date.isoformat(),
+        "provider": str(provider),
+        "feed": str(feed),
+        "primary_feed": str(feed),
+        "fallback_feed": None,
+        "capture_mode": "post_execution_async_single_fetch",
+        "execution_critical_path_blocked": False,
+        "before_cutoff_at_utc": str(cutoff_at_utc),
+        "requested_symbol_count": len(requested_symbols),
+        "requested_symbols": requested_symbols,
+        "bar_symbol_count": 0,
+        "bar_symbols": [],
+        "bar_count": 0,
+        "missing_bar_symbols": requested_symbols,
+        "bars": [],
+        "errors": [],
+        "api_calls": [],
+        "metrics": {
+            "api_call_count": 0,
+            "rate_limit_error_count": 0,
+            "deferred": True,
+        },
+    }
+
+
+def _derive_intraday_bars_before_snapshot(
+    *,
+    source_snapshot: Mapping[str, Any],
+    symbols: Sequence[str],
+    cutoff_at_utc: str,
+) -> dict[str, Any]:
+    requested_symbols = sorted(
+        {
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        }
+    )
+    requested_set = set(requested_symbols)
+    cutoff = _parse_clock_timestamp(cutoff_at_utc).astimezone(timezone.utc)
+    bars: list[dict[str, Any]] = []
+    filtered_after_cutoff_count = 0
+    filtered_unrequested_count = 0
+    timestamp_errors: list[dict[str, Any]] = []
+    for raw in source_snapshot.get("bars", []):
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if symbol not in requested_set:
+            filtered_unrequested_count += 1
+            continue
+        try:
+            bar_at = _parse_clock_timestamp(row.get("t")).astimezone(timezone.utc)
+        except Exception as exc:
+            timestamp_errors.append(
+                {
+                    "scope": "derive_before_submit_bars",
+                    "symbol": symbol,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+        if bar_at > cutoff:
+            filtered_after_cutoff_count += 1
+            continue
+        bars.append(row)
+
+    bar_symbols = sorted(
+        {
+            str(row.get("symbol") or "").strip().upper()
+            for row in bars
+            if str(row.get("symbol") or "").strip()
+        }
+    )
+    source_by_symbol_raw = source_snapshot.get("source_by_symbol")
+    source_by_symbol = {
+        symbol: str(
+            source_by_symbol_raw.get(symbol)
+            if isinstance(source_by_symbol_raw, Mapping)
+            else source_snapshot.get("feed")
+        )
+        for symbol in bar_symbols
+    }
+    errors: list[dict[str, Any]] = []
+    for raw in source_snapshot.get("errors", []):
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        symbol = str(row.get("symbol") or "").strip().upper()
+        error_symbols = {
+            str(item or "").strip().upper()
+            for item in row.get("symbols", [])
+            if str(item or "").strip()
+        } if isinstance(row.get("symbols"), Sequence) and not isinstance(
+            row.get("symbols"), (str, bytes)
+        ) else set()
+        if symbol and symbol not in requested_set:
+            continue
+        if error_symbols and not (error_symbols & requested_set):
+            continue
+        errors.append(row)
+    errors.extend(timestamp_errors)
+
+    def bar_volume(row: Mapping[str, Any]) -> float:
+        try:
+            return float(row.get("v") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    positive_volume_bars = [row for row in bars if bar_volume(row) > 0.0]
+    positive_volume_symbols = sorted(
+        {
+            str(row.get("symbol") or "").strip().upper()
+            for row in positive_volume_bars
+            if str(row.get("symbol") or "").strip()
+        }
+    )
+    trade_session_counts = dict(
+        Counter(str(row.get("trade_session") or "unknown") for row in bars)
+    )
+    source_metrics = (
+        dict(source_snapshot.get("metrics") or {})
+        if isinstance(source_snapshot.get("metrics"), Mapping)
+        else {}
+    )
+    source_api_call_count = int(source_metrics.get("api_call_count") or 0)
+    metrics = dict(source_metrics)
+    metrics.update(
+        {
+            "elapsed_seconds": 0.0,
+            "aggregate_request_work_seconds": 0.0,
+            "parallel_speedup_ratio": None,
+            "api_call_count": 0,
+            "source_api_call_count": source_api_call_count,
+            "source_capture_elapsed_seconds": float(
+                source_metrics.get("elapsed_seconds") or 0.0
+            ),
+            "bar_count": len(bars),
+            "positive_volume_bar_count": len(positive_volume_bars),
+            "zero_volume_bar_count": len(bars) - len(positive_volume_bars),
+            "zero_volume_bar_ratio": (
+                (len(bars) - len(positive_volume_bars)) / len(bars)
+                if bars
+                else 0.0
+            ),
+            "positive_volume_bar_symbol_count": len(positive_volume_symbols),
+            "trade_session_counts": trade_session_counts,
+            "derived_view": True,
+        }
+    )
+    missing_bar_symbols = sorted(requested_set - set(bar_symbols))
+    snapshot = dict(source_snapshot)
+    snapshot.update(
+        {
+            "schema_version": "1.2",
+            "ok": bool(source_snapshot.get("ok", False))
+            and not errors
+            and not missing_bar_symbols,
+            "status": "pass"
+            if bool(source_snapshot.get("ok", False))
+            and not errors
+            and not missing_bar_symbols
+            else "attention",
+            "label": "before_submit",
+            "capture_mode": "post_execution_async_single_fetch",
+            "execution_critical_path_blocked": False,
+            "derived_from_label": str(source_snapshot.get("label") or "after_execution"),
+            "derived_from_collected_at_utc": source_snapshot.get("collected_at_utc"),
+            "before_cutoff_at_utc": str(cutoff_at_utc),
+            "end": str(cutoff_at_utc),
+            "requested_symbol_count": len(requested_symbols),
+            "requested_symbols": requested_symbols,
+            "primary_bar_symbol_count": len(bar_symbols),
+            "primary_bar_symbols": bar_symbols,
+            "fallback_bar_symbol_count": 0,
+            "fallback_bar_symbols": [],
+            "source_by_symbol": dict(sorted(source_by_symbol.items())),
+            "source_counts": dict(sorted(Counter(source_by_symbol.values()).items())),
+            "bar_symbol_count": len(bar_symbols),
+            "bar_symbols": bar_symbols,
+            "bar_count": len(bars),
+            "missing_bar_symbols": missing_bar_symbols,
+            "chunk_size": 0,
+            "primary_chunk_count": 0,
+            "fallback_chunk_count": 0,
+            "chunk_count": 0,
+            "bars": bars,
+            "errors": errors,
+            "api_calls": [],
+            "metrics": metrics,
+            "filtered_after_cutoff_bar_count": filtered_after_cutoff_count,
+            "filtered_unrequested_bar_count": filtered_unrequested_count,
+        }
+    )
+    return snapshot
 
 
 def _marketable_offset_ladder(
