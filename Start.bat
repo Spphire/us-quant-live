@@ -18,11 +18,12 @@ if not exist "%PYTHON_EXE%" (
 echo [%date% %time%] restart mode: stopping existing project tray/scheduler/dashboard first>> "%STARTUP_LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$root=(Resolve-Path -LiteralPath '%PROJECT_ROOT%').Path; " ^
-  "$needles=@('tools\tray_launcher.py','tools\daily_alpaca_scheduler.py','tools\dashboard_server.py','tools\watch_daily_alpaca_scheduler.ps1'); " ^
+  "$needles=@((Join-Path $root 'tools\tray_launcher.py'),(Join-Path $root 'tools\daily_alpaca_scheduler.py'),(Join-Path $root 'tools\dashboard_server.py'),(Join-Path $root 'tools\watch_daily_alpaca_scheduler.ps1')); " ^
+  "$executorNeedle=Join-Path $root 'src\alpaca_executor.py'; " ^
   "$self=$PID; " ^
-  "$activeExecutors=@(Get-CimInstance Win32_Process | Where-Object { if([int]$_.ProcessId -eq [int]$self){return $false}; $cmd=[string]$_.CommandLine; if(-not $cmd){return $false}; ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and ($cmd.IndexOf('src\alpaca_executor.py',[StringComparison]::OrdinalIgnoreCase) -ge 0) }); " ^
+  "$activeExecutors=@(Get-CimInstance Win32_Process | Where-Object { if([int]$_.ProcessId -eq [int]$self){return $false}; $cmd=[string]$_.CommandLine; if(-not $cmd){return $false}; $cmd.IndexOf($executorNeedle,[StringComparison]::OrdinalIgnoreCase) -ge 0 }); " ^
   "if($activeExecutors.Count -gt 0){ Write-Output ('restart aborted: active decision/execution pid(s)='+ (($activeExecutors | ForEach-Object { [string]$_.ProcessId }) -join ',')); exit 41 }; " ^
-  "function Get-ProjectTargets { @(Get-CimInstance Win32_Process | Where-Object { if([int]$_.ProcessId -eq [int]$self){return $false}; $cmd=[string]$_.CommandLine; if(-not $cmd){return $false}; ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and (($needles | Where-Object { $cmd.IndexOf($_,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0) }) }; " ^
+  "function Get-ProjectTargets { @(Get-CimInstance Win32_Process | Where-Object { if([int]$_.ProcessId -eq [int]$self){return $false}; $cmd=[string]$_.CommandLine; if(-not $cmd){return $false}; (($needles | Where-Object { $cmd.IndexOf($_,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0) }) }; " ^
   "for($i=0; $i -lt 5; $i++){ $procs=@(Get-ProjectTargets); if($procs.Count -eq 0){ break }; foreach($p in $procs){ try { Write-Output ('stopping pid='+$p.ProcessId+' '+$p.Name); & taskkill.exe /F /T /PID ([string]$p.ProcessId) | Out-Null } catch { Write-Output ('taskkill failed pid='+$p.ProcessId+' '+$_.Exception.Message) }; try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }; Start-Sleep -Milliseconds 800 }; " ^
   "$remaining=@(Get-ProjectTargets); if($remaining.Count -gt 0){ Write-Output ('warning: remaining project processes after restart cleanup: '+(($remaining | ForEach-Object { [string]$_.ProcessId }) -join ',')) }; " ^
   "Remove-Item -LiteralPath (Join-Path $root 'artifacts\daily_alpaca_scheduler\daemon\tray_launcher.pid') -Force -ErrorAction SilentlyContinue; " ^

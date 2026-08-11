@@ -205,7 +205,7 @@ def _pid_file_has_live_launcher() -> int | None:
     cmd = _command_line_for_pid(pid)
     if not cmd:
         return None
-    if str(PROJECT_ROOT).lower() in cmd.lower() and "tray_launcher.py" in cmd.lower():
+    if str(Path(__file__).resolve()).lower() in cmd.lower():
         return pid
     return None
 
@@ -216,6 +216,7 @@ def _running_project_launcher_pids() -> list[int]:
         return []
     try:
         root_literal = _ps_single_quoted(str(PROJECT_ROOT))
+        launcher_literal = _ps_single_quoted(str(Path(__file__).resolve()))
         result = subprocess.run(
             [
                 "powershell",
@@ -223,14 +224,14 @@ def _running_project_launcher_pids() -> list[int]:
                 "-Command",
                 (
                     "$root = [string]" + root_literal + "; "
+                    "$launcher = [string]" + launcher_literal + "; "
                     "  $name=[string]$_.Name; "
                     "$items = @(Get-CimInstance Win32_Process | Where-Object { "
                     "  $name=[string]$_.Name; "
                     "  if($name -notin @('python.exe','pythonw.exe','USQuantLive.exe')){ return $false }; "
                     "  $cmd=[string]$_.CommandLine; "
                     "  if(-not $cmd){ return $false }; "
-                    "  ($cmd.IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and "
-                    "  ($cmd.IndexOf('tray_launcher.py',[StringComparison]::OrdinalIgnoreCase) -ge 0) "
+                    "  ($cmd.IndexOf($launcher,[StringComparison]::OrdinalIgnoreCase) -ge 0) "
                     "} | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine); "
                     "$items | ConvertTo-Json -Compress"
                 ),
