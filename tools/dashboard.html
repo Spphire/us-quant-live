@@ -709,6 +709,12 @@
                 seriesExecutionWindowContribution: 'Execution-window contribution',
                 seriesAccountReturn: 'Account cycle return',
                 metricCycleStartEquity: 'Cycle start equity',
+                metricExecutionBoundary: 'Execution boundary',
+                metricExecutionAttempts: 'Execution attempts',
+                metricRetryAfterPartial: 'Retry after partial execution',
+                metricFirstAttempt: 'First attempt',
+                metricFirstError: 'First error',
+                metricRetryReason: 'Retry reason',
                 seriesNonTradeContribution: 'Fees / income contribution',
                 seriesResidualContribution: 'Holding residual',
                 seriesStrategyActual: 'Strategy to actual',
@@ -860,6 +866,12 @@
                 seriesExecutionWindowContribution: '执行窗口贡献',
                 seriesAccountReturn: '账户周期收益',
                 metricCycleStartEquity: '周期起点权益',
+                metricExecutionBoundary: '执行归责边界',
+                metricExecutionAttempts: '执行尝试次数',
+                metricRetryAfterPartial: '部分执行后重试',
+                metricFirstAttempt: '首次尝试',
+                metricFirstError: '首次错误',
+                metricRetryReason: '重试原因',
                 seriesNonTradeContribution: '费用与收益项贡献',
                 seriesResidualContribution: '持有段残差',
                 seriesStrategyActual: '策略到实际',
@@ -1210,6 +1222,16 @@
                     cycleStartRunDir: String(row.daily_account_cycle_start_run_dir || ''),
                     positionContinuityStatus: String(row.daily_position_continuity_status || 'unavailable'),
                     matchedPositionCount: auditMetric(row, 'daily_matched_position_count'),
+                    executionBoundarySource: String(row.daily_execution_cycle_boundary_source || ''),
+                    executionBoundaryStatus: String(row.daily_execution_cycle_boundary_status || ''),
+                    executionAttemptCount: auditMetric(row, 'daily_execution_attempt_count'),
+                    retryOccurred: row.daily_retry_occurred === true,
+                    retryAfterPartialExecution: row.daily_retry_after_partial_execution === true,
+                    firstAttemptStatus: String(row.daily_first_attempt_status || ''),
+                    firstAttemptExecutorStatus: String(row.daily_first_attempt_executor_status || ''),
+                    firstAttemptReturncode: auditMetric(row, 'daily_first_attempt_returncode'),
+                    firstAttemptError: String(row.daily_first_attempt_error || ''),
+                    retryReason: String(row.daily_retry_reason || ''),
                     status: String(row.daily_side_pnl_attribution_status || 'unavailable'),
                     runDir: row.run_dir || ''
                 }));
@@ -1947,7 +1969,7 @@
                                 afterBody: items => {
                                     const point = series[items?.[0]?.dataIndex ?? -1];
                                     if (!point) return '';
-                                    return [
+                                    const details = [
                                         `${t('seriesAccountReturn')}: ${formatOptionalCurrency(point.accountPnl)} / ${t('metricCycleStartEquity')} ${formatOptionalCurrency(point.accountLastEquity)}`,
                                         `window: ${escapeHTML(point.cycleStartRunDir || 'n/a')} -> ${escapeHTML(point.runDir || 'n/a')}`,
                                         `${t('metricLong')}: ${formatOptionalCurrency(point.longPnl)} | ${t('metricShort')}: ${formatOptionalCurrency(point.shortPnl)}`,
@@ -1957,6 +1979,21 @@
                                         `positions: ${escapeHTML(point.positionContinuityStatus)} / matched ${formatNumber(point.matchedPositionCount)}`,
                                         `status: ${escapeHTML(point.status)}`
                                     ];
+                                    details.push(
+                                        `${t('metricExecutionBoundary')}: ${point.executionBoundarySource || 'n/a'} (${point.executionBoundaryStatus || 'n/a'})`,
+                                        `${t('metricExecutionAttempts')}: ${formatNumber(point.executionAttemptCount)} | ${t('metricRetryAfterPartial')}: ${point.retryAfterPartialExecution ? t('yes') : t('no')}`
+                                    );
+                                    if (point.retryOccurred) {
+                                        const firstAttempt = [
+                                            point.firstAttemptStatus,
+                                            point.firstAttemptExecutorStatus,
+                                            point.firstAttemptReturncode === null ? '' : `rc=${point.firstAttemptReturncode}`
+                                        ].filter(Boolean).join(' / ');
+                                        details.push(`${t('metricFirstAttempt')}: ${firstAttempt || 'n/a'}`);
+                                        if (point.firstAttemptError) details.push(`${t('metricFirstError')}: ${point.firstAttemptError}`);
+                                        if (point.retryReason) details.push(`${t('metricRetryReason')}: ${point.retryReason}`);
+                                    }
+                                    return details;
                                 }
                             }
                         }
