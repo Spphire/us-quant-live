@@ -908,6 +908,78 @@ def _write_scheduler_task_json(path: Path, payload: Mapping[str, Any]) -> str | 
         return f"{type(exc).__name__}: {exc}"
 
 
+def _read_scheduler_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_scheduler_attempt_record(
+    *,
+    task: str,
+    attempt_number: int,
+    task_state: Mapping[str, Any],
+    output_root: Path,
+    returncode: int,
+) -> dict[str, Any]:
+    """Persist the causal outcome of one scheduler attempt before a retry."""
+
+    summary = _read_scheduler_json(output_root / "execution_summary.json")
+    submit_error_count = int(summary.get("submit_error_count") or 0)
+    terminal_unfilled_count = int(summary.get("terminal_unfilled_record_count") or 0)
+    submitted = bool(summary.get("submitted"))
+    partial_execution_observed = bool(
+        task == "execute"
+        and (
+            submitted
+            or submit_error_count > 0
+            or terminal_unfilled_count > 0
+        )
+    )
+    error = str(
+        summary.get("submit_abort_reason")
+        or summary.get("error")
+        or ""
+    )
+    if returncode != 0 and not error and submit_error_count:
+        error = f"submit_error_count={submit_error_count}"
+    retry_reason = (
+        "executor_nonzero_returncode_after_submit_error"
+        if returncode != 0 and submit_error_count > 0
+        else "executor_nonzero_returncode_after_partial_execution"
+        if returncode != 0 and partial_execution_observed
+        else "executor_nonzero_returncode"
+        if returncode != 0
+        else ""
+    )
+    return {
+        "attempt": int(attempt_number),
+        "task": str(task),
+        "status": str(task_state.get("status") or ""),
+        "executor_ok": summary.get("ok"),
+        "returncode": int(returncode),
+        "started_at_cn": str(task_state.get("started_at_cn") or ""),
+        "finished_at_cn": str(task_state.get("finished_at_cn") or ""),
+        "elapsed_seconds": task_state.get("elapsed_seconds"),
+        "submitted": submitted,
+        "submit_error_count": submit_error_count,
+        "terminal_unfilled_record_count": terminal_unfilled_count,
+        "partial_execution_observed": partial_execution_observed,
+        "executor_status": (
+            "completed_with_errors"
+            if returncode != 0 and submit_error_count > 0
+            else "failed"
+            if returncode != 0
+            else "completed"
+        ),
+        "error": error,
+        "retry_reason": retry_reason,
+        "output_root": output_root.as_posix(),
+    }
+
+
 def _finalize_scheduler_run_evidence(output_root: Path) -> str | None:
     """Refresh executor evidence indexes after scheduler context/result files exist.
 
@@ -1008,6 +1080,9 @@ def _build_scheduler_task_context(
             "stderr_log": stderr_log.as_posix(),
             "scheduler_task_context": context_path.as_posix(),
             "scheduler_task_result": result_path.as_posix(),
+            "scheduler_attempt_history": (
+                output_root / "scheduler_attempt_history.json"
+            ).as_posix(),
         },
         "command": {
             "argv": [str(item) for item in command],
@@ -1091,6 +1166,9 @@ def _build_scheduler_task_result(
             "stderr_log": stderr_log.as_posix(),
             "scheduler_task_context": context_path.as_posix(),
             "scheduler_task_result": result_path.as_posix(),
+            "scheduler_attempt_history": (
+                output_root / "scheduler_attempt_history.json"
+            ).as_posix(),
         },
         "artifacts": {
             "execution_summary": _path_status(output_root / "execution_summary.json"),
@@ -1283,6 +1361,13 @@ def _run_task(
     output_root.mkdir(parents=True, exist_ok=True)
 
     previous_attempts = int(task_state.get("attempts") or 0)
+    previous_attempt_history = task_state.get("attempt_history")
+    if not isinstance(previous_attempt_history, list):
+        previous_attempt_history = []
+    else:
+        previous_attempt_history = [
+            _jsonable(item) for item in previous_attempt_history if isinstance(item, Mapping)
+        ]
     previous_task_state = _jsonable(dict(task_state))
     attempt_number = previous_attempts + 1
     try:
@@ -1387,6 +1472,46 @@ def _run_task(
                 _generate_execution_quality(paths.execute_output_root)
     else:
         task_state["status"] = "failed"
+
+    attempt_record = _build_scheduler_attempt_record(
+        task=task,
+        attempt_number=attempt_number,
+        task_state=task_state,
+        output_root=output_root,
+        returncode=returncode,
+    )
+    attempt_history = [*previous_attempt_history, attempt_record]
+    task_state["attempt_history"] = attempt_history
+    attempt_history_path = output_root / "scheduler_attempt_history.json"
+    task_state["scheduler_attempt_history_path"] = attempt_history_path.as_posix()
+    attempt_history_error = _write_scheduler_task_json(
+        attempt_history_path,
+        {
+            "schema_version": "1.0",
+            "record_type": "scheduler_attempt_history",
+            "generated_at_cn": _iso_now_cn(),
+            "generated_at_utc": _utc_now(),
+            "session_date": session_date.isoformat(),
+            "session_key": paths.session_key,
+            "task": str(task),
+            "attempt_count": len(attempt_history),
+            "attempts": attempt_history,
+            "retry_policy": {
+                "retry_after_minutes": float(
+                    args.execute_retry_failed_after_minutes
+                    if task == "execute"
+                    else args.retry_failed_after_minutes
+                ),
+                "max_attempts": int(
+                    args.max_execute_attempts
+                    if task == "execute"
+                    else args.max_attempts_per_task
+                ),
+            },
+        },
+    )
+    if attempt_history_error:
+        task_state["scheduler_attempt_history_error"] = attempt_history_error
 
     try:
         result_payload = _build_scheduler_task_result(

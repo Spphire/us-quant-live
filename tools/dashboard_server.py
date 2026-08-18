@@ -34,11 +34,13 @@ try:
     from tools.daily_pnl_attribution import (
         ALIGNED_SIDE_PNL_SEMANTICS,
         build_daily_side_pnl_attribution,
+        select_execution_cycle_boundary,
     )
 except ModuleNotFoundError:
     from daily_pnl_attribution import (
         ALIGNED_SIDE_PNL_SEMANTICS,
         build_daily_side_pnl_attribution,
+        select_execution_cycle_boundary,
     )
 
 
@@ -1774,6 +1776,55 @@ class DataAggregator:
             "run_dir": previous_run_dir.name,
         }
 
+    def _read_execution_attempt_metadata(self, run_dir: Path) -> dict[str, Any]:
+        """Read retry facts without allowing a retry to redefine the cycle boundary."""
+        def nonnegative_int(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        result = self._read_json_file(run_dir / "scheduler_task_result.json")
+        result_attempt = max(1, nonnegative_int(result.get("attempt")))
+
+        history_payload = self._read_json_file(
+            run_dir / "scheduler_attempt_history.json"
+        )
+        history = history_payload.get("attempts")
+        attempts = (
+            [item for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        )
+        attempts.sort(key=lambda item: nonnegative_int(item.get("attempt")))
+        history_attempt = max(
+            (nonnegative_int(item.get("attempt")) for item in attempts),
+            default=0,
+        )
+        attempt_count = max(result_attempt, history_attempt, len(attempts))
+        first = attempts[0] if attempts else {}
+        retry_occurred = attempt_count > 1
+        partial_execution = bool(
+            first.get("partial_execution_observed")
+            or first.get("submitted")
+            or nonnegative_int(first.get("submit_error_count")) > 0
+            or nonnegative_int(first.get("terminal_unfilled_record_count")) > 0
+        )
+        return {
+            "attempt_count": attempt_count,
+            "retry_occurred": retry_occurred,
+            "retry_after_partial_execution": bool(
+                retry_occurred and partial_execution
+            ),
+            "first_attempt_status": str(first.get("status") or ""),
+            "first_attempt_executor_status": str(
+                first.get("executor_status") or ""
+            ),
+            "first_attempt_returncode": first.get("returncode"),
+            "first_attempt_error": str(first.get("error") or ""),
+            "retry_reason": str(first.get("retry_reason") or ""),
+        }
+
     def _read_side_return_snapshot(self, run_dir: Path) -> dict[str, Any]:
         """Expose legacy side snapshots plus account-consistent daily contributions."""
         risk = self._read_json_file(run_dir / "audit" / "07_risk_snapshot.json")
@@ -1808,28 +1859,50 @@ class DataAggregator:
                 run_dir,
                 current_summary,
             )
+            attempt_metadata = self._read_execution_attempt_metadata(run_dir)
+            fallback_account_before = self._read_json_file(
+                run_dir / "broker_account_before.json"
+            )
+            fallback_positions_before = self._read_csv_rows(
+                run_dir / "broker_positions_before.csv"
+            )
+            execution_cycle_boundary = select_execution_cycle_boundary(
+                fallback_account_capture=fallback_account_before,
+                fallback_positions=fallback_positions_before or [],
+                opening_snapshot=self._read_json_file(
+                    run_dir / "broker_day_open_snapshot.json"
+                ),
+                attempt_count=attempt_metadata.get("attempt_count", 1),
+            )
+            execution_cycle_boundary.update(attempt_metadata)
             daily_attribution = build_daily_side_pnl_attribution(
                 account_after_capture=self._read_json_file(run_dir / "broker_account_after.json"),
-                account_before_capture=self._read_json_file(
-                    run_dir / "broker_account_before.json"
+                account_before_capture=execution_cycle_boundary.get(
+                    "account_capture", fallback_account_before
                 ),
                 account_start_capture=cycle_start_capture,
                 previous_positions_after=cycle_start_capture.get("positions_after"),
-                current_positions_before=self._read_csv_rows(
-                    run_dir / "broker_positions_before.csv"
+                current_positions_before=execution_cycle_boundary.get(
+                    "positions", fallback_positions_before or []
                 ),
                 risk_snapshot=risk,
                 account_activity_summary=self._read_json_file(
                     run_dir / "audit" / "51_account_activity_attribution_summary.json"
                 ),
-                opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+                opening_snapshot_available=bool(
+                    execution_cycle_boundary.get("available")
+                ),
+                execution_cycle_boundary=execution_cycle_boundary,
                 account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
                 account_end_run_dir=run_dir.name,
                 account_start_captured_at_utc=str(
                     cycle_start_capture.get("captured_at_utc") or ""
                 ),
                 account_before_captured_at_utc=str(
-                    current_summary.get("account_equity_preflight_captured_at_utc", "")
+                    execution_cycle_boundary.get("account_captured_at_utc")
+                    or current_summary.get(
+                        "account_equity_preflight_captured_at_utc", ""
+                    )
                 ),
                 account_end_captured_at_utc=str(
                     current_summary.get("account_equity_post_trade_captured_at_utc", "")
@@ -1918,6 +1991,37 @@ class DataAggregator:
             "daily_side_opening_snapshot_available": daily_attribution.get(
                 "opening_snapshot_available", False
             ),
+            "daily_execution_cycle_boundary_source": daily_attribution.get(
+                "execution_cycle_boundary_source", ""
+            ),
+            "daily_execution_cycle_boundary_status": daily_attribution.get(
+                "execution_cycle_boundary_status", ""
+            ),
+            "daily_execution_cycle_boundary_semantics": daily_attribution.get(
+                "execution_cycle_boundary_semantics", ""
+            ),
+            "daily_execution_attempt_count": daily_attribution.get(
+                "execution_attempt_count", 1
+            ),
+            "daily_retry_occurred": daily_attribution.get(
+                "retry_occurred", False
+            ),
+            "daily_retry_after_partial_execution": daily_attribution.get(
+                "retry_after_partial_execution", False
+            ),
+            "daily_first_attempt_status": daily_attribution.get(
+                "first_attempt_status", ""
+            ),
+            "daily_first_attempt_executor_status": daily_attribution.get(
+                "first_attempt_executor_status", ""
+            ),
+            "daily_first_attempt_returncode": daily_attribution.get(
+                "first_attempt_returncode"
+            ),
+            "daily_first_attempt_error": daily_attribution.get(
+                "first_attempt_error", ""
+            ),
+            "daily_retry_reason": daily_attribution.get("retry_reason", ""),
         }
 
     @staticmethod

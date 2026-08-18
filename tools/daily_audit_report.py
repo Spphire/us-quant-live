@@ -19,6 +19,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import urllib.request
 from collections import Counter, defaultdict
@@ -27,9 +28,15 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 try:
-    from tools.daily_pnl_attribution import build_daily_side_pnl_attribution
+    from tools.daily_pnl_attribution import (
+        build_daily_side_pnl_attribution,
+        select_execution_cycle_boundary,
+    )
 except ModuleNotFoundError:
-    from daily_pnl_attribution import build_daily_side_pnl_attribution
+    from daily_pnl_attribution import (
+        build_daily_side_pnl_attribution,
+        select_execution_cycle_boundary,
+    )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCHED_ROOT = PROJECT_ROOT / "artifacts" / "daily_alpaca_scheduler"
@@ -118,6 +125,145 @@ def _read_json(path: Path, default: Any) -> Any:
     except Exception:
         return default
     return default
+
+
+def _infer_first_execution_attempt_from_log(run_dir: Path) -> dict[str, Any]:
+    """Recover first-attempt failure context from the append-only scheduler log.
+
+    Older scheduler versions reused the canonical execute directory and did not
+    persist an attempt history.  The log still contains one executor block per
+    attempt, so this fallback lets historical retries be attributed correctly
+    without touching the broker.
+    """
+
+    candidates = [
+        run_dir.parent / "logs" / f"{run_dir.name[:8]}_execute.out.log",
+    ]
+    result = _read_json(run_dir / "scheduler_task_result.json", {})
+    if isinstance(result, Mapping):
+        paths = result.get("paths")
+        if isinstance(paths, Mapping) and paths.get("stdout_log"):
+            candidates.insert(0, Path(str(paths["stdout_log"])))
+    log_path = next((path for path in candidates if path.exists()), None)
+    if log_path is None:
+        return {}
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    starts = list(re.finditer(r"(?m)^\s*=== execute .* start .* ===\s*$", text))
+    if not starts:
+        return {}
+    first_start = starts[0]
+    first_end = starts[1].start() if len(starts) > 1 else len(text)
+    block = text[first_start.start() : first_end]
+    status_matches = re.findall(r"\[DecisionTiming\]\s+status=([^\s]+)", block)
+    executor_status = status_matches[-1] if status_matches else ""
+    warning_matches = re.findall(r"\[Executor\]\s+warning:\s*(.+)", block)
+    error_text = warning_matches[0].strip() if warning_matches else ""
+    submit_error_counts = [
+        _safe_int(value)
+        for value in re.findall(r'"submit_error_count"\s*:\s*(\d+)', block)
+    ]
+    submit_error_counts.extend(
+        _safe_int(value)
+        for value in re.findall(
+            r"submission completed with\s+(\d+)\s+error", block, flags=re.IGNORECASE
+        )
+    )
+    terminal_unfilled_counts = [
+        _safe_int(value)
+        for value in re.findall(r'"terminal_unfilled_record_count"\s*:\s*(\d+)', block)
+    ]
+    submit_error_count = max(submit_error_counts, default=0)
+    terminal_unfilled_count = max(terminal_unfilled_counts, default=0)
+    run_ok_false = bool(re.search(r'"run_ok"\s*:\s*false', block))
+    partial_execution_observed = bool(
+        submit_error_count > 0
+        or terminal_unfilled_count > 0
+        or re.search(r'"submitted"\s*:\s*true', block)
+    )
+    inferred_returncode: int | None
+    if executor_status == "completed_with_errors" or run_ok_false:
+        inferred_returncode = 1
+    elif executor_status == "completed":
+        inferred_returncode = 0
+    else:
+        inferred_returncode = None
+    return {
+        "attempt": 1,
+        "status": "failed" if inferred_returncode not in (None, 0) else "completed",
+        "executor_status": executor_status,
+        "returncode": inferred_returncode,
+        "error": error_text,
+        "submit_error_count": submit_error_count,
+        "terminal_unfilled_record_count": terminal_unfilled_count,
+        "partial_execution_observed": partial_execution_observed,
+        "source": log_path.as_posix(),
+    }
+
+
+def _build_execution_cycle_attempt_metadata(
+    run_dir: Path,
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect retry facts without treating a retry as a new holding window."""
+
+    result = _read_json(run_dir / "scheduler_task_result.json", {})
+    raw_history = _read_json(run_dir / "scheduler_attempt_history.json", {})
+    if isinstance(raw_history, Mapping):
+        history = raw_history.get("attempts")
+    else:
+        history = raw_history
+    attempts = [row for row in history if isinstance(row, Mapping)] if isinstance(history, list) else []
+    result_attempt = _safe_int(result.get("attempt")) if isinstance(result, Mapping) else 0
+    attempt_count = max(1, result_attempt, len(attempts))
+    first: Mapping[str, Any] = attempts[0] if attempts else {}
+    inferred = {}
+    if attempt_count > 1 and not first:
+        inferred = _infer_first_execution_attempt_from_log(run_dir)
+        first = inferred
+    first_returncode = first.get("returncode")
+    try:
+        first_returncode = int(first_returncode) if first_returncode is not None else None
+    except (TypeError, ValueError):
+        first_returncode = None
+    first_status = str(first.get("status") or "")
+    first_executor_status = str(
+        first.get("executor_status") or first.get("executor_status_latest") or ""
+    )
+    first_error = str(first.get("error") or first.get("first_error") or "")
+    partial_execution = bool(
+        first.get("partial_execution_observed")
+        or _safe_int(first.get("submitted_orders")) > 0
+        or _safe_int(first.get("submit_error_count")) > 0
+        or _safe_int(first.get("terminal_unfilled_record_count")) > 0
+    )
+    retry_occurred = attempt_count > 1
+    return {
+        "attempt_count": attempt_count,
+        "retry_occurred": retry_occurred,
+        "retry_after_partial_execution": bool(retry_occurred and partial_execution),
+        "first_attempt_status": first_status,
+        "first_attempt_executor_status": first_executor_status,
+        "first_attempt_returncode": first_returncode,
+        "first_attempt_error": first_error,
+        "retry_reason": (
+            "executor_nonzero_returncode_after_submit_error"
+            if retry_occurred and _safe_int(first.get("submit_error_count")) > 0
+            else "executor_nonzero_returncode_after_partial_execution"
+            if retry_occurred and partial_execution
+            else "scheduler_retry_after_failed_attempt"
+            if retry_occurred
+            else ""
+        ),
+        "attempt_history_available": bool(attempts),
+        "attempt_history_source": (
+            (run_dir / "scheduler_attempt_history.json").as_posix()
+            if attempts
+            else str(inferred.get("source") or "")
+        ),
+    }
 
 
 def _build_execution_attempt_outcome_audit(
@@ -11246,6 +11392,11 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
             "scheduler_task_result": (run_dir / "scheduler_task_result.json").as_posix()
             if (run_dir / "scheduler_task_result.json").exists()
             else None,
+            "scheduler_attempt_history": (
+                run_dir / "scheduler_attempt_history.json"
+            ).as_posix()
+            if (run_dir / "scheduler_attempt_history.json").exists()
+            else None,
             "startup_log": (run_dir.parent / "daemon" / "startup.bat.log").as_posix()
             if (run_dir.parent / "daemon" / "startup.bat.log").exists()
             else None,
@@ -11520,28 +11671,50 @@ def generate_audit(run_dir: Path, decision_dir: Path | None = None) -> dict[str,
         execution_attempt_outcomes,
     )
     current_account_after = _read_json(run_dir / "broker_account_after.json", {})
+    fallback_account_before = _read_json(run_dir / "broker_account_before.json", {})
+    fallback_positions_before = _read_csv_rows(run_dir / "broker_positions_before.csv")
+    execution_cycle_attempt_metadata = _build_execution_cycle_attempt_metadata(
+        run_dir,
+        summary if isinstance(summary, Mapping) else {},
+    )
+    execution_cycle_boundary = select_execution_cycle_boundary(
+        fallback_account_capture=fallback_account_before,
+        fallback_positions=fallback_positions_before,
+        opening_snapshot=_read_json(run_dir / "broker_day_open_snapshot.json", {}),
+        attempt_count=execution_cycle_attempt_metadata.get("attempt_count", 1),
+    )
+    execution_cycle_boundary.update(execution_cycle_attempt_metadata)
+    context["execution_cycle_attribution"] = {
+        key: value
+        for key, value in execution_cycle_boundary.items()
+        if key not in {"account_capture", "positions"}
+    }
     cycle_start_capture = _previous_completed_execute_cycle(
         run_dir,
         summary if isinstance(summary, dict) else {},
     )
     daily_side_pnl_attribution = build_daily_side_pnl_attribution(
         account_after_capture=current_account_after,
-        account_before_capture=_read_json(run_dir / "broker_account_before.json", {}),
+        account_before_capture=execution_cycle_boundary.get(
+            "account_capture", fallback_account_before
+        ),
         account_start_capture=cycle_start_capture,
         previous_positions_after=cycle_start_capture.get("positions_after"),
-        current_positions_before=_read_csv_rows(
-            run_dir / "broker_positions_before.csv"
+        current_positions_before=execution_cycle_boundary.get(
+            "positions", fallback_positions_before
         ),
         risk_snapshot=risk,
         account_activity_summary=account_activity_attribution_summary,
-        opening_snapshot_available=(run_dir / "broker_day_open_snapshot.json").exists(),
+        opening_snapshot_available=bool(execution_cycle_boundary.get("available")),
+        execution_cycle_boundary=execution_cycle_boundary,
         account_start_run_dir=str(cycle_start_capture.get("run_dir") or ""),
         account_end_run_dir=run_dir.name,
         account_start_captured_at_utc=str(
             cycle_start_capture.get("captured_at_utc") or ""
         ),
         account_before_captured_at_utc=str(
-            (summary if isinstance(summary, dict) else {}).get(
+            execution_cycle_boundary.get("account_captured_at_utc")
+            or (summary if isinstance(summary, dict) else {}).get(
                 "account_equity_preflight_captured_at_utc", ""
             )
         ),
@@ -12647,8 +12820,9 @@ def _signed_position_mv_from_row(row: dict[str, Any]) -> float:
     return value
 
 
-def _position_continuity_maps(path: Path) -> dict[str, dict[str, Any]]:
-    rows = _read_csv_rows(path)
+def _position_continuity_maps_from_rows(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         symbol = str(row.get("symbol") or "").upper().strip()
@@ -12664,13 +12838,52 @@ def _position_continuity_maps(path: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _position_continuity_maps(path: Path) -> dict[str, dict[str, Any]]:
+    return _position_continuity_maps_from_rows(_read_csv_rows(path))
+
+
+def _cross_day_opening_boundary(run_dir: Path) -> dict[str, Any]:
+    summary = _read_json(run_dir / "execution_summary.json", {})
+    fallback_account = _read_json(run_dir / "broker_account_before.json", {})
+    fallback_positions = _read_csv_rows(run_dir / "broker_positions_before.csv")
+    attempt_metadata = _build_execution_cycle_attempt_metadata(
+        run_dir,
+        summary if isinstance(summary, Mapping) else {},
+    )
+    boundary = select_execution_cycle_boundary(
+        fallback_account_capture=fallback_account,
+        fallback_positions=fallback_positions,
+        opening_snapshot=_read_json(run_dir / "broker_day_open_snapshot.json", {}),
+        attempt_count=attempt_metadata.get("attempt_count", 1),
+    )
+    boundary.update(attempt_metadata)
+    account = boundary.get("account_capture")
+    account = account if isinstance(account, Mapping) else {}
+    return {
+        "positions": _position_continuity_maps_from_rows(
+            boundary.get("positions")
+            if isinstance(boundary.get("positions"), (list, tuple))
+            else []
+        ),
+        "equity": _safe_float(
+            account.get("equity") or account.get("portfolio_value")
+        ),
+        "source": boundary.get("source", ""),
+        "captured_at_utc": boundary.get("captured_at_utc", ""),
+        "status": boundary.get("status", ""),
+        "attempt_count": boundary.get("attempt_count", 1),
+        "retry_occurred": boundary.get("retry_occurred", False),
+    }
+
+
 def _build_cross_day_continuity(root: Path, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     continuity_rows: list[dict[str, Any]] = []
     for prev_row, next_row in zip(rows, rows[1:]):
         prev_run = Path(str(prev_row.get("run_dir") or ""))
         next_run = Path(str(next_row.get("run_dir") or ""))
         prev_after = _position_continuity_maps(prev_run / "broker_positions_after.csv")
-        next_before = _position_continuity_maps(next_run / "broker_positions_before.csv")
+        next_boundary = _cross_day_opening_boundary(next_run)
+        next_before = next_boundary["positions"]
         symbols = sorted(set(prev_after) | set(next_before))
         qty_abs_gap = 0.0
         mv_abs_gap = 0.0
@@ -12704,15 +12917,26 @@ def _build_cross_day_continuity(root: Path, rows: list[dict[str, Any]]) -> tuple
             ).days
         except Exception:
             pass
-        equity_gap = _safe_float(next_row.get("equity_before")) - _safe_float(prev_row.get("equity_after"))
+        next_before_equity = _safe_float(next_boundary.get("equity"))
+        equity_gap = next_before_equity - _safe_float(prev_row.get("equity_after"))
+        boundary_missing_for_retry = bool(
+            next_boundary.get("retry_occurred")
+            and str(next_boundary.get("status") or "") == "missing"
+        )
         continuity_rows.append(
             {
                 "previous_session_date": prev_row.get("session_date", ""),
                 "next_session_date": next_row.get("session_date", ""),
                 "calendar_gap_days": calendar_gap_days,
                 "previous_after_equity": _safe_float(prev_row.get("equity_after")),
-                "next_before_equity": _safe_float(next_row.get("equity_before")),
+                "next_before_equity": next_before_equity,
                 "overnight_equity_gap": equity_gap,
+                "next_boundary_source": next_boundary.get("source", ""),
+                "next_boundary_captured_at_utc": next_boundary.get(
+                    "captured_at_utc", ""
+                ),
+                "next_boundary_status": next_boundary.get("status", ""),
+                "next_execution_attempt_count": next_boundary.get("attempt_count", 1),
                 "previous_after_position_symbols": len(prev_after),
                 "next_before_position_symbols": len(next_before),
                 "position_symbol_union_count": len(symbols),
@@ -12722,9 +12946,14 @@ def _build_cross_day_continuity(root: Path, rows: list[dict[str, Any]]) -> tuple
                 "largest_symbol_qty_gaps": _json_cell(
                     sorted(largest_symbol_gaps, key=lambda item: abs(_safe_float(item.get("qty_gap"))), reverse=True)[:20]
                 ),
-                "status": "attention" if symbol_gap_count else "pass",
+                "status": (
+                    "attention"
+                    if symbol_gap_count or boundary_missing_for_retry
+                    else "pass"
+                ),
                 "note": (
-                    "Compares previous execute after-snapshot to next execute before-snapshot. "
+                    "Compares previous execute after-snapshot to the next session's first submit-enabled "
+                    "preflight snapshot, so partial execution and scheduler retries stay in the execution window. "
                     "Equity/market-value gaps are informational market-mark drift; status is based on signed quantity gaps."
                 ),
             }
@@ -12732,7 +12961,7 @@ def _build_cross_day_continuity(root: Path, rows: list[dict[str, Any]]) -> tuple
 
     issue_rows = [row for row in continuity_rows if row.get("status") != "pass"]
     summary = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "root": root.as_posix(),
         "pair_count": len(continuity_rows),
@@ -14324,6 +14553,8 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
         [
             "previous_session_date", "next_session_date", "calendar_gap_days",
             "previous_after_equity", "next_before_equity", "overnight_equity_gap",
+            "next_boundary_source", "next_boundary_captured_at_utc", "next_boundary_status",
+            "next_execution_attempt_count",
             "previous_after_position_symbols", "next_before_position_symbols",
             "position_symbol_union_count", "symbols_with_qty_gap", "total_abs_qty_gap",
             "total_abs_market_value_gap", "largest_symbol_qty_gaps", "status", "note",

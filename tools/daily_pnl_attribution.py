@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 DEFAULT_RECONCILIATION_THRESHOLD_BPS = 10.0
 ALIGNED_SIDE_PNL_SEMANTICS = (
-    "static_positions_previous_post_trade_to_current_pre_trade_mark_to_market"
+    "static_positions_previous_post_trade_to_first_submit_enabled_preflight_mark_to_market"
 )
 
 
@@ -89,6 +89,79 @@ def _position_map(value: Any) -> tuple[dict[str, dict[str, float]], bool]:
             "current_price": float(price) if price is not None else math.nan,
         }
     return positions, available
+
+
+def select_execution_cycle_boundary(
+    *,
+    fallback_account_capture: Any,
+    fallback_positions: Any,
+    opening_snapshot: Any,
+    attempt_count: int = 1,
+) -> dict[str, Any]:
+    """Select the immutable start of an execution cycle.
+
+    A scheduler retry can overwrite ``broker_account_before`` and
+    ``broker_positions_before`` after the first attempt has already traded.  The
+    executor's day-open snapshot is written once, immediately before the first
+    submit-enabled preflight, so it is the correct boundary for both the
+    holding window and side PnL attribution.  A missing or malformed snapshot
+    is exposed explicitly instead of being treated as equivalent evidence.
+    """
+
+    try:
+        normalized_attempt_count = max(1, int(attempt_count))
+    except (TypeError, ValueError):
+        normalized_attempt_count = 1
+    snapshot = opening_snapshot if isinstance(opening_snapshot, Mapping) else {}
+    snapshot_account = snapshot.get("account")
+    snapshot_positions = snapshot.get("positions")
+    snapshot_valid = (
+        isinstance(snapshot_account, Mapping)
+        and isinstance(snapshot_positions, (list, tuple))
+    )
+    retry_occurred = normalized_attempt_count > 1
+
+    if snapshot_valid:
+        return {
+            "account_capture": snapshot_account,
+            "positions": list(snapshot_positions),
+            "available": True,
+            "source": "broker_day_open_snapshot.json",
+            "semantics": str(
+                snapshot.get("capture_semantics")
+                or "first_submit_enabled_executor_preflight_for_session"
+            ),
+            "captured_at_utc": str(snapshot.get("captured_at_utc") or ""),
+            "account_captured_at_utc": str(
+                snapshot.get("account_captured_at_utc")
+                or snapshot.get("captured_at_utc")
+                or ""
+            ),
+            "positions_captured_at_utc": str(
+                snapshot.get("positions_captured_at_utc")
+                or snapshot.get("captured_at_utc")
+                or ""
+            ),
+            "status": "pass",
+            "file_present": True,
+            "attempt_count": normalized_attempt_count,
+            "retry_occurred": retry_occurred,
+        }
+
+    return {
+        "account_capture": fallback_account_capture,
+        "positions": fallback_positions,
+        "available": False,
+        "source": "broker_account_before.json_and_broker_positions_before.csv",
+        "semantics": "current_attempt_preflight_fallback",
+        "captured_at_utc": "",
+        "account_captured_at_utc": "",
+        "positions_captured_at_utc": "",
+        "status": "missing" if retry_occurred else "fallback",
+        "file_present": bool(snapshot),
+        "attempt_count": normalized_attempt_count,
+        "retry_occurred": retry_occurred,
+    }
 
 
 def _static_holding_side_pnl(
@@ -176,21 +249,33 @@ def build_daily_side_pnl_attribution(
     account_start_captured_at_utc: str = "",
     account_before_captured_at_utc: str = "",
     account_end_captured_at_utc: str = "",
+    execution_cycle_boundary: Mapping[str, Any] | None = None,
     reconciliation_threshold_bps: float = DEFAULT_RECONCILIATION_THRESHOLD_BPS,
 ) -> dict[str, Any]:
     """Decompose one completed-execution cycle into additive contributions.
 
     Account return spans previous post-trade equity to current post-trade equity.
     Long and short PnL use unchanged quantities from the previous post-trade
-    position snapshot marked at current pre-trade prices. The execution-window
-    component is the current post-trade equity less current pre-trade equity.
-    Every contribution uses previous post-trade equity as its denominator.
+    position snapshot marked at the first submit-enabled preflight prices. The
+    execution-window component starts at that same preflight and ends at the
+    final post-trade snapshot, so it includes every partial execution and
+    scheduler retry. Every contribution uses previous post-trade equity as its
+    denominator.
     """
 
     account_after = _payload_mapping(account_after_capture)
     account_before = _payload_mapping(account_before_capture)
     account_start = _payload_mapping(account_start_capture)
     activity = _payload_mapping(account_activity_summary)
+    boundary = dict(execution_cycle_boundary or {})
+    boundary_available = bool(
+        boundary.get("available", opening_snapshot_available)
+    )
+    retry_occurred = bool(boundary.get("retry_occurred", False))
+    try:
+        attempt_count = max(1, int(boundary.get("attempt_count") or 1))
+    except (TypeError, ValueError):
+        attempt_count = 1
     static_side = _static_holding_side_pnl(
         previous_positions_after,
         current_positions_before,
@@ -275,6 +360,8 @@ def build_daily_side_pnl_attribution(
     )
     if not required_equity_available or not static_side["evidence_available"]:
         status = "unavailable"
+    elif retry_occurred and not boundary_available:
+        status = "partial"
     elif static_side["position_continuity_status"] != "pass":
         status = "partial"
     elif residual_abs_bps is not None and residual_abs_bps <= reconciliation_threshold_bps:
@@ -283,14 +370,16 @@ def build_daily_side_pnl_attribution(
         status = "partial"
 
     return {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": status,
         "window_semantics": "previous_completed_execute_to_current_completed_execute",
         "holding_window_semantics": (
-            "previous_completed_execute_post_trade_to_current_execute_pre_trade"
+            "previous_completed_execute_post_trade_to_first_submit_enabled_executor_preflight"
         ),
-        "execution_window_semantics": "current_execute_pre_trade_to_post_trade",
+        "execution_window_semantics": (
+            "first_submit_enabled_executor_preflight_to_current_execute_post_trade_including_retries"
+        ),
         "denominator_semantics": "previous_completed_execute_post_trade_equity",
         "side_pnl_semantics": ALIGNED_SIDE_PNL_SEMANTICS,
         "component_semantics": (
@@ -304,6 +393,28 @@ def build_daily_side_pnl_attribution(
         "account_cycle_end_captured_at_utc": account_end_captured_at_utc,
         "account_cycle_start_run_dir": account_start_run_dir,
         "account_cycle_end_run_dir": account_end_run_dir,
+        "execution_cycle_boundary_source": str(
+            boundary.get("source")
+            or (
+                "broker_day_open_snapshot.json"
+                if opening_snapshot_available
+                else ""
+            )
+        ),
+        "execution_cycle_boundary_semantics": str(boundary.get("semantics") or ""),
+        "execution_cycle_boundary_status": str(boundary.get("status") or ""),
+        "execution_attempt_count": attempt_count,
+        "retry_occurred": retry_occurred,
+        "retry_after_partial_execution": bool(
+            boundary.get("retry_after_partial_execution", False)
+        ),
+        "first_attempt_status": str(boundary.get("first_attempt_status") or ""),
+        "first_attempt_executor_status": str(
+            boundary.get("first_attempt_executor_status") or ""
+        ),
+        "first_attempt_returncode": boundary.get("first_attempt_returncode"),
+        "first_attempt_error": str(boundary.get("first_attempt_error") or ""),
+        "retry_reason": str(boundary.get("retry_reason") or ""),
         "account_equity_after": cycle_end_equity,
         "account_last_equity": cycle_start_equity,
         "broker_last_equity": broker_last_equity,
@@ -361,15 +472,18 @@ def build_daily_side_pnl_attribution(
             "missing_current_symbols"
         ],
         "position_missing_price_symbols": static_side["missing_price_symbols"],
-        "opening_snapshot_available": bool(opening_snapshot_available),
+        "opening_snapshot_available": bool(
+            boundary.get("file_present", boundary_available)
+        ),
         "opening_snapshot_source": (
-            "broker_day_open_snapshot.json" if opening_snapshot_available else ""
+            str(boundary.get("source") or "") if boundary_available else ""
         ),
         "strict_daily_side_attribution_ready": status == "reconciled",
         "note": (
             "Long and short use unchanged previous post-trade quantities marked from previous post-trade "
-            "prices to current pre-trade prices. Execution-window PnL is current post-trade equity less "
-            "current pre-trade equity. All chart contributions use previous post-trade equity, so they are "
-            "additive; holding residual remains explicit for cash activity, snapshot timing, or continuity gaps."
+            "prices to the first submit-enabled preflight prices. The execution window starts at that "
+            "preflight and ends at final post-trade equity, including all partial execution and retries. "
+            "All chart contributions use previous post-trade equity, so they are additive; holding residual "
+            "remains explicit for cash activity, snapshot timing, or continuity gaps."
         ),
     }

@@ -135,7 +135,57 @@ def _build_fixture(root: Path) -> DataAggregator:
             "fee_interest_dividend_net_amount": -10.0,
         },
     )
-    _write_json(complete / "broker_day_open_snapshot.json", {"positions": []})
+    _write_json(
+        complete / "broker_day_open_snapshot.json",
+        {
+            "capture_semantics": "first_submit_enabled_executor_preflight_for_session",
+            "account": {"equity": "100090"},
+            "positions": [
+                {
+                    "symbol": "LONG",
+                    "side": "long",
+                    "qty": 10.0,
+                    "signed_qty": 10.0,
+                    "current_price": 115.0,
+                    "market_value": 1150.0,
+                },
+                {
+                    "symbol": "SHORT",
+                    "side": "short",
+                    "qty": 5.0,
+                    "signed_qty": -5.0,
+                    "current_price": 110.0,
+                    "market_value": -550.0,
+                },
+            ],
+        },
+    )
+    _write_json(complete / "scheduler_task_result.json", {"attempt": 2})
+    _write_json(
+        complete / "scheduler_attempt_history.json",
+        {
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "status": "failed",
+                    "executor_status": "completed_with_errors",
+                    "returncode": 1,
+                    "submitted": True,
+                    "submit_error_count": 1,
+                    "partial_execution_observed": True,
+                    "error": "ARW: spread exceeds limit",
+                    "retry_reason": "executor_nonzero_returncode_after_submit_error",
+                },
+                {
+                    "attempt": 2,
+                    "status": "completed",
+                    "executor_status": "completed",
+                    "returncode": 0,
+                    "submitted": True,
+                },
+            ]
+        },
+    )
     _write_json(
         complete / "audit" / "07_risk_snapshot.json",
         {
@@ -258,6 +308,16 @@ def test_cycle_return_decomposes_holding_sides_and_execution_window() -> None:
         assert component_return == row["daily_account_return"], row
         assert row["daily_side_pnl_attribution_status"] == "reconciled", row
         assert row["daily_side_opening_snapshot_available"] is True, row
+        assert row["daily_execution_cycle_boundary_source"] == "broker_day_open_snapshot.json", row
+        assert row["daily_execution_cycle_boundary_status"] == "pass", row
+        assert row["daily_execution_attempt_count"] == 2, row
+        assert row["daily_retry_occurred"] is True, row
+        assert row["daily_retry_after_partial_execution"] is True, row
+        assert row["daily_first_attempt_status"] == "failed", row
+        assert row["daily_first_attempt_executor_status"] == "completed_with_errors", row
+        assert row["daily_first_attempt_returncode"] == 1, row
+        assert row["daily_first_attempt_error"] == "ARW: spread exceeds limit", row
+        assert row["daily_retry_reason"] == "executor_nonzero_returncode_after_submit_error", row
 
 
 def test_zero_exposure_does_not_emit_a_false_zero_return() -> None:
@@ -344,6 +404,12 @@ def test_dashboard_markup_includes_side_return_chart() -> None:
         "seriesExecutionWindowContribution",
         "seriesAccountReturn",
         "seriesResidualContribution",
+        "daily_execution_cycle_boundary_source",
+        "daily_execution_attempt_count",
+        "daily_retry_after_partial_execution",
+        "daily_first_attempt_error",
+        "metricExecutionBoundary",
+        "metricRetryAfterPartial",
     ):
         assert required in html, required
 
