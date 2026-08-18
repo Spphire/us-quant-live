@@ -512,6 +512,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Real-time quote provider used for sizing and order prices.",
     )
     parser.add_argument(
+        "--execution-intraday-bar-provider",
+        choices=("alpaca", "longbridge"),
+        default="alpaca",
+        help=(
+            "Provider used only for execution-stage 1-minute audit evidence. "
+            "It does not change sizing quotes or submitted limit prices."
+        ),
+    )
+    parser.add_argument(
         "--execution-price-feed",
         default="iex",
         help="Alpaca feed used for intraday bar evidence and when provider=alpaca.",
@@ -1662,6 +1671,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_quote_feed = str(
             getattr(execution_quote_client, "feed_name", None) or args.execution_price_feed
         )
+        execution_intraday_bar_provider_configured = str(
+            args.execution_intraday_bar_provider
+        ).lower()
+        if execution_intraday_bar_provider_configured != "alpaca":
+            raise ValueError(
+                "This production branch requires --execution-intraday-bar-provider=alpaca; "
+                "Longbridge minute-bar evidence is enabled only in the Dev candidate."
+            )
+        execution_intraday_bar_client = client
+        execution_intraday_bar_provider = "alpaca"
+        execution_intraday_bar_feed = str(args.execution_price_feed)
+        intraday_bar_capture_mode = "synchronous_before_after"
+        intraday_bar_before_cutoff_at_utc = _utc_now()
+        _mark_event(
+            run_events,
+            "execution_intraday_bar_provider_ready",
+            {
+                "configured_provider": execution_intraday_bar_provider_configured,
+                "active_provider": execution_intraday_bar_provider,
+                "feed": execution_intraday_bar_feed,
+                "capture_mode": intraday_bar_capture_mode,
+                "execution_critical_path_blocked": True,
+            },
+        )
         reference_prices = _resolve_reference_prices(
             client=execution_quote_client,
             symbols=reference_price_symbols,
@@ -1716,10 +1749,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(
             output_root / "execution_intraday_bars_1min.json",
             _collect_intraday_bars_snapshot(
-                client=client,
+                client=execution_intraday_bar_client,
                 symbols=audit_price_symbols,
                 session_date=decision_date,
-                feed=str(args.execution_price_feed),
+                feed=execution_intraday_bar_feed,
                 label="before_submit",
             ),
         )
@@ -1729,7 +1762,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "collected_at_utc": _utc_now(),
                 "provider": active_quote_provider,
                 "feed": execution_quote_feed,
-                "alpaca_intraday_bar_feed": str(args.execution_price_feed),
+                "execution_intraday_bar_provider_configured": (
+                    execution_intraday_bar_provider_configured
+                ),
+                "execution_intraday_bar_provider": execution_intraday_bar_provider,
+                "execution_intraday_bar_feed": execution_intraday_bar_feed,
+                "execution_intraday_bar_capture_mode": intraday_bar_capture_mode,
+                "execution_intraday_bar_before_cutoff_at_utc": (
+                    intraday_bar_before_cutoff_at_utc
+                ),
+                "alpaca_intraday_bar_feed": execution_intraday_bar_feed,
                 "target_symbols": sorted(target_signed_weights),
                 "broker_position_symbols_before": sorted(broker_signed_notional_before),
                 "audit_benchmark_symbols": benchmark_symbols,
@@ -2595,10 +2637,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json_file(
             output_root / "execution_intraday_bars_1min_after.json",
             _collect_intraday_bars_snapshot(
-                client=client,
+                client=execution_intraday_bar_client,
                 symbols=intraday_bar_symbols_after,
                 session_date=decision_date,
-                feed=str(args.execution_price_feed),
+                feed=execution_intraday_bar_feed,
                 label="after_execution",
             ),
         )
@@ -2813,7 +2855,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "execution_quote_provider_active": active_quote_provider,
             "execution_quote_feed": execution_quote_feed,
             "execution_quote_provider_health": quote_provider_health,
-            "alpaca_intraday_bar_feed": str(args.execution_price_feed),
+            "execution_intraday_bar_provider_configured": (
+                execution_intraday_bar_provider_configured
+            ),
+            "execution_intraday_bar_provider": execution_intraday_bar_provider,
+            "execution_intraday_bar_feed": execution_intraday_bar_feed,
+            "execution_intraday_bar_adjustment": "raw",
+            "execution_intraday_bar_capture_mode": intraday_bar_capture_mode,
+            "execution_intraday_bar_before_cutoff_at_utc": (
+                intraday_bar_before_cutoff_at_utc
+            ),
+            "execution_intraday_bar_execution_critical_path_blocked": True,
+            "alpaca_intraday_bar_feed": execution_intraday_bar_feed,
             "adverse_price_offset_bps": float(adverse_price_offset_bps),
             "marketable_limit_base_offset_bps": float(marketable_limit_base_offset_bps),
             "marketable_limit_max_offset_bps": float(marketable_limit_max_offset_bps),
@@ -5327,6 +5380,7 @@ def _collect_intraday_bars_snapshot(
         "label": str(label),
         "collected_at_utc": _utc_now(),
         "session_date": session_date.isoformat(),
+        "provider": "alpaca",
         "feed": str(feed),
         "primary_feed": str(feed),
         "fallback_feed": normalized_fallback_feed or None,

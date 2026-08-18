@@ -6305,7 +6305,9 @@ def _build_intraday_bar_evidence(
             "error_count": len(errors),
             "collected_at_utc": payload.get("collected_at_utc", ""),
             "label": payload.get("label") or source,
+            "provider": payload.get("provider", ""),
             "feed": payload.get("feed", ""),
+            "adjustment": payload.get("adjustment", ""),
             "primary_feed": payload.get("primary_feed") or payload.get("feed", ""),
             "fallback_feed": payload.get("fallback_feed", ""),
             "fallback_attempted": bool(payload.get("fallback_attempted")),
@@ -6315,6 +6317,7 @@ def _build_intraday_bar_evidence(
             "fallback_bar_symbol_count": _safe_int(payload.get("fallback_bar_symbol_count")),
             "fallback_bar_symbols": payload.get("fallback_bar_symbols") or [],
             "source_counts": payload.get("source_counts") or {},
+            "metrics": payload.get("metrics") or {},
         }
 
     market_by_symbol = {

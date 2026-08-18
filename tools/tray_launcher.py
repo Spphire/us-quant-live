@@ -450,6 +450,8 @@ class SchedulerSupervisor:
                 str(PROJECT_ROOT),
                 "--dashboard-port",
                 str(DASHBOARD_PORT),
+                "--execution-intraday-bar-provider",
+                "alpaca",
             ]
 
             # Open log file (keep handle so we can close it)
