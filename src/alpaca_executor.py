@@ -47,7 +47,11 @@ from dynamic_symbol_pool import (  # noqa: E402
     _load_candidate_symbols,
     _resolve_alpaca_credentials,
 )
-from executable_target_projector import project_executable_targets  # noqa: E402
+from executable_target_projector import (  # noqa: E402
+    REGT_INITIAL_MARGIN_FLOOR_RATE,
+    project_executable_targets,
+    resolve_initial_margin_requirement,
+)
 from price_basis import summarize_alpha_price_basis_panel  # noqa: E402
 from vendors import (  # noqa: E402
     AlpacaHttpClient,
@@ -1070,6 +1074,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         sec_cache_source = "runtime"
         symbols: list[str] = []
         target_signed_weights: dict[str, float] = {}
+        target_beta_by_symbol: dict[str, float] = {}
+        target_beta_missing_symbols: list[str] = []
         symbol_universe_snapshot: dict[str, Any] = {}
         symbol_universe_json_path = output_root / "symbol_universe_intersection.json"
         symbol_universe_csv_path = output_root / "symbol_universe_intersection.csv"
@@ -1111,6 +1117,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             decision_skip_reason = None if skip_reason_raw in (None, "", "null") else str(skip_reason_raw)
             diag_raw = loaded_plan.get("decision_diagnostics")
             decision_diagnostics = dict(diag_raw) if isinstance(diag_raw, Mapping) else {}
+            beta_payload = loaded_plan.get("target_beta_by_symbol")
+            if isinstance(beta_payload, Mapping):
+                target_beta_by_symbol = {
+                    str(symbol).strip().upper(): float(value)
+                    for symbol, value in beta_payload.items()
+                    if _safe_float(value) is not None
+                }
             sec_cache_source = str(loaded_plan.get("sec_cache_source") or "from_order_plan")
             decision_targets_path = output_root / "decision_targets.csv"
             _target_weights_to_frame(target_signed_weights).to_csv(decision_targets_path, index=False)
@@ -1582,12 +1595,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"observed_adjustments={alpha_price_basis_evidence.get('observed_alpha_price_adjustments')}. "
                 "Regenerate the Alpha panel with this branch before decision/execution."
             )
+        if not target_beta_by_symbol and not alpha_panel.empty:
+            target_beta_by_symbol, target_beta_missing_symbols = _target_beta_map_from_alpha_panel(
+                alpha_panel,
+                target_signed_weights,
+            )
+        else:
+            target_beta_missing_symbols = sorted(
+                set(target_signed_weights) - set(target_beta_by_symbol)
+            )
+        decision_diagnostics = dict(decision_diagnostics or {})
+        decision_diagnostics["executable_target_beta_symbol_count"] = int(
+            len(target_beta_by_symbol)
+        )
+        decision_diagnostics["executable_target_beta_missing_symbols"] = list(
+            target_beta_missing_symbols
+        )
         _mark_event(
             run_events,
             "decision_targets_resolved",
             {
                 "decision_status": decision_status,
                 "target_symbol_count": len(target_signed_weights),
+                "target_beta_symbol_count": len(target_beta_by_symbol),
+                "target_beta_missing_symbol_count": len(target_beta_missing_symbols),
                 "decision_targets_path": decision_targets_path.as_posix() if decision_targets_path else None,
             },
         )
@@ -1904,6 +1935,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
             total_buying_power_capacity=float(sizing_total_regt_capacity),
             gross_capacity_target_ratio=float(args.gross_capacity_target_ratio),
+            target_beta_by_symbol=target_beta_by_symbol,
         )
         executable_expected_signed_weights = dict(
             executable_projection_diag.get("executable_expected_signed_weights") or {}
@@ -1922,6 +1954,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         executable_projection_diag["submission_capability_guard"] = submission_capability_guard
         final_executable_projection_diag = executable_projection_diag
+        projection_hard_violations = list(
+            executable_projection_diag.get("hard_constraint_violations") or []
+        )
+        if should_submit and projection_hard_violations:
+            _mark_event(
+                run_events,
+                "projection_hard_constraints_blocked_submission",
+                {
+                    "violations": projection_hard_violations,
+                    "projected_initial_margin": executable_projection_diag.get(
+                        "projected_initial_margin"
+                    ),
+                    "initial_margin_cap": executable_projection_diag.get(
+                        "initial_margin_cap"
+                    ),
+                    "projected_net_beta": executable_projection_diag.get(
+                        "projected_net_beta"
+                    ),
+                    "beta_abs_limit": executable_projection_diag.get("beta_abs_limit"),
+                },
+            )
+            raise RuntimeError(
+                "Execution blocked before order creation: executable target hard constraint "
+                f"breach ({', '.join(projection_hard_violations)})."
+            )
         target_short_floor_diag = {
             "legacy_projection_replaced": True,
             "projector": "executable_target_projector",
@@ -1953,6 +2010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "order_target_signed_weights": target_signed_weights,
                 "target_lattice_signed_qty": target_lattice_signed_qty,
                 "executable_expected_signed_weights": executable_expected_signed_weights,
+                "target_beta_by_symbol": dict(sorted(target_beta_by_symbol.items())),
                 "executable_target_projection": executable_projection_diag,
                 "target_short_floor_diagnostics": target_short_floor_diag,
                 "account_equity_for_sizing": float(sizing_equity),
@@ -2126,6 +2184,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "projection_projected_final_gross_notional": executable_projection_diag.get(
                     "projected_final_gross_notional"
                 ),
+                "projection_projected_initial_margin": executable_projection_diag.get(
+                    "projected_initial_margin"
+                ),
+                "projection_initial_margin_cap": executable_projection_diag.get(
+                    "initial_margin_cap"
+                ),
+                "projection_projected_net_beta": executable_projection_diag.get(
+                    "projected_net_beta"
+                ),
             },
         )
         corporate_action_symbols = _relevant_corporate_action_symbols(
@@ -2218,6 +2285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "decision_status": decision_status,
                     "decision_skip_reason": decision_skip_reason,
                     "decision_diagnostics": decision_diagnostics,
+                    "target_beta_by_symbol": dict(sorted(target_beta_by_symbol.items())),
                     "previous_broker_signed_weights": dict(sorted(broker_weights_before.items())),
                     "sec_cache_source": sec_cache_source,
                     "dynamic_symbol_count": int(len(symbols)),
@@ -2349,6 +2417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     initial_instructions=instructions,
                     target_signed_weights=target_signed_weights,
                     raw_target_signed_weights=raw_target_signed_weights,
+                    target_beta_by_symbol=target_beta_by_symbol,
                     assets_by_symbol=assets_by_symbol,
                     fallback_prices=fallback_prices,
                     session_token=session_token,
@@ -2576,6 +2645,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _write_json_file(output_root / "broker_position_account_stability_after.json", position_account_stability_after)
         broker_frame_after, broker_signed_notional_after = _positions_to_frame_and_notional(positions_after)
+        margin_reconciliation = _build_margin_reconciliation(
+            positions=positions_after,
+            account=account_after,
+            assets_by_symbol=assets_by_symbol,
+            executable_projection=final_executable_projection_diag,
+        )
+        margin_reconciliation_path = output_root / "margin_reconciliation.json"
+        margin_reconciliation_csv_path = output_root / "margin_reconciliation.csv"
+        _write_json_file(margin_reconciliation_path, margin_reconciliation)
+        pd.DataFrame(margin_reconciliation.get("rows") or []).to_csv(
+            margin_reconciliation_csv_path,
+            index=False,
+        )
         intraday_bar_symbols_after = sorted(
             set(reference_price_symbols)
             | set(benchmark_symbols)
@@ -3034,6 +3116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "gross_capacity_target_ratio": float(args.gross_capacity_target_ratio),
             "initial_executable_target_projection": executable_projection_diag,
             "executable_target_projection": final_executable_projection_diag,
+            "margin_reconciliation": margin_reconciliation,
             "account_state_path": account_state_path.as_posix(),
             "alignment_after_execution": alignment_after,
             "outputs": {
@@ -3109,6 +3192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ).as_posix(),
                 "broker_positions_before_csv": (output_root / "broker_positions_before.csv").as_posix(),
                 "broker_positions_after_csv": (output_root / "broker_positions_after.csv").as_posix(),
+                "margin_reconciliation_json": margin_reconciliation_path.as_posix(),
+                "margin_reconciliation_csv": margin_reconciliation_csv_path.as_posix(),
                 "execution_records_json": (output_root / "execution_records.json").as_posix(),
                 "order_poll_timeline_json": order_poll_timeline_path.as_posix(),
                 "staged_rebuild_snapshots_json": (output_root / "staged_rebuild_snapshots.json").as_posix(),
@@ -3390,6 +3475,35 @@ def _target_weights_to_frame(target_signed_weights: Mapping[str, float]) -> pd.D
     if not frame.empty:
         frame = frame.sort_values(["side", "side_weight"], ascending=[True, False]).reset_index(drop=True)
     return frame
+
+
+def _target_beta_map_from_alpha_panel(
+    alpha_panel: pd.DataFrame,
+    target_symbols: Iterable[str],
+) -> tuple[dict[str, float], list[str]]:
+    """Resolve the point-in-time beta used by the decision for executable targets."""
+
+    symbols = {
+        str(symbol or "").strip().upper()
+        for symbol in target_symbols
+        if str(symbol or "").strip()
+    }
+    if alpha_panel is None or alpha_panel.empty or "symbol" not in alpha_panel.columns:
+        return {}, sorted(symbols)
+    beta_column = "beta" if "beta" in alpha_panel.columns else "beta_raw"
+    if beta_column not in alpha_panel.columns:
+        return {}, sorted(symbols)
+    frame = alpha_panel[["symbol", beta_column]].copy()
+    frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+    frame[beta_column] = pd.to_numeric(frame[beta_column], errors="coerce")
+    frame = frame.dropna(subset=[beta_column]).drop_duplicates("symbol", keep="last")
+    mapping: dict[str, float] = {}
+    for row in frame.itertuples(index=False):
+        symbol = str(getattr(row, "symbol") or "").strip().upper()
+        value = _safe_float(getattr(row, beta_column, None))
+        if symbol in symbols and value is not None:
+            mapping[symbol] = float(value)
+    return mapping, sorted(symbols - set(mapping))
 
 
 def _new_longbridge_quote_client(args: argparse.Namespace) -> LongbridgeQuoteClient:
@@ -3747,7 +3861,37 @@ def _total_regt_buying_power_capacity(
         raise ValueError(
             "Alpaca account snapshot is missing regt_buying_power; cannot enforce final gross capacity."
         )
-    total_capacity = gross_position + float(regt_buying_power)
+    equity = _safe_float(account.get("portfolio_value"))
+    if equity is None or equity <= 0.0:
+        equity = _safe_float(account.get("equity"))
+    initial_margin = _safe_float(account.get("initial_margin"))
+    if equity is not None and equity > 0.0:
+        # Reg T capacity is an account-level baseline.  Reconstructing it as
+        # current gross + remaining BP makes high-margin symbols shrink the
+        # denominator after every rebalance, which is exactly the drift this
+        # constraint is meant to prevent.
+        total_capacity = equity / REGT_INITIAL_MARGIN_FLOOR_RATE
+        source = (
+            f"alpaca_account.{('portfolio_value' if _safe_float(account.get('portfolio_value')) is not None else 'equity')}"
+            f"/regt_initial_margin_floor_{REGT_INITIAL_MARGIN_FLOOR_RATE:.2f}"
+        )
+        if initial_margin is not None and initial_margin >= 0.0:
+            implied_capacity = (
+                initial_margin / REGT_INITIAL_MARGIN_FLOOR_RATE
+                + float(regt_buying_power)
+            )
+            source += f";identity_check={implied_capacity:.6f}"
+    elif initial_margin is not None and initial_margin >= 0.0:
+        total_capacity = (
+            initial_margin / REGT_INITIAL_MARGIN_FLOOR_RATE
+            + float(regt_buying_power)
+        )
+        source = "alpaca_account.initial_margin+regt_buying_power"
+    else:
+        # Backward-compatible fallback for old synthetic fixtures that do not
+        # carry equity/initial_margin fields.
+        total_capacity = gross_position + float(regt_buying_power)
+        source = f"{gross_source}+alpaca_account.regt_buying_power"
     if total_capacity <= 0.0:
         raise ValueError(
             "Reconstructed total RegT capacity must be positive: "
@@ -3757,8 +3901,217 @@ def _total_regt_buying_power_capacity(
         float(total_capacity),
         float(gross_position),
         float(regt_buying_power),
-        f"{gross_source}+alpaca_account.regt_buying_power",
+        source,
     )
+
+
+def _build_margin_reconciliation(
+    *,
+    positions: Sequence[Mapping[str, Any]],
+    account: Mapping[str, Any],
+    assets_by_symbol: Mapping[str, Mapping[str, Any]],
+    executable_projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reconcile per-position margin estimates to the broker account snapshot."""
+
+    rows: list[dict[str, Any]] = []
+    source_counts: Counter[str] = Counter()
+    predicted_initial_margin = 0.0
+    regt_floor_initial_margin = 0.0
+    predicted_long_initial_margin = 0.0
+    predicted_short_initial_margin = 0.0
+    missing_margin_symbols: list[str] = []
+
+    for raw_position in positions:
+        if not isinstance(raw_position, Mapping):
+            continue
+        symbol = str(raw_position.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        qty = _safe_float(raw_position.get("qty")) or 0.0
+        side = str(raw_position.get("side") or "").strip().lower()
+        if side not in {"long", "short"}:
+            side = "short" if qty < 0.0 else "long"
+        current_price = _safe_float(raw_position.get("current_price"))
+        market_value = _safe_float(raw_position.get("market_value"))
+        if market_value is None and current_price is not None:
+            market_value = qty * current_price
+        abs_market_value = abs(float(market_value or 0.0))
+        if current_price is None or current_price <= 0.0:
+            current_price = (
+                abs_market_value / abs(qty)
+                if abs(qty) > EPS and abs_market_value > 0.0
+                else 0.0
+            )
+        margin_requirement = resolve_initial_margin_requirement(
+            asset=assets_by_symbol.get(symbol, {}) or {},
+            side=side,
+            reference_price=float(current_price),
+        )
+        margin_rate = float(margin_requirement["initial_margin_rate"])
+        margin_source = str(
+            margin_requirement["initial_margin_requirement_source"]
+        )
+        position_margin = abs_market_value * margin_rate
+        floor_margin = abs_market_value * REGT_INITIAL_MARGIN_FLOOR_RATE
+        extra_margin = max(0.0, position_margin - floor_margin)
+        predicted_initial_margin += position_margin
+        regt_floor_initial_margin += floor_margin
+        if side == "short":
+            predicted_short_initial_margin += position_margin
+        else:
+            predicted_long_initial_margin += position_margin
+        source_counts[margin_source] += 1
+        if margin_source == "missing_asset_margin_metadata_fail_closed":
+            missing_margin_symbols.append(symbol)
+        rows.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "qty": float(qty),
+                "current_price": float(current_price),
+                "market_value": float(market_value or 0.0),
+                "abs_market_value": float(abs_market_value),
+                "initial_margin_rate": margin_rate,
+                "initial_margin_requirement_pct": margin_rate * 100.0,
+                "initial_margin_requirement_source": margin_source,
+                "broker_margin_requirement_rate": margin_requirement.get(
+                    "broker_margin_requirement_rate"
+                ),
+                "broker_margin_requirement_pct": margin_requirement.get(
+                    "broker_margin_requirement_pct"
+                ),
+                "marginable": margin_requirement.get("marginable"),
+                "predicted_initial_margin": float(position_margin),
+                "regt_floor_initial_margin": float(floor_margin),
+                "extra_initial_margin_vs_regt_floor": float(extra_margin),
+            }
+        )
+
+    equity = _safe_float(account.get("portfolio_value"))
+    equity_source = "portfolio_value"
+    if equity is None or equity <= 0.0:
+        equity = _safe_float(account.get("equity"))
+        equity_source = "equity"
+    broker_initial_margin = _safe_float(account.get("initial_margin"))
+    broker_regt_buying_power = _safe_float(account.get("regt_buying_power"))
+    stable_total_regt_capacity = (
+        float(equity / REGT_INITIAL_MARGIN_FLOOR_RATE)
+        if equity is not None and equity > 0.0
+        else None
+    )
+    predicted_regt_buying_power = (
+        stable_total_regt_capacity
+        - predicted_initial_margin / REGT_INITIAL_MARGIN_FLOOR_RATE
+        if stable_total_regt_capacity is not None
+        else None
+    )
+    initial_margin_error = (
+        predicted_initial_margin - broker_initial_margin
+        if broker_initial_margin is not None
+        else None
+    )
+    regt_buying_power_error = (
+        predicted_regt_buying_power - broker_regt_buying_power
+        if predicted_regt_buying_power is not None
+        and broker_regt_buying_power is not None
+        else None
+    )
+    broker_identity_residual = (
+        stable_total_regt_capacity
+        - broker_initial_margin / REGT_INITIAL_MARGIN_FLOOR_RATE
+        - broker_regt_buying_power
+        if stable_total_regt_capacity is not None
+        and broker_initial_margin is not None
+        and broker_regt_buying_power is not None
+        else None
+    )
+    tolerance = max(25.0, float(equity or 0.0) * 0.0005)
+    broker_fields_complete = bool(
+        equity is not None
+        and equity > 0.0
+        and broker_initial_margin is not None
+        and broker_regt_buying_power is not None
+    )
+    reconciliation_pass = bool(
+        broker_fields_complete
+        and not missing_margin_symbols
+        and initial_margin_error is not None
+        and abs(initial_margin_error) <= tolerance
+        and regt_buying_power_error is not None
+        and abs(regt_buying_power_error) <= tolerance * 2.0
+    )
+    projection = dict(executable_projection or {})
+    high_margin_rows = sorted(
+        (
+            row
+            for row in rows
+            if float(row["initial_margin_rate"])
+            > REGT_INITIAL_MARGIN_FLOOR_RATE + EPS
+        ),
+        key=lambda row: float(row["extra_initial_margin_vs_regt_floor"]),
+        reverse=True,
+    )
+    return {
+        "schema_version": "1.0",
+        "generated_at_utc": _utc_now(),
+        "status": "pass" if reconciliation_pass else "attention",
+        "position_count": len(rows),
+        "account_equity": equity,
+        "account_equity_source": f"alpaca_account.{equity_source}",
+        "regt_initial_margin_floor_rate": REGT_INITIAL_MARGIN_FLOOR_RATE,
+        "stable_total_regt_buying_power_capacity": stable_total_regt_capacity,
+        "predicted_initial_margin": float(predicted_initial_margin),
+        "broker_initial_margin": broker_initial_margin,
+        "initial_margin_prediction_error": initial_margin_error,
+        "initial_margin_prediction_error_abs": (
+            abs(initial_margin_error) if initial_margin_error is not None else None
+        ),
+        "initial_margin_prediction_error_bps_of_equity": (
+            initial_margin_error / equity * 10000.0
+            if initial_margin_error is not None and equity and equity > 0.0
+            else None
+        ),
+        "reconciliation_tolerance": float(tolerance),
+        "predicted_regt_buying_power": predicted_regt_buying_power,
+        "broker_regt_buying_power": broker_regt_buying_power,
+        "regt_buying_power_prediction_error": regt_buying_power_error,
+        "broker_regt_capacity_identity_residual": broker_identity_residual,
+        "predicted_initial_margin_ratio_of_equity": (
+            predicted_initial_margin / equity if equity and equity > 0.0 else None
+        ),
+        "broker_initial_margin_ratio_of_equity": (
+            broker_initial_margin / equity
+            if broker_initial_margin is not None and equity and equity > 0.0
+            else None
+        ),
+        "broker_regt_buying_power_reserve_ratio": (
+            broker_regt_buying_power / stable_total_regt_capacity
+            if broker_regt_buying_power is not None
+            and stable_total_regt_capacity
+            and stable_total_regt_capacity > 0.0
+            else None
+        ),
+        "predicted_long_initial_margin": float(predicted_long_initial_margin),
+        "predicted_short_initial_margin": float(predicted_short_initial_margin),
+        "regt_floor_initial_margin": float(regt_floor_initial_margin),
+        "extra_initial_margin_vs_regt_floor": float(
+            predicted_initial_margin - regt_floor_initial_margin
+        ),
+        "margin_requirement_source_counts": dict(sorted(source_counts.items())),
+        "missing_margin_metadata_symbols": sorted(set(missing_margin_symbols)),
+        "high_margin_symbol_count": len(high_margin_rows),
+        "high_margin_symbols": high_margin_rows,
+        "projected_target_initial_margin": projection.get("projected_initial_margin"),
+        "projected_target_initial_margin_cap": projection.get("initial_margin_cap"),
+        "projected_target_regt_buying_power": projection.get(
+            "projected_regt_buying_power"
+        ),
+        "projected_target_net_beta": projection.get("projected_net_beta"),
+        "projected_target_beta_abs_limit": projection.get("beta_abs_limit"),
+        "hard_constraints_satisfied": projection.get("hard_constraints_satisfied"),
+        "rows": sorted(rows, key=lambda row: str(row["symbol"])),
+    }
 
 
 def _effective_min_trade_notional(
@@ -6567,6 +6920,7 @@ def _submit_staged_regt_orders(
     initial_instructions: Sequence[OrderInstruction],
     target_signed_weights: Mapping[str, float],
     raw_target_signed_weights: Mapping[str, float],
+    target_beta_by_symbol: Mapping[str, float] | None = None,
     assets_by_symbol: Mapping[str, Mapping[str, Any]],
     fallback_prices: Mapping[str, float],
     session_token: str,
@@ -7198,7 +7552,33 @@ def _submit_staged_regt_orders(
         short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
         total_buying_power_capacity=float(total_regt_capacity),
         gross_capacity_target_ratio=float(gross_capacity_target_ratio),
+        target_beta_by_symbol=target_beta_by_symbol,
     )
+    entry_projection_violations = list(
+        entry_projection.get("hard_constraint_violations") or []
+    )
+    if entry_projection_violations:
+        diagnostics.update(
+            {
+                "entry_projection": entry_projection,
+                "entry_aborted": True,
+                "entry_abort_reason": "entry_projection_hard_constraint_breach",
+                "entry_projection_hard_constraint_violations": entry_projection_violations,
+            }
+        )
+        snapshots.append(
+            {
+                "schema_version": "1.0",
+                "snapshot_type": "entry_abort",
+                "captured_at_utc": _utc_now(),
+                "stage": "entry_rebuild",
+                "macro_stage": "entry_rebuild",
+                "entry_abort_reason": diagnostics["entry_abort_reason"],
+                "hard_constraint_violations": entry_projection_violations,
+                "entry_projection": entry_projection,
+            }
+        )
+        return records, diagnostics
     entry_instructions, entry_skipped = _build_order_instructions(
         target_signed_weights=entry_target_signed_weights,
         current_signed_notional=refreshed_signed_notional,
@@ -7596,7 +7976,19 @@ def _submit_staged_regt_orders(
             short_buying_power_adverse_offset_bps=float(short_buying_power_adverse_offset_bps),
             total_buying_power_capacity=float(repair_total_regt_capacity),
             gross_capacity_target_ratio=float(gross_capacity_target_ratio),
+            target_beta_by_symbol=target_beta_by_symbol,
         )
+        repair_projection_violations = list(
+            repair_projection.get("hard_constraint_violations") or []
+        )
+        if repair_projection_violations:
+            diagnostics["entry_repair_projection_hard_constraint_violations"] = (
+                repair_projection_violations
+            )
+            diagnostics["entry_repair_projection"] = repair_projection
+            diagnostics["entry_abort_reason"] = "entry_repair_projection_hard_constraint_breach"
+            diagnostics["entry_aborted"] = True
+            return records, diagnostics
         rebuilt_repair_instructions, repair_skipped = _build_order_instructions(
             target_signed_weights=repair_target_signed_weights,
             current_signed_notional=repair_signed_notional,
@@ -7927,6 +8319,18 @@ def _build_target_capability_snapshot(
                 "maintenance_margin_requirement": _safe_float(
                     asset.get("maintenance_margin_requirement")
                 ),
+                "margin_requirement_long": _safe_float(
+                    asset.get("margin_requirement_long")
+                ),
+                "margin_requirement_short": _safe_float(
+                    asset.get("margin_requirement_short")
+                ),
+                "initial_margin_rate": _safe_float(
+                    projected.get("initial_margin_rate")
+                ),
+                "initial_margin_requirement_source": str(
+                    projected.get("initial_margin_requirement_source") or ""
+                ),
                 "constraint_reasons": reasons,
                 "capability_issues": sorted(set(issues)),
                 "capability_status": capability_status,
@@ -7996,6 +8400,10 @@ def _build_target_capability_drift(
         "fractionable",
         "marginable",
         "maintenance_margin_requirement",
+        "margin_requirement_long",
+        "margin_requirement_short",
+        "initial_margin_rate",
+        "initial_margin_requirement_source",
     ]
     rows: list[dict[str, Any]] = []
     for symbol in sorted(set(prior_by_symbol) | set(current_by_symbol)):
@@ -8821,6 +9229,8 @@ def _expected_artifact_categories(output_root: Path) -> dict[str, list[str]]:
             "target_capability_drift.csv",
             "portfolio_weights_snapshot.json",
             "portfolio_weights_after_snapshot.json",
+            "margin_reconciliation.json",
+            "margin_reconciliation.csv",
         ],
         "meta_manifests": [
             "run_evidence_digest.json",

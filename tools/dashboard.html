@@ -703,7 +703,7 @@
                 chartEquityTitle: 'Portfolio Equity (Execution Completions)',
                 chartSideReturnTitle: 'Execution-Cycle Return Decomposition',
                 chartWeightErrorTitle: 'Daily Weight Error (L1)',
-                chartBuyingPowerTitle: 'Gross Position vs RegT Capacity',
+                chartBuyingPowerTitle: 'Nominal Gross and Initial Margin',
                 seriesLongReturn: 'Long holding contribution',
                 seriesShortReturn: 'Short holding contribution',
                 seriesExecutionWindowContribution: 'Execution-window contribution',
@@ -722,11 +722,13 @@
                 seriesExecutableActual: 'Executable to actual',
                 seriesProjectionFloor: 'Constraint optimum',
                 seriesGrossUtilization: 'Gross utilization',
+                seriesInitialMarginUtilization: 'Initial margin utilization',
+                seriesRegtReserve: 'RegT BP reserve',
                 seriesConfiguredTarget: '95% target',
                 seriesTotalCapacity: '100% capacity',
                 seriesErrorVsTarget: 'Error vs target',
                 seriesErrorVsTotal: 'Error vs total',
-                metricGrossCapacity: 'Gross / RegT Capacity',
+                metricGrossCapacity: 'Initial Margin / Equity',
 
                 // Positions
                 searchSymbol: 'Search symbol...',
@@ -858,7 +860,7 @@
                 chartEquityTitle: '账户权益曲线（执行完成快照）',
                 chartSideReturnTitle: '执行周期收益拆分',
                 chartWeightErrorTitle: '每日权重误差（L1）',
-                chartBuyingPowerTitle: '总仓位与 RegT 购买力容量',
+                chartBuyingPowerTitle: '名义总仓位与初始保证金',
                 seriesLongReturn: '多头持有贡献',
                 seriesShortReturn: '空头持有贡献',
                 seriesExecutionWindowContribution: '执行窗口贡献',
@@ -877,11 +879,13 @@
                 seriesExecutableActual: '可执行到实际',
                 seriesProjectionFloor: '约束下的最优下界',
                 seriesGrossUtilization: '实际总仓位利用率',
+                seriesInitialMarginUtilization: '初始保证金利用率',
+                seriesRegtReserve: 'RegT 购买力储备',
                 seriesConfiguredTarget: '95% 目标',
                 seriesTotalCapacity: '100% 总容量',
                 seriesErrorVsTarget: '相对目标误差',
                 seriesErrorVsTotal: '相对总容量误差',
-                metricGrossCapacity: '总仓位 / RegT 总容量',
+                metricGrossCapacity: '初始保证金 / 账户权益',
 
                 // Positions
                 searchSymbol: '搜索股票代码...',
@@ -1634,8 +1638,8 @@
                         </div>
                         <div class="audit-item">
                             <div class="audit-label">${t('metricGrossCapacity')}</div>
-                            <div class="audit-value">${formatRatioPercent(latest.gross_utilization_of_total_bp)}</div>
-                            <div class="audit-sub">${formatRatioPercent(latest.gross_capacity_target_ratio ?? latest.configured_buying_power_target_ratio, 0)} gap ${formatSignedPoints(latest.gross_error_vs_target_pct_points)} | 100% gap ${formatSignedPoints(latest.gross_error_vs_total_pct_points)} · ${escapeHTML(latest.gross_capacity_target_policy_status || 'benchmark_only')}</div>
+                            <div class="audit-value">${formatRatioPercent(latest.initial_margin_utilization_of_capacity)}</div>
+                            <div class="audit-sub">target ${formatRatioPercent(latest.gross_capacity_target_ratio ?? latest.configured_buying_power_target_ratio, 0)} · nominal gross ${formatRatioPercent(latest.gross_utilization_of_total_bp)} · reserve ${formatRatioPercent(latest.regt_buying_power_reserve_ratio)} · ${statusBadge(latest.margin_reconciliation_status || 'historical_limited')}</div>
                         </div>
                         <div class="audit-item">
                             <div class="audit-label">Parallel Execution</div>
@@ -2127,8 +2131,9 @@
                     'strategy_to_executable_weight_error_l1',
                     'executable_to_actual_weight_error_l1'
                 ].some(key => auditMetric(row, key) !== null));
-                const capacityRows = auditSeries.filter(
-                    row => auditMetric(row, 'gross_utilization_of_total_bp') !== null
+                const capacityRows = auditSeries.filter(row =>
+                    auditMetric(row, 'gross_utilization_of_total_bp') !== null
+                    || auditMetric(row, 'initial_margin_utilization_of_capacity') !== null
                 );
 
                 const weightColors = {
@@ -2138,11 +2143,10 @@
                     projectionFloor: '#34d399'
                 };
                 const capacityColors = {
-                    utilization: '#34d399',
+                    gross: '#34d399',
+                    margin: '#60a5fa',
                     target: '#fbbf24',
-                    total: '#94a3b8',
-                    targetError: '#fb923c',
-                    totalError: '#f87171'
+                    total: '#94a3b8'
                 };
                 const weightKey = [
                     { label: t('seriesStrategyActual'), color: weightColors.strategyActual },
@@ -2151,11 +2155,10 @@
                     { label: t('seriesProjectionFloor'), color: weightColors.projectionFloor }
                 ];
                 const capacityKey = [
-                    { label: t('seriesGrossUtilization'), color: capacityColors.utilization },
+                    { label: t('seriesGrossUtilization'), color: capacityColors.gross },
+                    { label: t('seriesInitialMarginUtilization'), color: capacityColors.margin },
                     { label: t('seriesConfiguredTarget'), color: capacityColors.target },
-                    { label: t('seriesTotalCapacity'), color: capacityColors.total },
-                    { label: t('seriesErrorVsTarget'), color: capacityColors.targetError },
-                    { label: t('seriesErrorVsTotal'), color: capacityColors.totalError }
+                    { label: t('seriesTotalCapacity'), color: capacityColors.total }
                 ];
                 const chartHTML = `
                     <div class="execution-charts-grid" id="executionErrorCharts">
@@ -2193,7 +2196,7 @@
                 const capacityMeta = document.getElementById('buyingPowerErrorChartMeta');
                 if (capacityMeta) {
                     capacityMeta.textContent = latestCapacity
-                        ? `${capacityRows[0].session_date} to ${latestCapacity.session_date} · ${capacityRows.length} days · ${formatRatioPercent(latestCapacity.gross_utilization_of_total_bp)} · ${formatRatioPercent(latestCapacity.gross_capacity_target_ratio ?? latestCapacity.configured_buying_power_target_ratio, 0)} gap ${formatSignedPoints(latestCapacity.gross_error_vs_target_pct_points)}`
+                        ? `${capacityRows[0].session_date} to ${latestCapacity.session_date} · ${capacityRows.length} days · ${t('seriesGrossUtilization')} ${formatRatioPercent(latestCapacity.gross_utilization_of_total_bp)} · ${t('seriesInitialMarginUtilization')} ${formatRatioPercent(latestCapacity.initial_margin_utilization_of_capacity)} · ${t('seriesRegtReserve')} ${formatRatioPercent(latestCapacity.regt_buying_power_reserve_ratio)}`
                         : 'No strict RegT-capacity evidence';
                 }
 
@@ -2316,8 +2319,12 @@
                 const capacityLabels = capacityRows.map(row => row.session_date);
                 const capacityFallbackData = [
                     {
-                        color: capacityColors.utilization,
+                        color: capacityColors.gross,
                         data: capacityRows.map(row => auditMetric(row, 'gross_utilization_of_total_bp', 100))
+                    },
+                    {
+                        color: capacityColors.margin,
+                        data: capacityRows.map(row => auditMetric(row, 'initial_margin_utilization_of_capacity', 100))
                     },
                     {
                         color: capacityColors.target,
@@ -2335,16 +2342,6 @@
                         data: capacityRows.map(() => 100),
                         dash: [3, 5],
                         points: false
-                    },
-                    {
-                        color: capacityColors.targetError,
-                        data: capacityRows.map(row => auditMetric(row, 'gross_error_vs_target_pct_points')),
-                        axis: 'secondary'
-                    },
-                    {
-                        color: capacityColors.totalError,
-                        data: capacityRows.map(row => auditMetric(row, 'gross_error_vs_total_pct_points')),
-                        axis: 'secondary'
                     }
                 ];
                 const capacityCanvas = document.getElementById('buyingPowerErrorChart');
@@ -2365,7 +2362,7 @@
                                     {
                                         label: t('seriesGrossUtilization'),
                                         data: capacityFallbackData[0].data,
-                                        borderColor: capacityColors.utilization,
+                                        borderColor: capacityColors.gross,
                                         backgroundColor: 'rgba(52, 211, 153, 0.08)',
                                         borderWidth: 2.5,
                                         pointRadius: 2,
@@ -2374,8 +2371,18 @@
                                         yAxisID: 'yUtilization'
                                     },
                                     {
-                                        label: t('seriesConfiguredTarget'),
+                                        label: t('seriesInitialMarginUtilization'),
                                         data: capacityFallbackData[1].data,
+                                        borderColor: capacityColors.margin,
+                                        borderWidth: 2.5,
+                                        pointRadius: 2,
+                                        pointHoverRadius: 5,
+                                        tension: 0.25,
+                                        yAxisID: 'yUtilization'
+                                    },
+                                    {
+                                        label: t('seriesConfiguredTarget'),
+                                        data: capacityFallbackData[2].data,
                                         borderColor: capacityColors.target,
                                         borderWidth: 1.5,
                                         borderDash: [6, 5],
@@ -2384,32 +2391,12 @@
                                     },
                                     {
                                         label: t('seriesTotalCapacity'),
-                                        data: capacityFallbackData[2].data,
+                                        data: capacityFallbackData[3].data,
                                         borderColor: capacityColors.total,
                                         borderWidth: 1.5,
                                         borderDash: [3, 5],
                                         pointRadius: 0,
                                         yAxisID: 'yUtilization'
-                                    },
-                                    {
-                                        label: t('seriesErrorVsTarget'),
-                                        data: capacityFallbackData[3].data,
-                                        borderColor: capacityColors.targetError,
-                                        borderWidth: 2,
-                                        pointRadius: 2,
-                                        pointHoverRadius: 5,
-                                        tension: 0.25,
-                                        yAxisID: 'yError'
-                                    },
-                                    {
-                                        label: t('seriesErrorVsTotal'),
-                                        data: capacityFallbackData[4].data,
-                                        borderColor: capacityColors.totalError,
-                                        borderWidth: 2,
-                                        pointRadius: 2,
-                                        pointHoverRadius: 5,
-                                        tension: 0.25,
-                                        yAxisID: 'yError'
                                     }
                                 ]
                             },
@@ -2427,8 +2414,7 @@
                                         borderWidth: 1,
                                         callbacks: {
                                             label: context => {
-                                                const suffix = context.dataset.yAxisID === 'yError' ? ' pp' : '%';
-                                                return `${context.dataset.label}: ${Number(context.parsed.y).toFixed(3)}${suffix}`;
+                                                return `${context.dataset.label}: ${Number(context.parsed.y).toFixed(3)}%`;
                                             }
                                         }
                                     }
@@ -2441,14 +2427,6 @@
                                             callback: value => `${Number(value).toFixed(1)}%`
                                         },
                                         grid: { color: '#1e2a4a', lineWidth: 0.5 }
-                                    },
-                                    yError: {
-                                        position: 'right',
-                                        ticks: {
-                                            color: '#8b92a8',
-                                            callback: value => `${Number(value).toFixed(1)} pp`
-                                        },
-                                        grid: { drawOnChartArea: false }
                                     },
                                     x: {
                                         ticks: { color: '#8b92a8', font: {size: 10}, maxRotation: 45 },
