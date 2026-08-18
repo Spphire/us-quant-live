@@ -121,6 +121,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Real-time quote provider used for execution sizing and limit prices.",
     )
     parser.add_argument(
+        "--execution-intraday-bar-provider",
+        choices=("alpaca", "longbridge"),
+        default="alpaca",
+        help=(
+            "Provider used only for execution-stage 1-minute audit evidence. "
+            "This is independent from the real-time quote provider used for orders."
+        ),
+    )
+    parser.add_argument(
         "--longbridge-config-path",
         default="configs/longbridge.local.json",
         help="Ignored local JSON containing Longbridge OpenAPI credentials.",
@@ -1577,6 +1586,8 @@ def _build_command(
         args.execution_price_feed,
         "--execution-quote-provider",
         args.execution_quote_provider,
+        "--execution-intraday-bar-provider",
+        args.execution_intraday_bar_provider,
         "--longbridge-config-path",
         args.longbridge_config_path,
         "--longbridge-warmup-timeout-seconds",

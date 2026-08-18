@@ -102,6 +102,10 @@ def _scheduler_command(python_exe: str) -> list[str]:
         ("--accounts-json-path", SCHEDULER_ACCOUNTS_JSON_PATH),
         ("--account-name", os.environ.get("US_QUANT_LIVE_ACCOUNT_NAME")),
         ("--longbridge-config-path", SCHEDULER_LONG_BRIDGE_CONFIG_PATH),
+        (
+            "--execution-intraday-bar-provider",
+            os.environ.get("US_QUANT_LIVE_EXECUTION_INTRADAY_BAR_PROVIDER"),
+        ),
         ("--output-root", SCHEDULER_OUTPUT_ROOT),
         ("--state-path", SCHEDULER_STATE_PATH),
         ("--prepare-time-cn", os.environ.get("US_QUANT_LIVE_PREPARE_TIME_CN")),

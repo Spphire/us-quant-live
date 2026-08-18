@@ -49,6 +49,7 @@ def main() -> int:
     command = commands["execute"]
     expected_values = {
         "--execution-quote-provider": "longbridge",
+        "--execution-intraday-bar-provider": "alpaca",
         "--longbridge-max-quote-age-seconds": "10",
         "--longbridge-snapshot-contexts": "4",
         "--staged-entry-repair-rounds": "1",

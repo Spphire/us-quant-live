@@ -513,6 +513,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Real-time quote provider used for sizing and order prices.",
     )
     parser.add_argument(
+        "--execution-intraday-bar-provider",
+        choices=("alpaca", "longbridge"),
+        default="alpaca",
+        help=(
+            "Provider used only for execution-stage 1-minute audit evidence. "
+            "It does not change sizing quotes or submitted limit prices."
+        ),
+    )
+    parser.add_argument(
         "--execution-price-feed",
         default="iex",
         help="Alpaca feed used for intraday bar evidence and when provider=alpaca.",
@@ -1704,10 +1713,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_quote_feed = str(
             getattr(execution_quote_client, "feed_name", None) or args.execution_price_feed
         )
+        execution_intraday_bar_provider_configured = str(
+            args.execution_intraday_bar_provider
+        ).lower()
+        use_longbridge_intraday_bars = bool(
+            execution_intraday_bar_provider_configured == "longbridge"
+            and active_quote_provider == "longbridge"
+        )
+        if use_longbridge_intraday_bars and not callable(
+            getattr(execution_quote_client, "get_intraday_bars", None)
+        ):
+            raise LongbridgeQuoteError(
+                "Longbridge intraday bars were configured but the active quote client "
+                "does not implement get_intraday_bars()."
+            )
+        if (
+            execution_intraday_bar_provider_configured == "longbridge"
+            and (should_submit or execution_input_run)
+            and not use_longbridge_intraday_bars
+        ):
+            raise LongbridgeQuoteError(
+                "Longbridge intraday bars require --execution-quote-provider=longbridge "
+                "for decision and execution runs."
+            )
         execution_intraday_bar_client = (
-            execution_quote_client
-            if callable(getattr(execution_quote_client, "get_intraday_bars", None))
-            else client
+            execution_quote_client if use_longbridge_intraday_bars else client
         )
         execution_intraday_bar_provider = str(
             getattr(execution_intraday_bar_client, "provider_name", None) or "alpaca"
@@ -1715,6 +1745,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_intraday_bar_feed = str(
             getattr(execution_intraday_bar_client, "intraday_bar_feed_name", None)
             or args.execution_price_feed
+        )
+        _mark_event(
+            run_events,
+            "execution_intraday_bar_provider_ready",
+            {
+                "configured_provider": execution_intraday_bar_provider_configured,
+                "active_provider": execution_intraday_bar_provider,
+                "feed": execution_intraday_bar_feed,
+                "execution_input_run": bool(execution_input_run),
+                "submission_enabled": bool(should_submit),
+            },
         )
         reference_prices = _resolve_reference_prices(
             client=execution_quote_client,
@@ -1813,6 +1854,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "collected_at_utc": _utc_now(),
                 "provider": active_quote_provider,
                 "feed": execution_quote_feed,
+                "intraday_bar_provider_configured": (
+                    execution_intraday_bar_provider_configured
+                ),
                 "intraday_bar_provider": execution_intraday_bar_provider,
                 "intraday_bar_feed": execution_intraday_bar_feed,
                 "intraday_bar_capture_mode": intraday_bar_capture_mode,
@@ -1843,6 +1887,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "active_asset_count": len(assets),
                 "audit_price_symbol_count": len(audit_price_symbols),
+                "intraday_bar_provider_configured": (
+                    execution_intraday_bar_provider_configured
+                ),
                 "intraday_bar_provider": execution_intraday_bar_provider,
                 "intraday_bar_feed": execution_intraday_bar_feed,
                 "intraday_bar_capture_mode": intraday_bar_capture_mode,
@@ -3025,6 +3072,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Keep the provider/feed explicit at the run-summary level.  The
             # legacy Alpaca-only field remains for consumers that still read
             # it, but must not claim IEX when Longbridge supplied the bars.
+            "execution_intraday_bar_provider_configured": (
+                execution_intraday_bar_provider_configured
+            ),
             "execution_intraday_bar_provider": execution_intraday_bar_provider,
             "execution_intraday_bar_feed": execution_intraday_bar_feed,
             "execution_intraday_bar_adjustment": "raw",
@@ -5681,6 +5731,7 @@ def _collect_intraday_bars_snapshot(
         "label": str(label),
         "collected_at_utc": _utc_now(),
         "session_date": session_date.isoformat(),
+        "provider": "alpaca",
         "feed": str(feed),
         "primary_feed": str(feed),
         "fallback_feed": normalized_fallback_feed or None,

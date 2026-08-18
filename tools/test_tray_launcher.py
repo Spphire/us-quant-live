@@ -95,6 +95,7 @@ def test_scheduler_command_supports_isolated_instance(monkeypatch=None):
         tray_launcher.os.environ,
         {
             "US_QUANT_LIVE_ACCOUNT_NAME": "ALPACA_DEV_CANDIDATE",
+            "US_QUANT_LIVE_EXECUTION_INTRADAY_BAR_PROVIDER": "longbridge",
             "US_QUANT_LIVE_PREPARE_TIME_CN": "12:30",
             "US_QUANT_LIVE_DECISION_TIME_CN": "21:00",
             "US_QUANT_LIVE_EXECUTE_TIME_CN": "22:00",
@@ -108,6 +109,7 @@ def test_scheduler_command_supports_isolated_instance(monkeypatch=None):
     expected = {
         "--dashboard-port": "18077",
         "--account-name": "ALPACA_DEV_CANDIDATE",
+        "--execution-intraday-bar-provider": "longbridge",
         "--output-root": "artifacts\\dev_candidate_scheduler",
         "--state-path": "artifacts\\dev_candidate_scheduler\\state.json",
     }

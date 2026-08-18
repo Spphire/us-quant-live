@@ -1146,6 +1146,7 @@ def test_intraday_bar_capture_falls_back_for_primary_missing_symbols():
     assert client.calls[0]["feed"] == "iex", client.calls
     assert client.calls[1]["feed"] == "sip", client.calls
     assert client.calls[1]["symbols"] == ["Y"], client.calls
+    assert snapshot["provider"] == "alpaca", snapshot
     assert snapshot["missing_bar_symbols"] == [], snapshot
     assert snapshot["primary_bar_symbols"] == ["X"], snapshot
     assert snapshot["fallback_bar_symbols"] == ["Y"], snapshot
