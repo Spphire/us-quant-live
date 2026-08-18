@@ -21,6 +21,7 @@ from src.alpaca_executor import (  # noqa: E402
     _DecisionPhaseTimingRecorder,
     _PersistentRunEvents,
     _build_submission_capability_guard,
+    _build_margin_reconciliation,
     _build_target_capability_drift,
     _build_target_capability_snapshot,
     OrderInstruction,
@@ -42,7 +43,10 @@ from src.alpaca_executor import (  # noqa: E402
     _total_regt_buying_power_capacity,
     _write_json_file_if_absent,
 )
-from src.executable_target_projector import project_executable_targets  # noqa: E402
+from src.executable_target_projector import (  # noqa: E402
+    project_executable_targets,
+    resolve_initial_margin_requirement,
+)
 from vendors import AlpacaRequestError, LongbridgeQuoteError  # noqa: E402
 from tools.daily_audit_report import (  # noqa: E402
     _build_execution_attempt_outcome_audit,
@@ -622,35 +626,173 @@ def _project_targets(
     prices,
     current_qty=None,
     current_notional=None,
+    assets=None,
+    betas=None,
     equity=90000.0,
     buying_power=360000.0,
     buffer=0.90,
     total_capacity=None,
     gross_capacity_ratio=0.95,
+    sizing_adverse_offset_bps=12.0,
+    short_buying_power_adverse_offset_bps=300.0,
+    min_trade_notional=0.0,
+    executable_beta_band=0.01,
 ):
-    assets = {
-        symbol: {"shortable": True, "fractionable": True}
+    default_assets = {
+        symbol: {
+            "shortable": True,
+            "fractionable": True,
+            "marginable": True,
+            "maintenance_margin_requirement": 30,
+            "margin_requirement_long": 30,
+            "margin_requirement_short": 30,
+        }
         for symbol in set(weights) | set(current_qty or {})
     }
+    if assets:
+        default_assets.update(assets)
     return project_executable_targets(
         raw_target_signed_weights=weights,
         current_signed_qty=current_qty or {},
         current_signed_notional=current_notional or {},
         reference_prices=prices,
-        assets_by_symbol=assets,
+        assets_by_symbol=default_assets,
         account_equity=equity,
         buying_power=buying_power,
         buying_power_buffer=buffer,
-        min_trade_notional=0.0,
+        min_trade_notional=min_trade_notional,
         qty_decimals=4,
         whole_shares_only=False,
         short_sales_whole_shares_only=True,
         shorting_enabled=True,
-        sizing_adverse_offset_bps=12.0,
-        short_buying_power_adverse_offset_bps=300.0,
+        sizing_adverse_offset_bps=sizing_adverse_offset_bps,
+        short_buying_power_adverse_offset_bps=short_buying_power_adverse_offset_bps,
         total_buying_power_capacity=total_capacity,
         gross_capacity_target_ratio=gross_capacity_ratio,
+        target_beta_by_symbol=betas,
+        executable_beta_band=executable_beta_band,
     )
+
+
+def test_margin_requirement_resolution_is_side_specific_and_fail_closed():
+    ordinary = {
+        "marginable": True,
+        "maintenance_margin_requirement": 30,
+        "margin_requirement_long": 30,
+        "margin_requirement_short": 30,
+    }
+    long_special = {
+        "marginable": True,
+        "maintenance_margin_requirement": 75,
+        "margin_requirement_long": 75,
+        "margin_requirement_short": 100,
+    }
+    ordinary_long = resolve_initial_margin_requirement(
+        asset=ordinary,
+        side="long",
+        reference_price=100.0,
+    )
+    special_long = resolve_initial_margin_requirement(
+        asset=long_special,
+        side="long",
+        reference_price=100.0,
+    )
+    special_short = resolve_initial_margin_requirement(
+        asset=long_special,
+        side="short",
+        reference_price=100.0,
+    )
+    missing = resolve_initial_margin_requirement(
+        asset={"marginable": True},
+        side="long",
+        reference_price=100.0,
+    )
+    non_marginable = resolve_initial_margin_requirement(
+        asset={"marginable": False},
+        side="long",
+        reference_price=100.0,
+    )
+    low_price_short = resolve_initial_margin_requirement(
+        asset=ordinary,
+        side="short",
+        reference_price=1.0,
+    )
+
+    assert ordinary_long["initial_margin_rate"] == 0.50, ordinary_long
+    assert special_long["initial_margin_rate"] == 0.75, special_long
+    assert special_short["initial_margin_rate"] == 1.00, special_short
+    assert missing["initial_margin_rate"] == 1.00, missing
+    assert missing["initial_margin_requirement_source"] == "missing_asset_margin_metadata_fail_closed"
+    assert non_marginable["initial_margin_rate"] == 1.00, non_marginable
+    assert low_price_short["initial_margin_rate"] == 2.50, low_price_short
+    assert low_price_short["initial_margin_requirement_source"] == "regt_low_price_short_rule"
+    print("  [OK] margin rates use side metadata, Reg T floors, and fail-closed fallbacks")
+
+
+def test_projector_trims_high_margin_target_before_ordinary_target():
+    _, lattice_qty, diagnostics = _project_targets(
+        weights={"ORD": 0.75, "SPECIAL": 0.75},
+        prices={"ORD": 100.0, "SPECIAL": 100.0},
+        assets={
+            "SPECIAL": {
+                "shortable": True,
+                "fractionable": True,
+                "marginable": True,
+                "maintenance_margin_requirement": 100,
+                "margin_requirement_long": 100,
+                "margin_requirement_short": 100,
+            }
+        },
+        equity=100000.0,
+        buying_power=400000.0,
+        buffer=0.95,
+        total_capacity=200000.0,
+        gross_capacity_ratio=0.95,
+        sizing_adverse_offset_bps=0.0,
+        short_buying_power_adverse_offset_bps=0.0,
+    )
+    assert diagnostics["hard_constraints_satisfied"], diagnostics
+    assert abs(lattice_qty["ORD"] - 750.0) < 1e-6, lattice_qty
+    assert abs(lattice_qty["SPECIAL"] - 575.0) < 1e-6, lattice_qty
+    assert abs(diagnostics["projected_initial_margin"] - 95000.0) < 1e-5, diagnostics
+    assert abs(diagnostics["projected_regt_buying_power"] - 10000.0) < 1e-5, diagnostics
+    assert abs(diagnostics["projected_final_gross_notional"] - 132500.0) < 1e-5, diagnostics
+    print("  [OK] high-margin target is reduced only as needed under the 95% margin cap")
+
+
+def test_projector_beta_uses_nominal_signed_notional_without_margin_multiplier():
+    _, lattice_qty, diagnostics = _project_targets(
+        weights={"LONG": 0.75, "SHORT": -0.75},
+        prices={"LONG": 100.0, "SHORT": 100.0},
+        assets={
+            "SHORT": {
+                "shortable": True,
+                "fractionable": True,
+                "marginable": True,
+                "maintenance_margin_requirement": 100,
+                "margin_requirement_long": 100,
+                "margin_requirement_short": 100,
+            }
+        },
+        betas={"LONG": 1.0, "SHORT": 1.0},
+        equity=100000.0,
+        buying_power=400000.0,
+        buffer=0.95,
+        total_capacity=200000.0,
+        gross_capacity_ratio=0.95,
+        sizing_adverse_offset_bps=0.0,
+        short_buying_power_adverse_offset_bps=0.0,
+    )
+    rows = {row["symbol"]: row for row in diagnostics["symbols"]}
+    assert diagnostics["hard_constraints_satisfied"], diagnostics
+    assert diagnostics["beta_constraint_enforced"], diagnostics
+    assert abs(diagnostics["projected_net_beta"] - 0.01) < 1e-8, diagnostics
+    assert abs(rows["LONG"]["projected_beta_exposure"] - 0.64) < 1e-8, rows
+    assert abs(rows["SHORT"]["projected_beta_exposure"] + 0.63) < 1e-8, rows
+    assert lattice_qty == {"LONG": 640.0, "SHORT": -630.0}, lattice_qty
+    assert abs(diagnostics["projected_final_gross_notional"] - 127000.0) < 1e-5
+    assert abs(diagnostics["projected_initial_margin"] - 95000.0) < 1e-5
+    print("  [OK] beta stays 1x nominal while margin uses per-symbol coefficients")
 
 
 def test_projector_uses_nearest_integer_short_target():
@@ -786,6 +928,65 @@ def test_projector_reports_constraint_floor_and_min_trade_increment():
     print("  [OK] projector separates the constraint floor from min-trade filtering")
 
 
+def test_min_trade_carry_cannot_breach_initial_margin_cap():
+    _, lattice_qty, diagnostics = _project_targets(
+        weights={"X": 0.95},
+        prices={"X": 100.0},
+        current_qty={"X": 950.5},
+        current_notional={"X": 95050.0},
+        assets={
+            "X": {
+                "shortable": True,
+                "fractionable": True,
+                "marginable": True,
+                "maintenance_margin_requirement": 100,
+                "margin_requirement_long": 100,
+                "margin_requirement_short": 100,
+            }
+        },
+        equity=100000.0,
+        buying_power=10000.0,
+        buffer=0.95,
+        total_capacity=200000.0,
+        gross_capacity_ratio=0.95,
+        sizing_adverse_offset_bps=0.0,
+        short_buying_power_adverse_offset_bps=0.0,
+        min_trade_notional=100.0,
+    )
+    row = diagnostics["symbols"][0]
+    assert lattice_qty["X"] == 950.0, lattice_qty
+    assert diagnostics["hard_constraints_satisfied"], diagnostics
+    assert diagnostics["projected_initial_margin"] == 95000.0, diagnostics
+    assert "min_trade_notional_waived_for_hard_constraint" in row["constraint_reasons"], row
+    assert "min_trade_carry_rejected_initial_margin_cap" in row["constraint_reasons"], row
+    print("  [OK] tiny reductions are retained when carrying would breach the margin cap")
+
+
+def test_min_trade_carry_cannot_breach_beta_limit():
+    _, lattice_qty, diagnostics = _project_targets(
+        weights={"LONG": 0.50, "SHORT": -0.50},
+        prices={"LONG": 100.0, "SHORT": 100.0},
+        current_qty={"LONG": 500.5, "SHORT": -500.0},
+        current_notional={"LONG": 50050.0, "SHORT": -50000.0},
+        betas={"LONG": 1.0, "SHORT": 1.0},
+        equity=100000.0,
+        buying_power=10000.0,
+        buffer=0.95,
+        total_capacity=200000.0,
+        gross_capacity_ratio=0.95,
+        sizing_adverse_offset_bps=0.0,
+        short_buying_power_adverse_offset_bps=0.0,
+        min_trade_notional=100.0,
+        executable_beta_band=0.0001,
+    )
+    rows = {row["symbol"]: row for row in diagnostics["symbols"]}
+    assert lattice_qty == {"LONG": 500.0, "SHORT": -500.0}, lattice_qty
+    assert diagnostics["hard_constraints_satisfied"], diagnostics
+    assert abs(diagnostics["projected_net_beta"]) < 1e-12, diagnostics
+    assert "min_trade_carry_rejected_beta_abs_limit" in rows["LONG"]["constraint_reasons"]
+    print("  [OK] min-trade carrying cannot move executable beta outside its 1x band")
+
+
 def test_projector_enforces_final_gross_capacity_target():
     _, lattice_qty, diagnostics = _project_targets(
         weights={"A": 0.50, "B": 0.50, "C": -0.50, "D": -0.50},
@@ -853,6 +1054,25 @@ def test_total_regt_capacity_reconstruction():
     assert abs(total - 177780.02) < 1e-6
     assert "regt_buying_power" in source
     print("  [OK] total RegT capacity uses gross position plus remaining RegT buying power")
+
+
+def test_total_regt_capacity_uses_stable_equity_baseline():
+    total, gross, remaining, source = _total_regt_buying_power_capacity(
+        account={
+            "equity": "100000",
+            "long_market_value": "95000",
+            "short_market_value": "-85000",
+            "initial_margin": "95000",
+            "regt_buying_power": "10000",
+        },
+        signed_notional={},
+    )
+    assert total == 200000.0, total
+    assert gross == 180000.0, gross
+    assert remaining == 10000.0, remaining
+    assert "equity" in source, source
+    assert "identity_check=200000.000000" in source, source
+    print("  [OK] total RegT capacity is the stable 2x-equity baseline")
 
 
 def test_portfolio_history_uses_explicit_range_without_period():
@@ -2320,6 +2540,97 @@ def test_position_capacity_uses_total_regt_capacity():
     print("  [OK] gross position is benchmarked against reconstructed total RegT capacity")
 
 
+def test_position_capacity_uses_stable_equity_and_separate_margin_metrics():
+    with TemporaryDirectory() as tmp:
+        run_dir = Path(tmp)
+        (run_dir / "broker_account_after.json").write_text(
+            json.dumps(
+                {
+                    "equity": "100000",
+                    "long_market_value": "95000",
+                    "short_market_value": "-85000",
+                    "position_market_value": "180000",
+                    "initial_margin": "95000",
+                    "maintenance_margin": "60000",
+                    "regt_buying_power": "10000",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "execution_summary.json").write_text(
+            json.dumps(
+                {
+                    "executable_target_projection": {
+                        "gross_capacity_target_ratio": 0.95,
+                        "gross_capacity_constraint_enforced": True,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        summary = _build_position_capacity_summary(run_dir)
+
+    assert summary["total_regt_buying_power_capacity"] == 200000.0, summary
+    assert summary["gross_utilization_of_total_bp"] == 0.90, summary
+    assert summary["initial_margin_utilization_of_capacity"] == 0.95, summary
+    assert summary["regt_buying_power_reserve_ratio"] == 0.05, summary
+    assert summary["initial_margin_error_vs_target_notional"] == 0.0, summary
+    print("  [OK] audit separates nominal gross, initial margin, and RegT BP reserve")
+
+
+def test_margin_reconciliation_matches_broker_initial_margin():
+    ordinary = {
+        "marginable": True,
+        "margin_requirement_long": 30,
+        "margin_requirement_short": 30,
+        "maintenance_margin_requirement": 30,
+    }
+    special = {
+        "marginable": True,
+        "margin_requirement_long": 100,
+        "margin_requirement_short": 100,
+        "maintenance_margin_requirement": 100,
+    }
+    reconciliation = _build_margin_reconciliation(
+        positions=[
+            {
+                "symbol": "LONG",
+                "side": "long",
+                "qty": "10",
+                "current_price": "100",
+                "market_value": "1000",
+            },
+            {
+                "symbol": "SHORT",
+                "side": "short",
+                "qty": "-5",
+                "current_price": "100",
+                "market_value": "-500",
+            },
+        ],
+        account={
+            "equity": "2000",
+            "initial_margin": "1000",
+            "regt_buying_power": "2000",
+        },
+        assets_by_symbol={"LONG": ordinary, "SHORT": special},
+        executable_projection={
+            "projected_initial_margin": 950.0,
+            "initial_margin_cap": 1900.0,
+            "projected_net_beta": 0.0,
+            "beta_abs_limit": 0.01,
+            "hard_constraints_satisfied": True,
+        },
+    )
+    assert reconciliation["status"] == "pass", reconciliation
+    assert reconciliation["predicted_initial_margin"] == 1000.0, reconciliation
+    assert reconciliation["initial_margin_prediction_error"] == 0.0, reconciliation
+    assert reconciliation["predicted_regt_buying_power"] == 2000.0, reconciliation
+    assert reconciliation["high_margin_symbol_count"] == 1, reconciliation
+    assert reconciliation["extra_initial_margin_vs_regt_floor"] == 250.0, reconciliation
+    print("  [OK] post-trade margin model reconciles to broker account fields")
+
+
 def test_decision_phase_timings_persist_progress_and_failure():
     clock = _ManualClock(100.0)
     with TemporaryDirectory() as tmp:
@@ -2497,16 +2808,22 @@ def main() -> int:
         ("Fractional short residual close sizing", test_fractional_short_residual_close_does_not_round_up),
         ("Short cover to remaining short stays whole-share", test_short_cover_to_remaining_short_stays_whole_share),
         ("Near-integer short residual cover sizing", test_short_cover_near_integer_residual_does_not_round_to_zero),
+        ("Side-specific margin requirement resolution", test_margin_requirement_resolution_is_side_specific_and_fail_closed),
+        ("High-margin target projection", test_projector_trims_high_margin_target_before_ordinary_target),
+        ("Nominal 1x beta projection", test_projector_beta_uses_nominal_signed_notional_without_margin_multiplier),
         ("Nearest integer executable short target", test_projector_uses_nearest_integer_short_target),
         ("Proportional buying-power projection", test_projector_enforces_buying_power_cap_proportionally),
         ("Residual-aware integer short delta", test_projector_short_residual_produces_integer_order_delta),
         ("Buying-power scenario diagnostics", test_projector_logs_buffer_scenarios),
         ("Lexicographic weight-error priority", test_projector_uses_buying_power_only_as_secondary_objective),
         ("Projection constraint floor diagnostics", test_projector_reports_constraint_floor_and_min_trade_increment),
+        ("Min-trade margin hard constraint", test_min_trade_carry_cannot_breach_initial_margin_cap),
+        ("Min-trade beta hard constraint", test_min_trade_carry_cannot_breach_beta_limit),
         ("Final gross capacity target", test_projector_enforces_final_gross_capacity_target),
         ("Block missing short side", test_submission_guard_blocks_missing_short_side),
         ("Allow complete long/short portfolio", test_submission_guard_allows_complete_long_short_projection),
         ("Total RegT capacity reconstruction", test_total_regt_capacity_reconstruction),
+        ("Stable equity RegT capacity", test_total_regt_capacity_uses_stable_equity_baseline),
         ("Portfolio-history request parameters", test_portfolio_history_uses_explicit_range_without_period),
         ("Intraday SIP fallback evidence", test_intraday_bar_capture_falls_back_for_primary_missing_symbols),
         ("Projection audit staged-entry selection", test_projection_audit_prefers_staged_entry_snapshot),
@@ -2542,6 +2859,8 @@ def main() -> int:
         ("Execution-quality entry repair merge", test_execution_quality_merges_entry_repair_with_initial_entry),
         ("Audit attempt-outcome propagation", test_audit_exposes_attempt_outcomes_without_treating_requotes_as_misses),
         ("Total RegT position-capacity audit", test_position_capacity_uses_total_regt_capacity),
+        ("Stable RegT margin-capacity audit", test_position_capacity_uses_stable_equity_and_separate_margin_metrics),
+        ("Post-trade margin reconciliation", test_margin_reconciliation_matches_broker_initial_margin),
         ("Decision phase timing persistence", test_decision_phase_timings_persist_progress_and_failure),
         ("Persistent run event logging", test_run_events_are_persisted_immediately_with_sequence_and_elapsed_time),
         ("Target capability drift evidence", test_target_capability_drift_explains_new_nonshortable_target),

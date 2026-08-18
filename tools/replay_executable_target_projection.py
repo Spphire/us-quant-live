@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -63,6 +64,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw_weights = _mapping(target_snapshot, "raw_target_signed_weights") or _mapping(
         portfolio_snapshot, "raw_target_signed_weights"
     )
+    target_beta_by_symbol = _mapping(target_snapshot, "target_beta_by_symbol") or _mapping(
+        order_plan, "target_beta_by_symbol"
+    )
+    if not target_beta_by_symbol:
+        alpha_paths = sorted(run_dir.glob("alpha_core_panel_*.csv"))
+        if alpha_paths:
+            alpha_panel = pd.read_csv(alpha_paths[-1])
+            beta_column = "beta" if "beta" in alpha_panel.columns else "beta_raw"
+            if "symbol" in alpha_panel.columns and beta_column in alpha_panel.columns:
+                for row in alpha_panel[["symbol", beta_column]].itertuples(index=False):
+                    symbol = str(getattr(row, "symbol") or "").strip().upper()
+                    try:
+                        beta = float(getattr(row, beta_column))
+                    except (TypeError, ValueError):
+                        continue
+                    if symbol in raw_weights and math.isfinite(beta):
+                        target_beta_by_symbol[symbol] = beta
     current_qty = _mapping(portfolio_snapshot, "broker_signed_qty_before")
     current_notional = _mapping(portfolio_snapshot, "broker_signed_notional_before")
     reference_prices = _mapping(price_snapshot, "reference_prices")
@@ -110,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         total_buying_power_capacity=float(total_regt_capacity),
         gross_capacity_target_ratio=float(args.gross_capacity_target_ratio),
+        target_beta_by_symbol=target_beta_by_symbol,
     )
     instructions, skipped_orders = _build_order_instructions(
         target_signed_weights=order_weights,
@@ -206,6 +225,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "gross_capacity_target_gap_notional": diagnostics.get(
                 "gross_capacity_target_gap_notional"
             ),
+            "initial_margin_cap": diagnostics.get("initial_margin_cap"),
+            "projected_initial_margin": diagnostics.get("projected_initial_margin"),
+            "initial_margin_cap_slack": diagnostics.get("initial_margin_cap_slack"),
+            "projected_regt_buying_power": diagnostics.get("projected_regt_buying_power"),
+            "projected_regt_buying_power_ratio": diagnostics.get(
+                "projected_regt_buying_power_ratio"
+            ),
+            "projected_net_beta": diagnostics.get("projected_net_beta"),
+            "beta_abs_limit": diagnostics.get("beta_abs_limit"),
+            "beta_constraint_enforced": diagnostics.get("beta_constraint_enforced"),
+            "hard_constraints_satisfied": diagnostics.get("hard_constraints_satisfied"),
+            "hard_constraint_violations": diagnostics.get("hard_constraint_violations"),
         },
         "auxiliary_notional_translation": {
             "legacy_short_floor_gap": old_floor.get("lost_notional"),
@@ -266,6 +297,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "projected_final_gross_utilization_of_total_capacity"
         ),
         "gross_capacity_target_gap_notional": diagnostics.get("gross_capacity_target_gap_notional"),
+        "initial_margin_cap": diagnostics.get("initial_margin_cap"),
+        "projected_initial_margin": diagnostics.get("projected_initial_margin"),
+        "projected_regt_buying_power": diagnostics.get("projected_regt_buying_power"),
+        "projected_regt_buying_power_ratio": diagnostics.get("projected_regt_buying_power_ratio"),
+        "projected_net_beta": diagnostics.get("projected_net_beta"),
+        "beta_abs_limit": diagnostics.get("beta_abs_limit"),
+        "hard_constraints_satisfied": diagnostics.get("hard_constraints_satisfied"),
+        "hard_constraint_violations": diagnostics.get("hard_constraint_violations"),
         "blocked_target_count": diagnostics.get("blocked_target_count"),
         "simulated_order_count": len(instructions),
         "simulated_release_order_count": len(release_instructions),
@@ -275,7 +314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fractional_short_sell_order_count": len(fractional_short_sell_orders),
     }
     print(json.dumps(concise, indent=2, ensure_ascii=False))
-    return 0 if bool(diagnostics.get("solver", {}).get("success")) else 1
+    return 0 if bool(diagnostics.get("hard_constraints_satisfied")) else 1
 
 
 if __name__ == "__main__":

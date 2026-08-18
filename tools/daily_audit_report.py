@@ -5763,10 +5763,18 @@ def _build_executable_target_projection_outputs(
         projection_error_floor_l1 = _optional_float(
             pre_min_trade.get("tracking_error_l1_weight")
         )
+    hard_constraints_satisfied = final_projection.get("hard_constraints_satisfied")
+    solver_success = bool(final_projection.get("solver", {}).get("success"))
     summary = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "status": "pass" if projections and bool(final_projection.get("solver", {}).get("success")) else "missing",
+        "status": (
+            "pass"
+            if projections and solver_success and hard_constraints_satisfied is not False
+            else "attention"
+            if projections
+            else "missing"
+        ),
         "projection_count": len(projections),
         "row_count": len(rows),
         "final_projection_phase": final_phase,
@@ -5850,6 +5858,51 @@ def _build_executable_target_projection_outputs(
         "gross_capacity_constraint_enforced": final_projection.get(
             "gross_capacity_constraint_enforced"
         ),
+        "initial_margin_constraint_enforced": final_projection.get(
+            "initial_margin_constraint_enforced"
+        ),
+        "initial_margin_capacity": final_projection.get("initial_margin_capacity"),
+        "initial_margin_target_ratio": final_projection.get(
+            "initial_margin_target_ratio"
+        ),
+        "initial_margin_cap": final_projection.get("initial_margin_cap"),
+        "projected_initial_margin": final_projection.get(
+            "projected_initial_margin"
+        ),
+        "projected_initial_margin_utilization_of_capacity": final_projection.get(
+            "projected_initial_margin_utilization_of_capacity"
+        ),
+        "initial_margin_cap_slack": final_projection.get(
+            "initial_margin_cap_slack"
+        ),
+        "regt_buying_power_reserve_floor": final_projection.get(
+            "regt_buying_power_reserve_floor"
+        ),
+        "projected_regt_buying_power": final_projection.get(
+            "projected_regt_buying_power"
+        ),
+        "projected_regt_buying_power_ratio": final_projection.get(
+            "projected_regt_buying_power_ratio"
+        ),
+        "raw_target_net_beta": final_projection.get("raw_target_net_beta"),
+        "capacity_adjusted_target_net_beta": final_projection.get(
+            "capacity_adjusted_target_net_beta"
+        ),
+        "projected_net_beta": final_projection.get("projected_net_beta"),
+        "beta_abs_limit": final_projection.get("beta_abs_limit"),
+        "beta_constraint_enforced": final_projection.get("beta_constraint_enforced"),
+        "beta_constraint_satisfied": final_projection.get("beta_constraint_satisfied"),
+        "hard_constraints_satisfied": hard_constraints_satisfied,
+        "hard_constraint_violations": final_projection.get(
+            "hard_constraint_violations", []
+        ),
+        "margin_requirement_source_counts": final_projection.get(
+            "margin_requirement_source_counts", {}
+        ),
+        "high_margin_symbol_count": final_projection.get(
+            "high_margin_symbol_count"
+        ),
+        "high_margin_symbols": final_projection.get("high_margin_symbols", []),
         "strategy_capacity_scaling_error_l1_weight": final_projection.get(
             "strategy_capacity_scaling_error_l1_weight"
         ),
@@ -5886,12 +5939,20 @@ def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
     long_market_value = _optional_float(account_after.get("long_market_value"))
     short_market_value = _optional_float(account_after.get("short_market_value"))
     regt_buying_power = _optional_float(account_after.get("regt_buying_power"))
+    initial_margin = _optional_float(account_after.get("initial_margin"))
+    maintenance_margin = _optional_float(account_after.get("maintenance_margin"))
+    equity = _optional_float(account_after.get("portfolio_value"))
+    equity_source = "portfolio_value"
+    if equity is None or equity <= 0.0:
+        equity = _optional_float(account_after.get("equity"))
+        equity_source = "equity"
     broker_position_market_value = _optional_float(account_after.get("position_market_value"))
+    margin_reconciliation = _read_json(run_dir / "margin_reconciliation.json", {})
     target_ratio = _optional_float(final_projection.get("gross_capacity_target_ratio")) or 0.95
     target_enforced = bool(final_projection.get("gross_capacity_constraint_enforced"))
 
     payload: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": "missing",
         "source_account_snapshot": (run_dir / "broker_account_after.json").as_posix(),
@@ -5904,17 +5965,41 @@ def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
         "broker_position_market_value": broker_position_market_value,
         "broker_position_market_value_delta": None,
         "regt_buying_power_remaining": regt_buying_power,
+        "account_equity": equity,
+        "account_equity_source": f"alpaca_account.{equity_source}",
+        "broker_initial_margin": initial_margin,
+        "broker_maintenance_margin": maintenance_margin,
         "total_regt_buying_power_capacity": None,
+        "total_regt_buying_power_capacity_source": None,
         "configured_gross_target_notional": None,
         "gross_utilization_of_total_bp": None,
         "gross_error_vs_target_notional": None,
         "gross_error_vs_target_pct_points": None,
         "gross_error_vs_total_notional": None,
         "gross_error_vs_total_pct_points": None,
+        "initial_margin_capacity": equity,
+        "configured_initial_margin_target": (
+            target_ratio * equity if equity is not None else None
+        ),
+        "initial_margin_utilization_of_capacity": None,
+        "initial_margin_error_vs_target_notional": None,
+        "initial_margin_error_vs_target_pct_points": None,
+        "regt_buying_power_reserve_ratio": None,
+        "configured_regt_buying_power_reserve_ratio": 1.0 - target_ratio,
+        "predicted_initial_margin": margin_reconciliation.get(
+            "predicted_initial_margin"
+        ),
+        "initial_margin_prediction_error": margin_reconciliation.get(
+            "initial_margin_prediction_error"
+        ),
+        "margin_reconciliation_status": margin_reconciliation.get("status", "missing"),
+        "high_margin_symbol_count": margin_reconciliation.get(
+            "high_margin_symbol_count"
+        ),
         "note": (
-            "Total RegT capacity is reconstructed as gross position notional plus remaining "
-            "RegT buying power. The 95% target is enforced for runs produced by the gross-capacity "
-            "projector; older runs are evaluated against it as a retrospective benchmark."
+            "Nominal gross uses the stable 2x-equity Reg T baseline. Initial margin is a separate "
+            "per-symbol weighted constraint against equity; remaining Reg T buying power is shown "
+            "as a reserve ratio. Older runs are retrospective benchmarks."
         ),
     }
     if long_market_value is None or short_market_value is None or regt_buying_power is None:
@@ -5923,12 +6008,26 @@ def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
     gross_long = abs(float(long_market_value))
     gross_short = abs(float(short_market_value))
     gross_position = gross_long + gross_short
-    total_capacity = gross_position + float(regt_buying_power)
+    if equity is not None and equity > 0.0:
+        total_capacity = equity * 2.0
+        total_capacity_source = f"alpaca_account.{equity_source}*2"
+    elif initial_margin is not None and initial_margin >= 0.0:
+        total_capacity = initial_margin * 2.0 + float(regt_buying_power)
+        total_capacity_source = "alpaca_account.initial_margin*2+regt_buying_power"
+    else:
+        total_capacity = gross_position + float(regt_buying_power)
+        total_capacity_source = "legacy_gross_position+regt_buying_power"
     if total_capacity <= 0.0:
         return payload
 
     configured_target = target_ratio * total_capacity
     utilization = gross_position / total_capacity
+    initial_margin_utilization = (
+        initial_margin / equity
+        if initial_margin is not None and equity is not None and equity > 0.0
+        else None
+    )
+    regt_reserve_ratio = float(regt_buying_power) / total_capacity
     payload.update(
         {
             "status": "pass",
@@ -5941,12 +6040,25 @@ def _build_position_capacity_summary(run_dir: Path) -> dict[str, Any]:
                 else None
             ),
             "total_regt_buying_power_capacity": total_capacity,
+            "total_regt_buying_power_capacity_source": total_capacity_source,
             "configured_gross_target_notional": configured_target,
             "gross_utilization_of_total_bp": utilization,
             "gross_error_vs_target_notional": gross_position - configured_target,
             "gross_error_vs_target_pct_points": (utilization - target_ratio) * 100.0,
             "gross_error_vs_total_notional": gross_position - total_capacity,
             "gross_error_vs_total_pct_points": (utilization - 1.0) * 100.0,
+            "initial_margin_utilization_of_capacity": initial_margin_utilization,
+            "initial_margin_error_vs_target_notional": (
+                initial_margin - target_ratio * equity
+                if initial_margin is not None and equity is not None
+                else None
+            ),
+            "initial_margin_error_vs_target_pct_points": (
+                (initial_margin_utilization - target_ratio) * 100.0
+                if initial_margin_utilization is not None
+                else None
+            ),
+            "regt_buying_power_reserve_ratio": regt_reserve_ratio,
         }
     )
     return payload
@@ -13114,6 +13226,36 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(executable_projection, dict)
                 else False,
+                "optimizer_projected_initial_margin": _optional_float(
+                    executable_projection.get("projected_initial_margin")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_initial_margin_cap": _optional_float(
+                    executable_projection.get("initial_margin_cap")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_projected_regt_buying_power_ratio": _optional_float(
+                    executable_projection.get("projected_regt_buying_power_ratio")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_projected_net_beta": _optional_float(
+                    executable_projection.get("projected_net_beta")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_beta_abs_limit": _optional_float(
+                    executable_projection.get("beta_abs_limit")
+                )
+                if isinstance(executable_projection, dict)
+                else None,
+                "optimizer_hard_constraints_satisfied": bool(
+                    executable_projection.get("hard_constraints_satisfied")
+                )
+                if isinstance(executable_projection, dict)
+                else False,
                 "position_capacity_status": position_capacity.get("status")
                 if isinstance(position_capacity, dict)
                 else "",
@@ -13177,6 +13319,56 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
                 )
                 if isinstance(position_capacity, dict)
                 else None,
+                "account_equity_capacity": _optional_float(
+                    position_capacity.get("account_equity")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "broker_initial_margin": _optional_float(
+                    position_capacity.get("broker_initial_margin")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "initial_margin_utilization_of_capacity": _optional_float(
+                    position_capacity.get("initial_margin_utilization_of_capacity")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "initial_margin_error_vs_target_notional": _optional_float(
+                    position_capacity.get("initial_margin_error_vs_target_notional")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "initial_margin_error_vs_target_pct_points": _optional_float(
+                    position_capacity.get("initial_margin_error_vs_target_pct_points")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "regt_buying_power_reserve_ratio": _optional_float(
+                    position_capacity.get("regt_buying_power_reserve_ratio")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "configured_regt_buying_power_reserve_ratio": _optional_float(
+                    position_capacity.get("configured_regt_buying_power_reserve_ratio")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "margin_reconciliation_status": position_capacity.get(
+                    "margin_reconciliation_status"
+                )
+                if isinstance(position_capacity, dict)
+                else "",
+                "initial_margin_prediction_error": _optional_float(
+                    position_capacity.get("initial_margin_prediction_error")
+                )
+                if isinstance(position_capacity, dict)
+                else None,
+                "high_margin_symbol_count": _safe_int(
+                    position_capacity.get("high_margin_symbol_count")
+                )
+                if isinstance(position_capacity, dict)
+                else 0,
                 "submitted_orders": _safe_int(summary.get("submitted_orders")),
                 "order_plan_count": _safe_int(summary.get("order_plan_count")),
                 "staged_rebuild_snapshot_count": _safe_int(summary.get("staged_rebuild_snapshot_count")),
@@ -14136,6 +14328,10 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "optimizer_gross_capacity_target_ratio", "optimizer_gross_capacity_target_notional",
             "optimizer_projected_final_gross_notional",
             "optimizer_gross_capacity_constraint_enforced",
+            "optimizer_projected_initial_margin", "optimizer_initial_margin_cap",
+            "optimizer_projected_regt_buying_power_ratio",
+            "optimizer_projected_net_beta", "optimizer_beta_abs_limit",
+            "optimizer_hard_constraints_satisfied",
             "position_capacity_status", "gross_capacity_target_policy_status",
             "gross_position_notional", "regt_buying_power_remaining",
             "total_regt_buying_power_capacity", "gross_capacity_target_ratio",
@@ -14143,6 +14339,14 @@ def generate_rollup(root: Path = SCHED_ROOT) -> dict[str, Any]:
             "configured_gross_target_notional", "gross_utilization_of_total_bp",
             "gross_error_vs_target_notional", "gross_error_vs_target_pct_points",
             "gross_error_vs_total_notional", "gross_error_vs_total_pct_points",
+            "account_equity_capacity", "broker_initial_margin",
+            "initial_margin_utilization_of_capacity",
+            "initial_margin_error_vs_target_notional",
+            "initial_margin_error_vs_target_pct_points",
+            "regt_buying_power_reserve_ratio",
+            "configured_regt_buying_power_reserve_ratio",
+            "margin_reconciliation_status", "initial_margin_prediction_error",
+            "high_margin_symbol_count",
             "submitted_orders",
             "order_plan_count", "staged_rebuild_snapshot_count",
             "execution_attempt_outcome_status", "execution_broker_attempt_count",
